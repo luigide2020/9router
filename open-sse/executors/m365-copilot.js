@@ -1,6 +1,8 @@
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
-import { WebSocket as UndiciWebSocket, ProxyAgent } from "undici";
+import WsClient from "ws";
+import * as net from "net";
+import * as tls from "tls";
 
 const M365_WS_BASE = "wss://substrate.office.com/m365chat/SecuredChathub";
 const M365_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
@@ -419,54 +421,102 @@ export class M365CopilotExecutor extends BaseExecutor {
 
     log?.info?.("M365-COPILOT", `Connecting WebSocket: oid=${oid.slice(0, 8)}..., tid=${tid.slice(0, 8)}..., model=${model}, prompt_len=${userPrompt.length}`);
 
-    // Open WebSocket connection (proxy-aware via undici)
+    // Open WebSocket connection (proxy-aware via CONNECT tunnel)
     const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+    const wsUrlParsed = new URL(wsUrl);
     let ws;
+
     try {
-      const wsOpts = { headers: { "User-Agent": M365_USER_AGENT } };
       if (proxyUrl) {
-        wsOpts.dispatcher = new ProxyAgent(proxyUrl);
         log?.info?.("M365-COPILOT", `Using HTTP proxy: ${proxyUrl}`);
+        const proxy = new URL(proxyUrl);
+        // Step 1: Establish CONNECT tunnel through proxy
+        const tunnelSocket = await new Promise((resolve, reject) => {
+          const connectReq = net.connect(
+            { host: proxy.hostname, port: parseInt(proxy.port || 80) },
+            () => {
+              connectReq.write(
+                `CONNECT ${wsUrlParsed.hostname}:${wsUrlParsed.port || 443} HTTP/1.1\r\n` +
+                `Host: ${wsUrlParsed.hostname}:${wsUrlParsed.port || 443}\r\n\r\n`
+              );
+            }
+          );
+          let data = '';
+          connectReq.on('data', (chunk) => {
+            data += chunk.toString();
+            if (data.includes('\r\n\r\n')) {
+              const statusLine = data.split('\r\n')[0];
+              const status = parseInt(statusLine.split(' ')[1]);
+              log?.info?.("M365-COPILOT", `CONNECT tunnel: ${statusLine}`);
+              connectReq.removeAllListeners('data');
+              connectReq.removeAllListeners('error');
+              if (status === 200) {
+                resolve(connectReq);
+              } else {
+                reject(new Error(`CONNECT failed: ${statusLine}`));
+              }
+            }
+          });
+          connectReq.on('error', reject);
+          setTimeout(() => { if (!connectReq.destroyed) { connectReq.destroy(); reject(new Error('CONNECT timed out')); } }, WS_CONNECT_TIMEOUT_MS);
+        });
+
+        // Step 2: Wrap tunnel in TLS
+        const tlsSocket = tls.connect({
+          socket: tunnelSocket,
+          servername: wsUrlParsed.hostname,
+        });
+
+        // Step 3: Use ws library over TLS tunnel via custom agent
+        const { Agent: HttpAgent } = await import("http");
+        const wsAgent = new HttpAgent();
+        wsAgent.createConnection = () => tlsSocket;
+        ws = new WsClient(wsUrl, [], {
+          agent: wsAgent,
+          headers: { "User-Agent": M365_USER_AGENT },
+        });
+      } else {
+        // No proxy: use ws directly
+        ws = new WsClient(wsUrl, [], {
+          headers: { "User-Agent": M365_USER_AGENT },
+        });
       }
-      ws = new UndiciWebSocket(wsUrl, [], wsOpts);
     } catch (err) {
       return this._errorResponse(`WebSocket creation failed: ${err.message}`, 502, "upstream_error");
     }
 
-    // Wait for connection open
+    // Wait for connection open (ws library API)
     await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         try { ws.close(); } catch {}
         reject(new Error("WebSocket connection timed out"));
       }, WS_CONNECT_TIMEOUT_MS);
 
-      ws.onopen = () => { clearTimeout(timer); resolve(); };
-      ws.onerror = (ev) => {
+      ws.on("open", () => { clearTimeout(timer); resolve(); });
+      ws.on("error", (err) => {
         clearTimeout(timer);
-        // Extract detailed error info from undici WebSocket
-        const errObj = ev?.error || ev;
-        const details = JSON.stringify({
-          message: errObj?.message,
-          cause: errObj?.cause?.message || errObj?.cause,
-          code: errObj?.code,
-          type: ev?.type,
-        });
-        reject(new Error(`WebSocket error: ${details}`));
-      };
-      ws.onclose = (ev) => {
-        if (ws.readyState !== UndiciWebSocket.OPEN) {
-          clearTimeout(timer);
-          reject(new Error(`WebSocket closed before open: code=${ev?.code}, reason=${ev?.reason}, wasClean=${ev?.wasClean}`));
-        }
-      };
+        reject(new Error(`WebSocket error: ${err.message || err}`));
+      });
     }).catch((err) => {
       log?.error?.("M365-COPILOT", `WebSocket connect failed: ${err.message}`);
       return this._errorResponse(`M365 Copilot connection failed: ${err.message}`, 502, "upstream_error");
     });
 
-    if (ws.readyState !== UndiciWebSocket.OPEN) {
+    if (ws.readyState !== WsClient.OPEN) {
       return this._errorResponse("M365 Copilot WebSocket failed to connect", 502, "upstream_error");
     }
+
+    // Adapt ws library API: wrap onmessage for streaming code
+    // ws library emits 'message' event; existing code uses ws.onmessage = fn
+    ws.on("message", (data) => {
+      if (ws.onmessage) ws.onmessage({ data: typeof data === "string" ? data : data.toString() });
+    });
+    ws.on("close", (code, reason) => {
+      if (ws.onclose) ws.onclose({ code, reason: reason?.toString() || "" });
+    });
+    ws.on("error", (err) => {
+      if (ws.onerror) ws.onerror({ message: err.message });
+    });
 
     // Send protocol init frame
     ws.send(JSON.stringify({ protocol: "json", version: 1 }));
