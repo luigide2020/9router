@@ -1,7 +1,10 @@
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import WsClient from "ws";
-import { HttpsProxyAgent } from "https-proxy-agent";
+import net from "net";
+import tls from "tls";
+import http from "http";
+import https from "https";
 
 const M365_WS_BASE = "wss://substrate.office.com/m365chat/SecuredChathub";
 const M365_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
@@ -421,48 +424,73 @@ export class M365CopilotExecutor extends BaseExecutor {
 
     log?.info?.("M365-COPILOT", `Connecting WebSocket: oid=${oid.slice(0, 8)}..., tid=${tid.slice(0, 8)}..., model=${model}, prompt_len=${userPrompt.length}`);
 
-    // Open WebSocket connection (proxy-aware via https-proxy-agent)
+    // Open WebSocket connection via manual CONNECT tunnel (full control over upgrade request)
     const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
     let ws;
 
     try {
-      const wsOpts = {
-        headers: {
-          "User-Agent": M365_USER_AGENT,
-          "Origin": "https://m365.cloud.microsoft",
-          "Sec-Fetch-Dest": "websocket",
-          "Sec-Fetch-Mode": "websocket",
-          "Sec-Fetch-Site": "cross-site",
-        },
+      // Step 1: Pre-flight HTTP request to get session cookies
+      const cookies = await fetchCookies(proxyUrl, accessToken, log);
+      log?.info?.("M365-COPILOT", `Pre-flight cookies: ${cookies.length}`);
+
+      // Step 2: Build ws options with cookies
+      const wsHeaders = {
+        "User-Agent": M365_USER_AGENT,
+        "Origin": "https://m365.cloud.microsoft",
+        "Sec-Fetch-Dest": "websocket",
+        "Sec-Fetch-Mode": "websocket",
+        "Sec-Fetch-Site": "cross-site",
       };
+      if (cookies.length > 0) {
+        wsHeaders["Cookie"] = cookies.join("; ");
+      }
+
+      const wsOpts = { headers: wsHeaders };
+
       if (proxyUrl) {
         log?.info?.("M365-COPILOT", `Using HTTP proxy: ${proxyUrl}`);
-        wsOpts.agent = new HttpsProxyAgent(proxyUrl);
+        // Manual CONNECT tunnel: establish raw TCP→proxy→TLS→target
+        const proxy = new URL(proxyUrl);
+        const targetHost = "substrate.office.com";
+        const targetPort = 443;
+
+        // Create TLS socket through proxy tunnel
+        const tunnelSocket = await connectViaProxy(proxy.hostname, parseInt(proxy.port || 80), targetHost, targetPort);
+        const tlsSocket = tls.connect({
+          socket: tunnelSocket,
+          servername: targetHost,
+          ALPNProtocols: ['http/1.1'],
+        });
+        await new Promise((r, j) => { tlsSocket.once('secureConnect', r); tlsSocket.once('error', j); });
+
+        // Use ws:// since TLS is already handled by our tunnel
+        const wsUrlHttp = `ws://${targetHost}/m365chat/SecuredChathub/${encodeURIComponent(oid)}@${encodeURIComponent(tid)}?${wsParams.toString()}`;
+        wsOpts.createConnection = () => tlsSocket;
+        ws = new WsClient(wsUrlHttp, [], wsOpts);
+      } else {
+        ws = new WsClient(wsUrl, [], wsOpts);
       }
-      ws = new WsClient(wsUrl, [], wsOpts);
     } catch (err) {
-      return this._errorResponse(`WebSocket creation failed: ${err.message}`, 502, "upstream_error");
+      log?.error?.("M365-COPILOT", `WebSocket connect failed: ${err.message}`);
+      return this._errorResponse(`M365 Copilot connection failed: ${err.message}`, 502, "upstream_error");
     }
 
-    // Wait for connection open (ws library API)
+    // Wait for WebSocket open
     await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         try { ws.close(); } catch {}
         reject(new Error("WebSocket connection timed out"));
       }, WS_CONNECT_TIMEOUT_MS);
-
       ws.on("open", () => { clearTimeout(timer); resolve(); });
       ws.on("unexpected-response", (req, res) => {
         clearTimeout(timer);
-        const headers = {};
+        const hdrs = {};
         for (const [k, v] of Object.entries(res.headers || {})) {
-          if (k.startsWith('x-') || k === 'server') headers[k] = v;
+          if (k.startsWith('x-')) hdrs[k] = v;
         }
         let body = '';
         res.on('data', (c) => { body += c; });
-        res.on('end', () => {
-          reject(new Error(`HTTP ${res.statusCode}: headers=${JSON.stringify(headers)}, body=${body.slice(0, 200)}`));
-        });
+        res.on('end', () => reject(new Error(`HTTP ${res.statusCode}: ${JSON.stringify(hdrs)}, body=${body.slice(0, 200)}`)));
       });
       ws.on("error", (err) => {
         clearTimeout(timer);
@@ -472,10 +500,6 @@ export class M365CopilotExecutor extends BaseExecutor {
       log?.error?.("M365-COPILOT", `WebSocket connect failed: ${err.message}`);
       return this._errorResponse(`M365 Copilot connection failed: ${err.message}`, 502, "upstream_error");
     });
-
-    if (ws.readyState !== WsClient.OPEN) {
-      return this._errorResponse("M365 Copilot WebSocket failed to connect", 502, "upstream_error");
-    }
 
     // Adapt ws library API: wrap onmessage for streaming code
     // ws library emits 'message' event; existing code uses ws.onmessage = fn
@@ -526,6 +550,111 @@ export class M365CopilotExecutor extends BaseExecutor {
       error: { message, type: code || "upstream_error", code: code || `HTTP_${status}` },
     }), { status, headers: { "Content-Type": "application/json" } });
     return { response: errResp, url: M365_WS_BASE, headers: {}, transformedBody: null };
+  }
+}
+
+/**
+ * Establish a TCP tunnel through an HTTP proxy via CONNECT method
+ */
+function connectViaProxy(proxyHost, proxyPort, targetHost, targetPort) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect({ host: proxyHost, port: proxyPort }, () => {
+      socket.write(
+        `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
+        `Host: ${targetHost}:${targetPort}\r\n\r\n`
+      );
+    });
+    let buf = '';
+    socket.on('data', function onData(chunk) {
+      buf += chunk.toString();
+      const headerEnd = buf.indexOf('\r\n\r\n');
+      if (headerEnd !== -1) {
+        socket.removeListener('data', onData);
+        const statusLine = buf.split('\r\n')[0];
+        if (statusLine.includes('200')) {
+          resolve(socket);
+        } else {
+          reject(new Error(`Proxy CONNECT failed: ${statusLine}`));
+        }
+      }
+    });
+    socket.on('error', reject);
+    setTimeout(() => reject(new Error('Proxy CONNECT timeout')), 15000);
+  });
+}
+
+/**
+ * Pre-flight HTTP request to substrate.office.com to collect session cookies.
+ * Browsers automatically visit the web app first and accumulate cookies
+ * that are then sent with the WebSocket upgrade request.
+ */
+async function fetchCookies(proxyUrl, accessToken, log) {
+  try {
+    const url = `https://substrate.office.com/m365chat/SecuredChathub/negotiate?negotiateVersion=1`;
+    const fetchOpts = {
+      method: 'POST',
+      headers: {
+        'User-Agent': M365_USER_AGENT,
+        'Origin': 'https://m365.cloud.microsoft',
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      redirect: 'manual',
+    };
+    // Use proxy for the pre-flight too
+    if (proxyUrl) {
+      const { HttpsProxyAgent } = await import('https-proxy-agent');
+      fetchOpts.dispatcher = undefined;
+      fetchOpts.agent = new HttpsProxyAgent(proxyUrl);
+      // Use https module directly
+      return await new Promise((resolve) => {
+        const parsedUrl = new URL(url);
+        const proxy = new URL(proxyUrl);
+        const reqOpts = {
+          host: proxy.hostname,
+          port: parseInt(proxy.port || 80),
+          method: 'CONNECT',
+          path: `${parsedUrl.hostname}:443`,
+        };
+        const connectReq = http.request(reqOpts);
+        connectReq.on('connect', (res, socket) => {
+          if (res.statusCode !== 200) { resolve([]); return; }
+          const req = https.request({
+            host: parsedUrl.hostname,
+            port: 443,
+            path: parsedUrl.pathname + parsedUrl.search,
+            method: 'POST',
+            socket: socket,
+            agent: false,
+            headers: {
+              'User-Agent': M365_USER_AGENT,
+              'Origin': 'https://m365.cloud.microsoft',
+              'Authorization': `Bearer ${accessToken}`,
+              'Content-Type': 'application/json',
+              'Content-Length': '0',
+            },
+          }, (resp) => {
+            const cookies = (resp.headers['set-cookie'] || []).map(c => c.split(';')[0]);
+            log?.info?.("M365-COPILOT", `Negotiate status: ${resp.statusCode}, cookies: ${cookies.length}`);
+            resp.resume(); // drain
+            resolve(cookies);
+          });
+          req.on('error', () => resolve([]));
+          req.end();
+        });
+        connectReq.on('error', () => resolve([]));
+        connectReq.end();
+      });
+    }
+    // Direct (no proxy)
+    const resp = await fetch(url, fetchOpts);
+    const setCookies = resp.headers.getSetCookie?.() || [];
+    const cookies = setCookies.map(c => c.split(';')[0]);
+    log?.info?.("M365-COPILOT", `Negotiate status: ${resp.status}, cookies: ${cookies.length}`);
+    return cookies;
+  } catch (e) {
+    log?.info?.("M365-COPILOT", `Pre-flight cookie fetch failed: ${e.message}, continuing without cookies`);
+    return [];
   }
 }
 
