@@ -320,7 +320,7 @@ function buildStreamingFromWs(ws, model, cid, created, signal) {
 /**
  * Build non-streaming response by collecting full text from WebSocket
  */
-async function buildNonStreamingFromWs(ws, model, cid, created, signal) {
+async function buildNonStreamingFromWs(ws, model, cid, created, signal, log) {
   return new Promise((resolve) => {
     let fullText = "";
     const thinkingParts = [];
@@ -335,6 +335,7 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal) {
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(typeof event.data === "string" ? event.data : "");
+        log?.info?.("M365-COPILOT", `NonStream handler: type=${data.type}, hasItem=${!!data.item}, hasArgs=${!!data.arguments}, fullText_len=${fullText.length}`);
         // M365 SignalR: type 1 streaming updates use arguments[0].messages
         if (data.type === 1) {
           const payload = data.item || data.arguments?.[0];
@@ -365,6 +366,7 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal) {
             return;
           }
           // Type 2 = conversation turn complete in M365 Copilot
+          log?.info?.("M365-COPILOT", `NonStream resolving: fullText_len=${fullText.length}`);
           clearTimeout(responseTimer);
           try { ws.close(); } catch {}
           const promptTokens = Math.ceil(fullText.length / 4);
@@ -607,7 +609,7 @@ export class M365CopilotExecutor extends BaseExecutor {
         headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no" },
       });
     } else {
-      finalResponse = await buildNonStreamingFromWs(ws, model, cid, created, signal);
+      finalResponse = await buildNonStreamingFromWs(ws, model, cid, created, signal, log);
     }
 
     return { response: finalResponse, url: M365_WS_BASE, headers: {}, transformedBody: copilotMsg };
