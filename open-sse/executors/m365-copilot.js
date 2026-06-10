@@ -237,40 +237,50 @@ function buildStreamingFromWs(ws, model, cid, created, signal) {
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(typeof event.data === "string" ? event.data : "");
-          // Type 1: intermediate streaming text
-          if (data.type === 1 && data.item?.messages) {
-            for (const msg of data.item.messages) {
-              if (msg.text && msg.author === "bot") {
-                const delta = msg.text.slice(fullText.length);
-                if (delta) {
-                  fullText = msg.text;
-                  controller.enqueue(encoder.encode(sseChunk({
-                    id: cid, object: "chat.completion.chunk", created, model, system_fingerprint: null,
-                    choices: [{ index: 0, delta: { content: delta }, finish_reason: null, logprobs: null }],
-                  })));
+          // M365 SignalR: type 1 streaming updates use arguments[0].messages
+          if (data.type === 1) {
+            const payload = data.item || data.arguments?.[0];
+            if (payload?.messages) {
+              for (const msg of payload.messages) {
+                if (msg.text && msg.author === "bot") {
+                  const delta = msg.text.slice(fullText.length);
+                  if (delta) {
+                    fullText = msg.text;
+                    controller.enqueue(encoder.encode(sseChunk({
+                      id: cid, object: "chat.completion.chunk", created, model, system_fingerprint: null,
+                      choices: [{ index: 0, delta: { content: delta }, finish_reason: null, logprobs: null }],
+                    })));
+                  }
                 }
               }
             }
           }
-          // Type 2: final complete message
-          if (data.type === 2 && data.item?.messages) {
-            for (const msg of data.item.messages) {
-              if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
-                const delta = msg.text.slice(fullText.length);
-                fullText = msg.text;
-                if (delta) {
-                  controller.enqueue(encoder.encode(sseChunk({
-                    id: cid, object: "chat.completion.chunk", created, model, system_fingerprint: null,
-                    choices: [{ index: 0, delta: { content: delta }, finish_reason: null, logprobs: null }],
-                  })));
+          // Type 2: final complete message (M365 uses type 2 as completion signal)
+          if (data.type === 2) {
+            const payload = data.item || data.arguments?.[0];
+            if (payload?.messages) {
+              for (const msg of payload.messages) {
+                if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
+                  const delta = msg.text.slice(fullText.length);
+                  fullText = msg.text;
+                  if (delta) {
+                    controller.enqueue(encoder.encode(sseChunk({
+                      id: cid, object: "chat.completion.chunk", created, model, system_fingerprint: null,
+                      choices: [{ index: 0, delta: { content: delta }, finish_reason: null, logprobs: null }],
+                    })));
+                  }
                 }
               }
             }
-            // Check for result message (some variants use item.result)
-            if (data.item.result?.value && data.item.result.value !== "Success") {
-              sendError(data.item.result.message || data.item.result.value);
+            // Check for result message
+            if (payload?.result?.value && payload.result.value !== "Success") {
+              sendError(payload.result.message || payload.result.value);
               return;
             }
+            // Type 2 = conversation turn complete in M365 Copilot
+            clearTimeout(responseTimer);
+            close();
+            return;
           }
           // Type 3: end of conversation turn
           if (data.type === 3) {
@@ -325,27 +335,47 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal) {
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(typeof event.data === "string" ? event.data : "");
-        if (data.type === 1 && data.item?.messages) {
-          for (const msg of data.item.messages) {
-            if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
-              fullText = msg.text;
+        // M365 SignalR: type 1 streaming updates use arguments[0].messages
+        if (data.type === 1) {
+          const payload = data.item || data.arguments?.[0];
+          if (payload?.messages) {
+            for (const msg of payload.messages) {
+              if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
+                fullText = msg.text;
+              }
             }
           }
         }
-        if (data.type === 2 && data.item?.messages) {
-          for (const msg of data.item.messages) {
-            if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
-              fullText = msg.text;
+        // Type 2: final complete message (M365 uses type 2 as completion signal)
+        if (data.type === 2) {
+          const payload = data.item || data.arguments?.[0];
+          if (payload?.messages) {
+            for (const msg of payload.messages) {
+              if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
+                fullText = msg.text;
+              }
             }
           }
-          if (data.item.result?.value && data.item.result.value !== "Success") {
+          if (payload?.result?.value && payload.result.value !== "Success") {
             clearTimeout(responseTimer);
             try { ws.close(); } catch {}
             resolve(new Response(JSON.stringify({
-              error: { message: data.item.result.message || data.item.result.value, type: "upstream_error", code: "COPILOT_ERROR" },
+              error: { message: payload.result.message || payload.result.value, type: "upstream_error", code: "COPILOT_ERROR" },
             }), { status: 502, headers: { "Content-Type": "application/json" } }));
             return;
           }
+          // Type 2 = conversation turn complete in M365 Copilot
+          clearTimeout(responseTimer);
+          try { ws.close(); } catch {}
+          const promptTokens = Math.ceil(fullText.length / 4);
+          const completionTokens = Math.ceil(fullText.length / 4);
+          const msg = { role: "assistant", content: fullText };
+          resolve(new Response(JSON.stringify({
+            id: cid, object: "chat.completion", created, model, system_fingerprint: null,
+            choices: [{ index: 0, message: msg, finish_reason: "stop", logprobs: null }],
+            usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
+          }), { status: 200, headers: { "Content-Type": "application/json" } }));
+          return;
         }
         if (data.type === 3) {
           clearTimeout(responseTimer);
