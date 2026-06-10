@@ -468,10 +468,12 @@ export class M365CopilotExecutor extends BaseExecutor {
         });
 
         // Step 3: Use ws library over TLS tunnel via custom agent
+        // TLS already handled by tunnel, so use ws:// instead of wss://
+        const wsUrlHttp = wsUrl.replace(/^wss:/, "ws:");
         const { Agent: HttpAgent } = await import("http");
         const wsAgent = new HttpAgent();
         wsAgent.createConnection = () => tlsSocket;
-        ws = new WsClient(wsUrl, [], {
+        ws = new WsClient(wsUrlHttp, [], {
           agent: wsAgent,
           headers: { "User-Agent": M365_USER_AGENT },
         });
