@@ -41,6 +41,8 @@ COPY --from=builder /app/node_modules/ws ./node_modules/ws
 # Ensure `https-proxy-agent` is available for proxy tunnel
 COPY --from=builder /app/node_modules/https-proxy-agent ./node_modules/https-proxy-agent
 COPY --from=builder /app/node_modules/agent-base ./node_modules/agent-base
+COPY --from=builder /app/node_modules/debug ./node_modules/debug
+COPY --from=builder /app/node_modules/ms ./node_modules/ms
 
 RUN mkdir -p /app/data && chown -R node:node /app && \
   mkdir -p /app/data-home && chown node:node /app/data-home && \
