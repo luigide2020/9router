@@ -441,7 +441,24 @@ export class M365CopilotExecutor extends BaseExecutor {
       }, WS_CONNECT_TIMEOUT_MS);
 
       ws.onopen = () => { clearTimeout(timer); resolve(); };
-      ws.onerror = (err) => { clearTimeout(timer); reject(new Error(err?.message || "WebSocket error")); };
+      ws.onerror = (ev) => {
+        clearTimeout(timer);
+        // Extract detailed error info from undici WebSocket
+        const errObj = ev?.error || ev;
+        const details = JSON.stringify({
+          message: errObj?.message,
+          cause: errObj?.cause?.message || errObj?.cause,
+          code: errObj?.code,
+          type: ev?.type,
+        });
+        reject(new Error(`WebSocket error: ${details}`));
+      };
+      ws.onclose = (ev) => {
+        if (ws.readyState !== UndiciWebSocket.OPEN) {
+          clearTimeout(timer);
+          reject(new Error(`WebSocket closed before open: code=${ev?.code}, reason=${ev?.reason}, wasClean=${ev?.wasClean}`));
+        }
+      };
     }).catch((err) => {
       log?.error?.("M365-COPILOT", `WebSocket connect failed: ${err.message}`);
       return this._errorResponse(`M365 Copilot connection failed: ${err.message}`, 502, "upstream_error");
