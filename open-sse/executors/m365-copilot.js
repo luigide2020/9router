@@ -525,9 +525,6 @@ export class M365CopilotExecutor extends BaseExecutor {
 
     log?.info?.("M365-COPILOT", `WS readyState=${ws.readyState}, sending SignalR handshake`);
 
-    // SignalR protocol: all messages must end with \u001e (Record Separator)
-    const RS = "\u001e";
-
     // Send protocol handshake
     ws.send(JSON.stringify({ protocol: "json", version: 1 }) + RS);
 
