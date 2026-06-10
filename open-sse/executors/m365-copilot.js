@@ -1,13 +1,23 @@
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
-import { proxyAwareFetch } from "../utils/proxyFetch.js";
 
-const M365_HTTP_BASE = "https://substrate.office.com/m365chat/SecuredChathub";
 const M365_WS_BASE = "wss://substrate.office.com/m365chat/SecuredChathub";
 const M365_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 const WS_CONNECT_TIMEOUT_MS = 15_000;
 const WS_RESPONSE_TIMEOUT_MS = 120_000;
-const NEGOTIATE_TIMEOUT_MS = 15_000;
+
+// X-variants features from the M365 Business Chat web app
+const M365_X_VARIANTS = [
+  "feature.includeExternal",
+  "feature.AssistantConnectorsContentSources",
+  "3S.BizChatWprBoostAssistant",
+  "3S.EnableMEFromSkillDiscovery",
+  "feature.EnableAuthErrorMessage",
+  "EnableRequestPlugins",
+  "feature.EnableSensitivityLabels",
+  "feature.IsEntityAnnotationsEnabled",
+  "EnableUnsupportedUrlDetector",
+].join(",");
 
 /**
  * Decode JWT payload (no verification, just extract claims)
@@ -366,7 +376,7 @@ export class M365CopilotExecutor extends BaseExecutor {
     super("m365-copilot", PROVIDERS["m365-copilot"]);
   }
 
-  async execute({ model, body, stream, credentials, signal, log, proxyOptions }) {
+  async execute({ model, body, stream, credentials, signal, log }) {
     const messages = body?.messages;
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       return this._errorResponse("Missing or empty messages array", 400, "invalid_request");
@@ -393,62 +403,22 @@ export class M365CopilotExecutor extends BaseExecutor {
     const conversationId = crypto.randomUUID();
     const clientRequestId = crypto.randomUUID();
 
-    // Step 1: SignalR negotiate to get connectionToken
-    log?.info?.("M365-COPILOT", `Negotiating SignalR connection for model=${model}, prompt_len=${userPrompt.length}`);
+    // Build WebSocket URL following the M365 Copilot protocol
+    // Ref: https://labs.zenity.io/p/access-copilot-m365-terminal
+    // URL format: wss://substrate.office.com/m365chat/SecuredChathub/{oid}@{tid}?params...
+    const wsParams = new URLSearchParams({
+      "X-ClientRequestId": clientRequestId,
+      "X-SessionId": sessionId,
+      "access_token": accessToken,
+      "X-variants": M365_X_VARIANTS,
+      "source": '"officeweb"',
+      "scenario": "officeweb",
+    });
+    const wsUrl = `${M365_WS_BASE}/${encodeURIComponent(oid)}@${encodeURIComponent(tid)}?${wsParams.toString()}`;
 
-    let connectionToken;
-    let connectionId;
-    try {
-      const negotiateController = new AbortController();
-      const negotiateTimer = setTimeout(() => negotiateController.abort(), NEGOTIATE_TIMEOUT_MS);
+    log?.info?.("M365-COPILOT", `Connecting WebSocket: oid=${oid.slice(0, 8)}..., tid=${tid.slice(0, 8)}..., model=${model}, prompt_len=${userPrompt.length}`);
 
-      const negotiateRes = await proxyAwareFetch(
-        `${M365_HTTP_BASE}/negotiate?negotiateVersion=1`,
-        {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${accessToken}`,
-            "Content-Type": "application/json",
-            "User-Agent": M365_USER_AGENT,
-            "Origin": "https://m365.cloud.microsoft",
-            "X-ClientRequestId": clientRequestId,
-            "X-SessionId": sessionId,
-          },
-          signal: negotiateController.signal,
-        },
-        proxyOptions
-      );
-
-      clearTimeout(negotiateTimer);
-
-      if (!negotiateRes.ok) {
-        const errText = await negotiateRes.text().catch(() => "");
-        log?.error?.("M365-COPILOT", `Negotiate failed: ${negotiateRes.status} ${errText.slice(0, 200)}`);
-        return this._errorResponse(
-          `M365 Copilot negotiate failed: HTTP ${negotiateRes.status}`,
-          502, "upstream_error"
-        );
-      }
-
-      const negotiateData = await negotiateRes.json();
-      // SignalR may return connectionToken or accessToken depending on version
-      connectionToken = negotiateData.connectionToken || negotiateData.accessToken;
-      connectionId = negotiateData.connectionId;
-      log?.info?.("M365-COPILOT", `Negotiate OK: connectionId=${connectionId ? connectionId.slice(0, 8) + "..." : "n/a"}, hasToken=${!!connectionToken}`);
-    } catch (err) {
-      const msg = err.name === "AbortError" ? "Negotiate timed out" : err.message;
-      log?.error?.("M365-COPILOT", `Negotiate error: ${msg}`);
-      return this._errorResponse(`M365 Copilot negotiate error: ${msg}`, 502, "upstream_error");
-    }
-
-    // Step 2: Build WebSocket URL using connectionToken from negotiate
-    const wsAccessToken = connectionToken || accessToken;
-    const wsId = connectionId || clientRequestId;
-    const wsUrl = `${M365_WS_BASE}?id=${wsId}&X-ClientRequestId=${clientRequestId}&X-SessionId=${sessionId}&access_token=${encodeURIComponent(wsAccessToken)}`;
-
-    log?.info?.("M365-COPILOT", `Connecting to M365 Copilot WebSocket for model=${model}`);
-
-    // Step 3: Open WebSocket
+    // Open WebSocket connection
     let ws;
     try {
       ws = new WebSocket(wsUrl);
