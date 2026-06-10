@@ -409,8 +409,9 @@ export class M365CopilotExecutor extends BaseExecutor {
     // Ref: https://labs.zenity.io/p/access-copilot-m365-terminal
     // URL format: wss://substrate.office.com/m365chat/SecuredChathub/{oid}@{tid}?params...
     const wsParams = new URLSearchParams({
-      "X-ClientRequestId": clientRequestId,
-      "X-SessionId": sessionId,
+      "clientRequestId": clientRequestId,
+      "chatSessionId": sessionId,
+      "XRoutingParameterSessionKey": sessionId,
       "access_token": accessToken,
       "X-variants": M365_X_VARIANTS,
       "source": "officeweb",
@@ -428,7 +429,7 @@ export class M365CopilotExecutor extends BaseExecutor {
       const wsOpts = {
         headers: {
           "User-Agent": M365_USER_AGENT,
-          "Origin": "https://substrate.office.com",
+          "Origin": "https://m365.cloud.microsoft",
           "Sec-Fetch-Dest": "websocket",
           "Sec-Fetch-Mode": "websocket",
           "Sec-Fetch-Site": "cross-site",
