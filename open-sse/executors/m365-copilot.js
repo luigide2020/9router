@@ -408,14 +408,14 @@ export class M365CopilotExecutor extends BaseExecutor {
     // Build WebSocket URL following the M365 Copilot protocol
     // Ref: https://labs.zenity.io/p/access-copilot-m365-terminal
     // URL format: wss://substrate.office.com/m365chat/SecuredChathub/{oid}@{tid}?params...
+    // Only send routing-critical params (matches browser behavior exactly).
+    // Extra params (X-variants, source, scenario) change the RequestHash-Query
+    // and cause NanoProxy to route to a non-existent backend (0x80070036).
     const wsParams = new URLSearchParams({
       "clientRequestId": clientRequestId,
       "chatSessionId": sessionId,
       "XRoutingParameterSessionKey": sessionId,
       "access_token": accessToken,
-      "X-variants": M365_X_VARIANTS,
-      "source": "officeweb",
-      "scenario": "officeweb",
     });
     const wsUrl = `${M365_WS_BASE}/${encodeURIComponent(oid)}@${encodeURIComponent(tid)}?${wsParams.toString()}`;
 
