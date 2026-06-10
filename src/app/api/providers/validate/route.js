@@ -545,6 +545,43 @@ export async function POST(request) {
           break;
         }
 
+        case "m365-copilot": {
+          // Validate by decoding the JWT access token (no external call needed)
+          let token = apiKey.trim();
+          try {
+            const parts = token.split(".");
+            if (parts.length !== 3) {
+              isValid = false;
+              error = "Not a valid JWT format";
+              break;
+            }
+            const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+            const padded = b64 + "=".repeat((4 - b64.length % 4) % 4);
+            const payload = JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
+
+            // Check audience is substrate.office.com
+            const aud = typeof payload.aud === "string" ? payload.aud : "";
+            if (!aud.includes("substrate.office.com")) {
+              isValid = false;
+              error = "Token audience does not match substrate.office.com. Please extract the Copilot access token from Network tab.";
+              break;
+            }
+
+            // Check expiry
+            if (payload.exp && payload.exp * 1000 < Date.now()) {
+              isValid = false;
+              error = "Token has expired. Please re-extract a fresh token from your browser.";
+              break;
+            }
+
+            isValid = true;
+          } catch (e) {
+            isValid = false;
+            error = `Failed to decode token: ${e.message}`;
+          }
+          break;
+        }
+
         case "perplexity-web": {
           let sessionToken = apiKey;
           if (sessionToken.startsWith("__Secure-next-auth.session-token=")) {

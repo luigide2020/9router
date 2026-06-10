@@ -11,11 +11,14 @@ export default function AddApiKeyModal({ isOpen, provider, providerName, isCompa
   const NONE_PROXY_POOL_VALUE = "__none__";
   const isOllamaLocal = provider === "ollama-local";
   const isCookie = authType === "cookie";
+  const isM365 = provider === "m365-copilot";
   const isXaiApiKey = provider === "xai" && !isCookie;
-  const credentialLabel = isCookie ? "Cookie Value" : "API Key";
-  const credentialPlaceholder = isCookie
-    ? (provider === "grok-web" ? "sso=xxxxx... or just the raw value" : "eyJhbGciOi...")
-    : (isXaiApiKey ? "xai-..." : "");
+  const credentialLabel = isM365 ? "Access Token" : (isCookie ? "Cookie Value" : "API Key");
+  const credentialPlaceholder = isM365
+    ? "eyJhbGciOiJSUzI1NiIs..."
+    : isCookie
+      ? (provider === "grok-web" ? "sso=xxxxx... or just the raw value" : "eyJhbGciOi...")
+      : (isXaiApiKey ? "xai-..." : "");
 
   const isAzure = provider === "azure";
   const isCloudflareAi = provider === "cloudflare-ai";
@@ -234,7 +237,7 @@ export default function AddApiKeyModal({ isOpen, provider, providerName, isCompa
             Use a direct xAI API key from console.x.ai. This is separate from Grok Build OAuth.
           </p>
         )}
-        {isCookie && authHint && (
+        {isCookie && authHint && !isM365 && (
           <p className="text-xs text-text-muted">
             {authHint}
             {website && (
@@ -246,6 +249,38 @@ export default function AddApiKeyModal({ isOpen, provider, providerName, isCompa
               </>
             )}
           </p>
+        )}
+        {isM365 && (
+          <div className="bg-sidebar/50 p-4 rounded-lg border border-accent/20">
+            <h3 className="font-semibold mb-3 text-sm">M365 Copilot — Token 提取指南</h3>
+            <p className="text-xs text-text-muted mb-3">
+              需要 Microsoft 365 Copilot 订阅账号。Token 有效期约 1 小时，过期后需重新提取。
+            </p>
+            <div className="flex flex-col gap-2 text-xs">
+              <div className="flex gap-2 items-start">
+                <span className="font-bold text-primary shrink-0">方法 1</span>
+                <span className="text-text-muted">（推荐 · Network 拦截）</span>
+              </div>
+              <ol className="list-decimal pl-5 flex flex-col gap-1 text-text-muted">
+                <li>打开 <a href="https://m365.cloud.microsoft" target="_blank" rel="noopener noreferrer" className="text-primary underline">m365.cloud.microsoft</a> 并登录</li>
+                <li>进入 Copilot，发送一条消息</li>
+                <li>按 F12 → <strong>Network</strong> → 过滤框输入 <code className="bg-black/5 dark:bg-white/10 px-1 rounded">substrate</code></li>
+                <li>找到 <code className="bg-black/5 dark:bg-white/10 px-1 rounded">wss://substrate.office.com</code> 请求</li>
+                <li>复制 Request URL 中 <code className="bg-black/5 dark:bg-white/10 px-1 rounded">access_token=</code> 后面的 JWT 值</li>
+              </ol>
+              <div className="flex gap-2 items-start mt-2">
+                <span className="font-bold text-primary shrink-0">方法 2</span>
+                <span className="text-text-muted">（localStorage 提取）</span>
+              </div>
+              <ol className="list-decimal pl-5 flex flex-col gap-1 text-text-muted">
+                <li>访问 <a href="https://outlook.office.com" target="_blank" rel="noopener noreferrer" className="text-primary underline">outlook.office.com</a> 并登录</li>
+                <li>F12 → <strong>Application</strong> → 左侧 <strong>Local storage</strong> → 点击 <code className="bg-black/5 dark:bg-white/10 px-1 rounded">https://outlook.office.com</code></li>
+                <li>搜索 <code className="bg-black/5 dark:bg-white/10 px-1 rounded">substrate</code></li>
+                <li>找到 <code className="bg-black/5 dark:bg-white/10 px-1 rounded">credentialType: &quot;AccessToken&quot;</code> 的条目</li>
+                <li>复制其 <code className="bg-black/5 dark:bg-white/10 px-1 rounded">secret</code> 字段值</li>
+              </ol>
+            </div>
+          </div>
         )}
         {providerRegions && (
           <Select

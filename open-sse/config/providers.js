@@ -230,7 +230,7 @@ export const PROVIDERS = {
     format: "openai",
     headers: {}
   },
-  opencode: {
+  "opencode-local": {
     baseUrl: "http://localhost:4096/v1/chat/completions",
     format: "openai",
     headers: {}
@@ -380,6 +380,11 @@ export const PROVIDERS = {
     baseUrl: "https://www.perplexity.ai/rest/sse/perplexity_ask",
     format: "perplexity-web",
     authType: "cookie"
+  },
+  "m365-copilot": {
+    baseUrl: "https://m365.cloud.microsoft/",
+    format: "m365-copilot",
+    authType: "token"
   },
   azure: {
     baseUrl: "",

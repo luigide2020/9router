@@ -612,6 +612,18 @@ export const PROVIDER_MODELS = {
     { id: "pplx-opus", name: "Claude Opus 4.6 (via Perplexity)" },
     { id: "pplx-nemotron", name: "Nemotron 3 Super (via Perplexity)" },
   ],
+  "m365": [
+    { id: "copilot", name: "M365 Copilot (Default)" },
+    { id: "gpt-5.5", name: "GPT-5.5 (via Copilot)" },
+    { id: "gpt-5.4", name: "GPT-5.4 (via Copilot)" },
+    { id: "gpt-5.4-mini", name: "GPT-5.4 Mini (via Copilot)" },
+    { id: "gpt-5.2", name: "GPT-5.2 (via Copilot)" },
+    { id: "gpt-5", name: "GPT-5 (via Copilot)" },
+    { id: "gpt-4o", name: "GPT-4o (via Copilot)" },
+    { id: "gpt-4.1", name: "GPT-4.1 (via Copilot)" },
+    { id: "o3", name: "o3 (via Copilot)" },
+    { id: "o4-mini", name: "o4-mini (via Copilot)" },
+  ],
 
   // TTS entries are loaded from ttsModels.js via buildTtsProviderModels()
   ...buildTtsProviderModels(),
@@ -899,6 +911,7 @@ const OAUTH_ALIASES = {
   qoder: "qd",
   vertex: "vertex",
   "vertex-partner": "vertex-partner",
+  "m365-copilot": "m365",
 };
 
 // Derived from PROVIDERS — no need to maintain manually

@@ -30,3 +30,12 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
+
+# Python
+.venv
+__pycache__
+*.py[cod]
+*.egg-info
+uv.lock
+pyproject.toml
+scripts/m365

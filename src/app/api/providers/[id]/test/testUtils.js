@@ -614,6 +614,33 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
         }, effectiveProxy);
         return { valid: res.ok, error: res.ok ? null : "Invalid API key" };
       }
+      case "m365-copilot": {
+        // Validate JWT token format and expiry
+        const token = connection.apiKey || connection.accessToken || "";
+        if (!token || !token.startsWith("ey")) {
+          return { valid: false, error: "Missing or invalid token. Paste a valid JWT from substrate.office.com." };
+        }
+        try {
+          const parts = token.split(".");
+          if (parts.length < 2) throw new Error("Invalid JWT format");
+          const claims = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf-8"));
+          if (claims.exp && claims.exp * 1000 < Date.now()) {
+            return { valid: false, error: `Token expired at ${new Date(claims.exp * 1000).toISOString()}. Extract a fresh token.` };
+          }
+          const expiresIn = claims.exp ? Math.floor((claims.exp * 1000 - Date.now()) / 60_000) : null;
+          return {
+            valid: true,
+            error: null,
+            meta: {
+              userPrincipalName: claims.upn || claims.preferred_username || "unknown",
+              expiresInMinutes: expiresIn,
+              audience: claims.aud || "unknown",
+            },
+          };
+        } catch (e) {
+          return { valid: false, error: `Token decode failed: ${e.message}` };
+        }
+      }
       default:
         return { valid: false, error: "Provider test not supported" };
     }

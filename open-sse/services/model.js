@@ -71,6 +71,8 @@ const ALIAS_TO_PROVIDER_ID = {
   "grok-web": "grok-web",
   pw: "perplexity-web",
   "perplexity-web": "perplexity-web",
+  m365: "m365-copilot",
+  "m365-copilot": "m365-copilot",
   mimo: "xiaomi-mimo",
   "xiaomi-mimo": "xiaomi-mimo",
   xmtp: "xiaomi-tokenplan",
