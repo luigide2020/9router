@@ -38,6 +38,9 @@ COPY --from=builder /app/node_modules/next ./node_modules/next
 COPY --from=builder /app/node_modules/undici ./node_modules/undici
 # Ensure `ws` is available for M365 Copilot WebSocket client
 COPY --from=builder /app/node_modules/ws ./node_modules/ws
+# Ensure `https-proxy-agent` is available for proxy tunnel
+COPY --from=builder /app/node_modules/https-proxy-agent ./node_modules/https-proxy-agent
+COPY --from=builder /app/node_modules/agent-base ./node_modules/agent-base
 
 RUN mkdir -p /app/data && chown -R node:node /app && \
   mkdir -p /app/data-home && chown node:node /app/data-home && \

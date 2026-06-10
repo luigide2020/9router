@@ -1,8 +1,7 @@
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import WsClient from "ws";
-import * as net from "net";
-import * as tls from "tls";
+import { HttpsProxyAgent } from "https-proxy-agent";
 
 const M365_WS_BASE = "wss://substrate.office.com/m365chat/SecuredChathub";
 const M365_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
@@ -421,68 +420,17 @@ export class M365CopilotExecutor extends BaseExecutor {
 
     log?.info?.("M365-COPILOT", `Connecting WebSocket: oid=${oid.slice(0, 8)}..., tid=${tid.slice(0, 8)}..., model=${model}, prompt_len=${userPrompt.length}`);
 
-    // Open WebSocket connection (proxy-aware via CONNECT tunnel)
+    // Open WebSocket connection (proxy-aware via https-proxy-agent)
     const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
-    const wsUrlParsed = new URL(wsUrl);
     let ws;
 
     try {
+      const wsOpts = { headers: { "User-Agent": M365_USER_AGENT } };
       if (proxyUrl) {
         log?.info?.("M365-COPILOT", `Using HTTP proxy: ${proxyUrl}`);
-        const proxy = new URL(proxyUrl);
-        // Step 1: Establish CONNECT tunnel through proxy
-        const tunnelSocket = await new Promise((resolve, reject) => {
-          const connectReq = net.connect(
-            { host: proxy.hostname, port: parseInt(proxy.port || 80) },
-            () => {
-              connectReq.write(
-                `CONNECT ${wsUrlParsed.hostname}:${wsUrlParsed.port || 443} HTTP/1.1\r\n` +
-                `Host: ${wsUrlParsed.hostname}:${wsUrlParsed.port || 443}\r\n\r\n`
-              );
-            }
-          );
-          let data = '';
-          connectReq.on('data', (chunk) => {
-            data += chunk.toString();
-            if (data.includes('\r\n\r\n')) {
-              const statusLine = data.split('\r\n')[0];
-              const status = parseInt(statusLine.split(' ')[1]);
-              log?.info?.("M365-COPILOT", `CONNECT tunnel: ${statusLine}`);
-              connectReq.removeAllListeners('data');
-              connectReq.removeAllListeners('error');
-              if (status === 200) {
-                resolve(connectReq);
-              } else {
-                reject(new Error(`CONNECT failed: ${statusLine}`));
-              }
-            }
-          });
-          connectReq.on('error', reject);
-          setTimeout(() => { if (!connectReq.destroyed) { connectReq.destroy(); reject(new Error('CONNECT timed out')); } }, WS_CONNECT_TIMEOUT_MS);
-        });
-
-        // Step 2: Wrap tunnel in TLS
-        const tlsSocket = tls.connect({
-          socket: tunnelSocket,
-          servername: wsUrlParsed.hostname,
-        });
-
-        // Step 3: Use ws library over TLS tunnel via custom agent
-        // TLS already handled by tunnel, so use ws:// instead of wss://
-        const wsUrlHttp = wsUrl.replace(/^wss:/, "ws:");
-        const { Agent: HttpAgent } = await import("http");
-        const wsAgent = new HttpAgent();
-        wsAgent.createConnection = () => tlsSocket;
-        ws = new WsClient(wsUrlHttp, [], {
-          agent: wsAgent,
-          headers: { "User-Agent": M365_USER_AGENT },
-        });
-      } else {
-        // No proxy: use ws directly
-        ws = new WsClient(wsUrl, [], {
-          headers: { "User-Agent": M365_USER_AGENT },
-        });
+        wsOpts.agent = new HttpsProxyAgent(proxyUrl);
       }
+      ws = new WsClient(wsUrl, [], wsOpts);
     } catch (err) {
       return this._errorResponse(`WebSocket creation failed: ${err.message}`, 502, "upstream_error");
     }
