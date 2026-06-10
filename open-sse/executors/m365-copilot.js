@@ -1,5 +1,6 @@
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
+import { WebSocket as UndiciWebSocket, ProxyAgent } from "undici";
 
 const M365_WS_BASE = "wss://substrate.office.com/m365chat/SecuredChathub";
 const M365_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
@@ -418,10 +419,16 @@ export class M365CopilotExecutor extends BaseExecutor {
 
     log?.info?.("M365-COPILOT", `Connecting WebSocket: oid=${oid.slice(0, 8)}..., tid=${tid.slice(0, 8)}..., model=${model}, prompt_len=${userPrompt.length}`);
 
-    // Open WebSocket connection
+    // Open WebSocket connection (proxy-aware via undici)
+    const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
     let ws;
     try {
-      ws = new WebSocket(wsUrl);
+      const wsOpts = { headers: { "User-Agent": M365_USER_AGENT } };
+      if (proxyUrl) {
+        wsOpts.dispatcher = new ProxyAgent(proxyUrl);
+        log?.info?.("M365-COPILOT", `Using HTTP proxy: ${proxyUrl}`);
+      }
+      ws = new UndiciWebSocket(wsUrl, [], wsOpts);
     } catch (err) {
       return this._errorResponse(`WebSocket creation failed: ${err.message}`, 502, "upstream_error");
     }
@@ -440,7 +447,7 @@ export class M365CopilotExecutor extends BaseExecutor {
       return this._errorResponse(`M365 Copilot connection failed: ${err.message}`, 502, "upstream_error");
     });
 
-    if (ws.readyState !== WebSocket.OPEN) {
+    if (ws.readyState !== UndiciWebSocket.OPEN) {
       return this._errorResponse("M365 Copilot WebSocket failed to connect", 502, "upstream_error");
     }
 
