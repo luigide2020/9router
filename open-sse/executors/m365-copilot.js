@@ -505,8 +505,10 @@ export class M365CopilotExecutor extends BaseExecutor {
 
     // Adapt ws library API: wrap onmessage for streaming code
     // ws library emits 'message' event; existing code uses ws.onmessage = fn
+    // NOTE: set this AFTER SignalR handshake to avoid interference
+    const RS = "\u001e";
     ws.on("message", (data) => {
-      const text = typeof data === "string" ? data : data.toString();
+      const text = (typeof data === "string" ? data : data.toString()).replace(/\u001e$/, "");
       log?.info?.("M365-COPILOT", `WS recv: ${text.slice(0, 200)}`);
       if (ws.onmessage) ws.onmessage({ data: text });
     });
@@ -521,22 +523,49 @@ export class M365CopilotExecutor extends BaseExecutor {
     ws.on("ping", (data) => log?.info?.("M365-COPILOT", `WS ping recv: ${data?.toString().slice(0, 50)}`));
     ws.on("pong", (data) => log?.info?.("M365-COPILOT", `WS pong recv: ${data?.toString().slice(0, 50)}`));
 
-    log?.info?.("M365-COPILOT", `WS readyState=${ws.readyState}, sending init frame`);
+    log?.info?.("M365-COPILOT", `WS readyState=${ws.readyState}, sending SignalR handshake`);
 
-    // Send protocol init frame
-    ws.send(JSON.stringify({ protocol: "json", version: 1 }));
+    // SignalR protocol: all messages must end with \u001e (Record Separator)
+    const RS = "\u001e";
 
-    // Wait briefly for server ack, then send ping + user message
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Send protocol handshake
+    ws.send(JSON.stringify({ protocol: "json", version: 1 }) + RS);
 
-    log?.info?.("M365-COPILOT", `WS readyState after init=${ws.readyState}, sending message`);
+    // Wait for server handshake ack: {}\u001e
+    await new Promise((resolve, reject) => {
+      const ackTimer = setTimeout(() => reject(new Error("SignalR handshake timeout (10s)")), 10_000);
+      const onAck = (data) => {
+        const text = typeof data === "string" ? data : data.toString();
+        log?.info?.("M365-COPILOT", `WS handshake ack: ${text.slice(0, 100)}`);
+        // Check for handshake response ({} or error)
+        const payload = text.replace(/\u001e$/, "").trim();
+        if (payload) {
+          try {
+            const parsed = JSON.parse(payload);
+            if (parsed.error) {
+              clearTimeout(ackTimer);
+              ws.removeListener("message", onAck);
+              reject(new Error(`Handshake rejected: ${parsed.error}`));
+              return;
+            }
+          } catch { /* not JSON, ignore */ }
+        }
+        // Empty {} = handshake ack
+        clearTimeout(ackTimer);
+        ws.removeListener("message", onAck);
+        resolve();
+      };
+      ws.on("message", onAck);
+    });
+
+    log?.info?.("M365-COPILOT", `WS handshake OK, sending message`);
 
     // Send keep-alive ping (type 6)
-    ws.send(JSON.stringify({ type: 6 }));
+    ws.send(JSON.stringify({ type: 6 }) + RS);
 
     // Send user message
     const copilotMsg = buildCopilotMessage(userPrompt, 0, conversationId, sessionIdUuid, model);
-    ws.send(JSON.stringify(copilotMsg));
+    ws.send(JSON.stringify(copilotMsg) + RS);
 
     log?.info?.("M365-COPILOT", `Message sent (model=${model}), waiting for response stream`);
 
