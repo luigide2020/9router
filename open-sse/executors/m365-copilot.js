@@ -506,20 +506,30 @@ export class M365CopilotExecutor extends BaseExecutor {
     // Adapt ws library API: wrap onmessage for streaming code
     // ws library emits 'message' event; existing code uses ws.onmessage = fn
     ws.on("message", (data) => {
-      if (ws.onmessage) ws.onmessage({ data: typeof data === "string" ? data : data.toString() });
+      const text = typeof data === "string" ? data : data.toString();
+      log?.info?.("M365-COPILOT", `WS recv: ${text.slice(0, 200)}`);
+      if (ws.onmessage) ws.onmessage({ data: text });
     });
     ws.on("close", (code, reason) => {
+      log?.info?.("M365-COPILOT", `WS close: code=${code}, reason=${reason?.toString() || ""}`);
       if (ws.onclose) ws.onclose({ code, reason: reason?.toString() || "" });
     });
     ws.on("error", (err) => {
+      log?.error?.("M365-COPILOT", `WS error: ${err.message}`);
       if (ws.onerror) ws.onerror({ message: err.message });
     });
+    ws.on("ping", (data) => log?.info?.("M365-COPILOT", `WS ping recv: ${data?.toString().slice(0, 50)}`));
+    ws.on("pong", (data) => log?.info?.("M365-COPILOT", `WS pong recv: ${data?.toString().slice(0, 50)}`));
+
+    log?.info?.("M365-COPILOT", `WS readyState=${ws.readyState}, sending init frame`);
 
     // Send protocol init frame
     ws.send(JSON.stringify({ protocol: "json", version: 1 }));
 
     // Wait briefly for server ack, then send ping + user message
     await new Promise((resolve) => setTimeout(resolve, 200));
+
+    log?.info?.("M365-COPILOT", `WS readyState after init=${ws.readyState}, sending message`);
 
     // Send keep-alive ping (type 6)
     ws.send(JSON.stringify({ type: 6 }));
