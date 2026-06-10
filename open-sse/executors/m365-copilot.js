@@ -1,8 +1,7 @@
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import WsClient from "ws";
-import net from "net";
-import tls from "tls";
+import { HttpsProxyAgent } from "https-proxy-agent";
 
 const M365_WS_BASE = "wss://substrate.office.com/m365Copilot/Chathub";
 const M365_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.3.1 Safari/605.1.15";
@@ -469,25 +468,10 @@ export class M365CopilotExecutor extends BaseExecutor {
 
       if (proxyUrl) {
         log?.info?.("M365-COPILOT", `Using HTTP proxy: ${proxyUrl}`);
-        const proxy = new URL(proxyUrl);
-        const targetHost = "substrate.office.com";
-        const targetPort = 443;
-
-        const tunnelSocket = await connectViaProxy(proxy.hostname, parseInt(proxy.port || 80), targetHost, targetPort);
-        const tlsSocket = tls.connect({
-          socket: tunnelSocket,
-          servername: targetHost,
-          ALPNProtocols: ['http/1.1'],
-        });
-        await new Promise((r, j) => { tlsSocket.once('secureConnect', r); tlsSocket.once('error', j); });
-
-        // Use ws:// since TLS is already handled by the tunnel
-        const wsUrlHttp = `ws://${targetHost}/m365Copilot/Chathub/${encodeURIComponent(oid)}@${encodeURIComponent(tid)}?${wsParams.toString()}`;
-        wsOpts.createConnection = () => tlsSocket;
-        ws = new WsClient(wsUrlHttp, [], wsOpts);
-      } else {
-        ws = new WsClient(wsUrl, [], wsOpts);
+        wsOpts.agent = new HttpsProxyAgent(proxyUrl);
       }
+
+      ws = new WsClient(wsUrl, [], wsOpts);
     } catch (err) {
       log?.error?.("M365-COPILOT", `WebSocket connect failed: ${err.message}`);
       return this._errorResponse(`M365 Copilot connection failed: ${err.message}`, 502, "upstream_error");
@@ -569,36 +553,6 @@ export class M365CopilotExecutor extends BaseExecutor {
     }), { status, headers: { "Content-Type": "application/json" } });
     return { response: errResp, url: M365_WS_BASE, headers: {}, transformedBody: null };
   }
-}
-
-/**
- * Establish a TCP tunnel through an HTTP proxy via CONNECT method
- */
-function connectViaProxy(proxyHost, proxyPort, targetHost, targetPort) {
-  return new Promise((resolve, reject) => {
-    const socket = net.connect({ host: proxyHost, port: proxyPort }, () => {
-      socket.write(
-        `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
-        `Host: ${targetHost}:${targetPort}\r\n\r\n`
-      );
-    });
-    let buf = '';
-    socket.on('data', function onData(chunk) {
-      buf += chunk.toString();
-      const headerEnd = buf.indexOf('\r\n\r\n');
-      if (headerEnd !== -1) {
-        socket.removeListener('data', onData);
-        const statusLine = buf.split('\r\n')[0];
-        if (statusLine.includes('200')) {
-          resolve(socket);
-        } else {
-          reject(new Error(`Proxy CONNECT failed: ${statusLine}`));
-        }
-      }
-    });
-    socket.on('error', reject);
-    setTimeout(() => reject(new Error('Proxy CONNECT timeout')), 15000);
-  });
 }
 
 export default M365CopilotExecutor;
