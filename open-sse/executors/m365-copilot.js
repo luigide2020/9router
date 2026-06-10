@@ -413,7 +413,7 @@ export class M365CopilotExecutor extends BaseExecutor {
       "X-SessionId": sessionId,
       "access_token": accessToken,
       "X-variants": M365_X_VARIANTS,
-      "source": '"officeweb"',
+      "source": "officeweb",
       "scenario": "officeweb",
     });
     const wsUrl = `${M365_WS_BASE}/${encodeURIComponent(oid)}@${encodeURIComponent(tid)}?${wsParams.toString()}`;
@@ -425,7 +425,15 @@ export class M365CopilotExecutor extends BaseExecutor {
     let ws;
 
     try {
-      const wsOpts = { headers: { "User-Agent": M365_USER_AGENT } };
+      const wsOpts = {
+        headers: {
+          "User-Agent": M365_USER_AGENT,
+          "Origin": "https://substrate.office.com",
+          "Sec-Fetch-Dest": "websocket",
+          "Sec-Fetch-Mode": "websocket",
+          "Sec-Fetch-Site": "cross-site",
+        },
+      };
       if (proxyUrl) {
         log?.info?.("M365-COPILOT", `Using HTTP proxy: ${proxyUrl}`);
         wsOpts.agent = new HttpsProxyAgent(proxyUrl);
