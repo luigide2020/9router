@@ -3,25 +3,45 @@ import { PROVIDERS } from "../config/providers.js";
 import WsClient from "ws";
 import net from "net";
 import tls from "tls";
-import http from "http";
-import https from "https";
 
-const M365_WS_BASE = "wss://substrate.office.com/m365chat/SecuredChathub";
-const M365_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
+const M365_WS_BASE = "wss://substrate.office.com/m365Copilot/Chathub";
+const M365_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.3.1 Safari/605.1.15";
 const WS_CONNECT_TIMEOUT_MS = 15_000;
 const WS_RESPONSE_TIMEOUT_MS = 120_000;
 
-// X-variants features from the M365 Business Chat web app
-const M365_X_VARIANTS = [
-  "feature.includeExternal",
-  "feature.AssistantConnectorsContentSources",
-  "3S.BizChatWprBoostAssistant",
-  "3S.EnableMEFromSkillDiscovery",
-  "feature.EnableAuthErrorMessage",
-  "EnableRequestPlugins",
-  "feature.EnableSensitivityLabels",
-  "feature.IsEntityAnnotationsEnabled",
-  "EnableUnsupportedUrlDetector",
+// Feature variants from the current M365 Copilot web app (2025-06)
+const M365_VARIANTS = [
+  "EnableMcpServerWidgets", "feature.EnableMcpServerWidgets",
+  "feature.EnableLuForChatCIQ", "feature.enableChatCIQPlugin",
+  "EnableRequestPlugins", "feature.EnableSensitivityLabels",
+  "EnableUnsupportedUrlDetector", "feature.IsCustomEngineCopilotEnabled",
+  "feature.bizchatfluxv3", "feature.enablechatpages", "feature.enableCodeCanvas",
+  "feature.turnOnWorkTabRecommendation", "feature.turnOnDARecommendation",
+  "feature.IsStreamingModeInChatRequestEnabled",
+  "IncludeSourceAttributionsConcise", "SkipPublishEmptyMessage",
+  "feature.EnableDeduplicatingSourceAttributions",
+  "Enable3PActionProgressMessages", "feature.EnableCIQDesktopDisplay",
+  "feature.enableClientWebRtc", "feature.EnableMeetingRecapOfSeriesMeetingWithCiq",
+  "feature.EnableReferencesListCompleteSignal", "feature.StorageMessageSplitDisabled",
+  "feature.EnableCuaTakeControlApi",
+  "agt_bizchat_enablePagesCitations", "agt_bizchat_enablePagesCitationsForMultiturn",
+  "feature.cwcallowedos", "feature.EnableMergingPureDeltas",
+  "feature.disabledisallowedmsgs", "feature.enableCitationsForSynthesisData",
+  "feature.EnableConversationShareApis", "feature.enableGenerateGraphicArtOptionsSet",
+  "cdximagen", "feature.EnableUpdatedUXForConfirmationDialog",
+  "feature.EnableContentApiandDocTypeHtmlInRichAnswers",
+  "cdxgrounding_api_v2_rich_web_answers_reference_bottom_force",
+  "cdxenablerenderforisocomp",
+  "feature.EnableClientFileURLSupportForOfficeWebPaidCopilot",
+  "feature.EnableDesignEditorImageGrounding", "feature.EnableDesignerEditor",
+  "feature.EnableSkipRehydrationForSpeCIdImages", "feature.EnablePersonalization",
+  "agt_bizchat_enableRichResponses", "feature.EnableBase64DataInMessageAnnotations",
+  "feature.EnableSkipEmittingMessageOnFlush", "feature.EnableRemoveEmptySourceAttributions",
+  "feature.EnableRemoveStreamingMode",
+  "feature.OfficeWebToHelix", "feature.OfficeDesktopToHelix",
+  "feature.M365TeamsHubToHelix", "feature.OwaHubToHelix",
+  "feature.MonarchHubToHelix", "feature.Win32OutlookHubToHelix",
+  "feature.MacOutlookHubToHelix", "Agt_bizchat_enableGpt5ForHelix",
 ].join(",");
 
 /**
@@ -404,36 +424,40 @@ export class M365CopilotExecutor extends BaseExecutor {
 
     // Extract user identity from token
     const { oid, tid } = extractTokenClaims(accessToken);
-    const sessionId = crypto.randomUUID();
-    const conversationId = crypto.randomUUID();
-    const clientRequestId = crypto.randomUUID();
 
-    // Build WebSocket URL following the M365 Copilot protocol
-    // Ref: https://labs.zenity.io/p/access-copilot-m365-terminal
-    // URL format: wss://substrate.office.com/m365chat/SecuredChathub/{oid}@{tid}?params...
-    // Only send routing-critical params (matches browser behavior exactly).
-    // Extra params (X-variants, source, scenario) change the RequestHash-Query
-    // and cause NanoProxy to route to a non-existent backend (0x80070036).
+    // Build WebSocket URL matching browser behavior exactly (2025-06)
+    // Path: /m365Copilot/Chathub/{oid}@{tid}
+    // Session IDs: chatsessionid/clientrequestid use hex (no hyphens), X-SessionId uses UUID format
+    const rawHex = crypto.randomUUID().replace(/-/g, ""); // 32-char hex
+    const sessionIdHex = rawHex;
+    const sessionIdUuid = `${rawHex.slice(0,8)}-${rawHex.slice(8,12)}-${rawHex.slice(12,16)}-${rawHex.slice(16,20)}-${rawHex.slice(20)}`;
+    const conversationId = crypto.randomUUID();
+
     const wsParams = new URLSearchParams({
-      "clientRequestId": clientRequestId,
-      "chatSessionId": sessionId,
-      "XRoutingParameterSessionKey": sessionId,
+      "chatsessionid": sessionIdHex,
+      "XRoutingParameterSessionKey": sessionIdHex,
+      "clientrequestid": sessionIdHex,
+      "X-SessionId": sessionIdUuid,
+      "ConversationId": conversationId,
       "access_token": accessToken,
+      "variants": M365_VARIANTS,
+      "source": '"officeweb"',
+      "product": "Office",
+      "agentHost": "Bizchat.FullScreen",
+      "licenseType": "Starter",
+      "isEdu": "false",
+      "agent": "web",
+      "scenario": "OfficeWebIncludedCopilot",
     });
     const wsUrl = `${M365_WS_BASE}/${encodeURIComponent(oid)}@${encodeURIComponent(tid)}?${wsParams.toString()}`;
 
     log?.info?.("M365-COPILOT", `Connecting WebSocket: oid=${oid.slice(0, 8)}..., tid=${tid.slice(0, 8)}..., model=${model}, prompt_len=${userPrompt.length}`);
 
-    // Open WebSocket connection via manual CONNECT tunnel (full control over upgrade request)
+    // Open WebSocket connection (via proxy tunnel if HTTPS_PROXY is set)
     const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
     let ws;
 
     try {
-      // Step 1: Pre-flight HTTP request to get session cookies
-      const cookies = await fetchCookies(proxyUrl, accessToken, log);
-      log?.info?.("M365-COPILOT", `Pre-flight cookies: ${cookies.length}`);
-
-      // Step 2: Build ws options with cookies
       const wsHeaders = {
         "User-Agent": M365_USER_AGENT,
         "Origin": "https://m365.cloud.microsoft",
@@ -441,20 +465,14 @@ export class M365CopilotExecutor extends BaseExecutor {
         "Sec-Fetch-Mode": "websocket",
         "Sec-Fetch-Site": "cross-site",
       };
-      if (cookies.length > 0) {
-        wsHeaders["Cookie"] = cookies.join("; ");
-      }
-
       const wsOpts = { headers: wsHeaders };
 
       if (proxyUrl) {
         log?.info?.("M365-COPILOT", `Using HTTP proxy: ${proxyUrl}`);
-        // Manual CONNECT tunnel: establish raw TCP→proxy→TLS→target
         const proxy = new URL(proxyUrl);
         const targetHost = "substrate.office.com";
         const targetPort = 443;
 
-        // Create TLS socket through proxy tunnel
         const tunnelSocket = await connectViaProxy(proxy.hostname, parseInt(proxy.port || 80), targetHost, targetPort);
         const tlsSocket = tls.connect({
           socket: tunnelSocket,
@@ -463,8 +481,8 @@ export class M365CopilotExecutor extends BaseExecutor {
         });
         await new Promise((r, j) => { tlsSocket.once('secureConnect', r); tlsSocket.once('error', j); });
 
-        // Use ws:// since TLS is already handled by our tunnel
-        const wsUrlHttp = `ws://${targetHost}/m365chat/SecuredChathub/${encodeURIComponent(oid)}@${encodeURIComponent(tid)}?${wsParams.toString()}`;
+        // Use ws:// since TLS is already handled by the tunnel
+        const wsUrlHttp = `ws://${targetHost}/m365Copilot/Chathub/${encodeURIComponent(oid)}@${encodeURIComponent(tid)}?${wsParams.toString()}`;
         wsOpts.createConnection = () => tlsSocket;
         ws = new WsClient(wsUrlHttp, [], wsOpts);
       } else {
@@ -523,7 +541,7 @@ export class M365CopilotExecutor extends BaseExecutor {
     ws.send(JSON.stringify({ type: 6 }));
 
     // Send user message
-    const copilotMsg = buildCopilotMessage(userPrompt, 0, conversationId, sessionId, model);
+    const copilotMsg = buildCopilotMessage(userPrompt, 0, conversationId, sessionIdUuid, model);
     ws.send(JSON.stringify(copilotMsg));
 
     log?.info?.("M365-COPILOT", `Message sent (model=${model}), waiting for response stream`);
@@ -581,81 +599,6 @@ function connectViaProxy(proxyHost, proxyPort, targetHost, targetPort) {
     socket.on('error', reject);
     setTimeout(() => reject(new Error('Proxy CONNECT timeout')), 15000);
   });
-}
-
-/**
- * Pre-flight HTTP request to substrate.office.com to collect session cookies.
- * Browsers automatically visit the web app first and accumulate cookies
- * that are then sent with the WebSocket upgrade request.
- */
-async function fetchCookies(proxyUrl, accessToken, log) {
-  try {
-    const url = `https://substrate.office.com/m365chat/SecuredChathub/negotiate?negotiateVersion=1`;
-    const fetchOpts = {
-      method: 'POST',
-      headers: {
-        'User-Agent': M365_USER_AGENT,
-        'Origin': 'https://m365.cloud.microsoft',
-        'Authorization': `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      redirect: 'manual',
-    };
-    // Use proxy for the pre-flight too
-    if (proxyUrl) {
-      const { HttpsProxyAgent } = await import('https-proxy-agent');
-      fetchOpts.dispatcher = undefined;
-      fetchOpts.agent = new HttpsProxyAgent(proxyUrl);
-      // Use https module directly
-      return await new Promise((resolve) => {
-        const parsedUrl = new URL(url);
-        const proxy = new URL(proxyUrl);
-        const reqOpts = {
-          host: proxy.hostname,
-          port: parseInt(proxy.port || 80),
-          method: 'CONNECT',
-          path: `${parsedUrl.hostname}:443`,
-        };
-        const connectReq = http.request(reqOpts);
-        connectReq.on('connect', (res, socket) => {
-          if (res.statusCode !== 200) { resolve([]); return; }
-          const req = https.request({
-            host: parsedUrl.hostname,
-            port: 443,
-            path: parsedUrl.pathname + parsedUrl.search,
-            method: 'POST',
-            socket: socket,
-            agent: false,
-            headers: {
-              'User-Agent': M365_USER_AGENT,
-              'Origin': 'https://m365.cloud.microsoft',
-              'Authorization': `Bearer ${accessToken}`,
-              'Content-Type': 'application/json',
-              'Content-Length': '0',
-            },
-          }, (resp) => {
-            const cookies = (resp.headers['set-cookie'] || []).map(c => c.split(';')[0]);
-            log?.info?.("M365-COPILOT", `Negotiate status: ${resp.statusCode}, cookies: ${cookies.length}`);
-            resp.resume(); // drain
-            resolve(cookies);
-          });
-          req.on('error', () => resolve([]));
-          req.end();
-        });
-        connectReq.on('error', () => resolve([]));
-        connectReq.end();
-      });
-    }
-    // Direct (no proxy)
-    const resp = await fetch(url, fetchOpts);
-    const setCookies = resp.headers.getSetCookie?.() || [];
-    const cookies = setCookies.map(c => c.split(';')[0]);
-    log?.info?.("M365-COPILOT", `Negotiate status: ${resp.status}, cookies: ${cookies.length}`);
-    return cookies;
-  } catch (e) {
-    log?.info?.("M365-COPILOT", `Pre-flight cookie fetch failed: ${e.message}, continuing without cookies`);
-    return [];
-  }
 }
 
 export default M365CopilotExecutor;
