@@ -452,6 +452,18 @@ export class M365CopilotExecutor extends BaseExecutor {
       }, WS_CONNECT_TIMEOUT_MS);
 
       ws.on("open", () => { clearTimeout(timer); resolve(); });
+      ws.on("unexpected-response", (req, res) => {
+        clearTimeout(timer);
+        const headers = {};
+        for (const [k, v] of Object.entries(res.headers || {})) {
+          if (k.startsWith('x-') || k === 'server') headers[k] = v;
+        }
+        let body = '';
+        res.on('data', (c) => { body += c; });
+        res.on('end', () => {
+          reject(new Error(`HTTP ${res.statusCode}: headers=${JSON.stringify(headers)}, body=${body.slice(0, 200)}`));
+        });
+      });
       ws.on("error", (err) => {
         clearTimeout(timer);
         reject(new Error(`WebSocket error: ${err.message || err}`));
