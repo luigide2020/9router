@@ -320,21 +320,29 @@ function buildStreamingFromWs(ws, model, cid, created, signal) {
 /**
  * Build non-streaming response by collecting full text from WebSocket
  */
-async function buildNonStreamingFromWs(ws, model, cid, created, signal, log) {
+async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, messageBuffer) {
   return new Promise((resolve) => {
     let fullText = "";
     const thinkingParts = [];
+    let resolved = false;
+
+    const doResolve = (response) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(responseTimer);
+      try { ws.close(); } catch {}
+      resolve(response);
+    };
 
     const responseTimer = setTimeout(() => {
-      try { ws.close(); } catch {}
-      resolve(new Response(JSON.stringify({
+      doResolve(new Response(JSON.stringify({
         error: { message: "M365 Copilot response timed out", type: "upstream_error", code: "TIMEOUT" },
       }), { status: 504, headers: { "Content-Type": "application/json" } }));
     }, WS_RESPONSE_TIMEOUT_MS);
 
-    ws.onmessage = (event) => {
+    const handleMessage = (text) => {
       try {
-        const data = JSON.parse(typeof event.data === "string" ? event.data : "");
+        const data = JSON.parse(text);
         log?.info?.("M365-COPILOT", `NonStream handler: type=${data.type}, hasItem=${!!data.item}, hasArgs=${!!data.arguments}, fullText_len=${fullText.length}`);
         // M365 SignalR: type 1 streaming updates use arguments[0].messages
         if (data.type === 1) {
@@ -358,21 +366,17 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log) {
             }
           }
           if (payload?.result?.value && payload.result.value !== "Success") {
-            clearTimeout(responseTimer);
-            try { ws.close(); } catch {}
-            resolve(new Response(JSON.stringify({
+            doResolve(new Response(JSON.stringify({
               error: { message: payload.result.message || payload.result.value, type: "upstream_error", code: "COPILOT_ERROR" },
             }), { status: 502, headers: { "Content-Type": "application/json" } }));
             return;
           }
           // Type 2 = conversation turn complete in M365 Copilot
           log?.info?.("M365-COPILOT", `NonStream resolving: fullText_len=${fullText.length}`);
-          clearTimeout(responseTimer);
-          try { ws.close(); } catch {}
           const promptTokens = Math.ceil(fullText.length / 4);
           const completionTokens = Math.ceil(fullText.length / 4);
           const msg = { role: "assistant", content: fullText };
-          resolve(new Response(JSON.stringify({
+          doResolve(new Response(JSON.stringify({
             id: cid, object: "chat.completion", created, model, system_fingerprint: null,
             choices: [{ index: 0, message: msg, finish_reason: "stop", logprobs: null }],
             usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
@@ -380,34 +384,32 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log) {
           return;
         }
         if (data.type === 3) {
-          clearTimeout(responseTimer);
-          try { ws.close(); } catch {}
           const promptTokens = Math.ceil(fullText.length / 4);
           const completionTokens = Math.ceil(fullText.length / 4);
           const msg = { role: "assistant", content: fullText };
-          resolve(new Response(JSON.stringify({
+          doResolve(new Response(JSON.stringify({
             id: cid, object: "chat.completion", created, model, system_fingerprint: null,
             choices: [{ index: 0, message: msg, finish_reason: "stop", logprobs: null }],
             usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
           }), { status: 200, headers: { "Content-Type": "application/json" } }));
         }
-      } catch { /* ignore non-JSON frames */ }
+      } catch (e) { log?.error?.("M365-COPILOT", `NonStream parse error: ${e.message}`); }
     };
 
+    // Set ws.onmessage to forward to handleMessage
+    ws.onmessage = (event) => handleMessage(typeof event.data === "string" ? event.data : "");
+
     ws.onerror = (err) => {
-      clearTimeout(responseTimer);
-      try { ws.close(); } catch {}
-      resolve(new Response(JSON.stringify({
+      doResolve(new Response(JSON.stringify({
         error: { message: `WebSocket error: ${err?.message || String(err)}`, type: "upstream_error", code: "WS_ERROR" },
       }), { status: 502, headers: { "Content-Type": "application/json" } }));
     };
 
     ws.onclose = () => {
-      clearTimeout(responseTimer);
       if (fullText) {
         const promptTokens = Math.ceil(fullText.length / 4);
         const completionTokens = Math.ceil(fullText.length / 4);
-        resolve(new Response(JSON.stringify({
+        doResolve(new Response(JSON.stringify({
           id: cid, object: "chat.completion", created, model, system_fingerprint: null,
           choices: [{ index: 0, message: { role: "assistant", content: fullText }, finish_reason: "stop", logprobs: null }],
           usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
@@ -417,13 +419,19 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log) {
 
     if (signal) {
       signal.addEventListener("abort", () => {
-        clearTimeout(responseTimer);
-        try { ws.close(); } catch {}
-        resolve(new Response(JSON.stringify({
+        doResolve(new Response(JSON.stringify({
           error: { message: "Request aborted", type: "upstream_error", code: "ABORTED" },
         }), { status: 499, headers: { "Content-Type": "application/json" } }));
       }, { once: true });
     }
+
+    // Process buffered messages (race condition fix)
+    log?.info?.("M365-COPILOT", `NonStream processing ${messageBuffer.length} buffered messages`);
+    for (const buf of messageBuffer) {
+      handleMessage(buf);
+      if (resolved) return;
+    }
+    messageBuffer.length = 0;
   });
 }
 
@@ -535,26 +543,6 @@ export class M365CopilotExecutor extends BaseExecutor {
       return this._errorResponse(`M365 Copilot connection failed: ${err.message}`, 502, "upstream_error");
     });
 
-    // Adapt ws library API: wrap onmessage for streaming code
-    // ws library emits 'message' event; existing code uses ws.onmessage = fn
-    // NOTE: set this AFTER SignalR handshake to avoid interference
-    const RS = "\u001e";
-    ws.on("message", (data) => {
-      const text = (typeof data === "string" ? data : data.toString()).replace(/\u001e$/, "");
-      log?.info?.("M365-COPILOT", `WS recv: ${text.slice(0, 200)}`);
-      if (ws.onmessage) ws.onmessage({ data: text });
-    });
-    ws.on("close", (code, reason) => {
-      log?.info?.("M365-COPILOT", `WS close: code=${code}, reason=${reason?.toString() || ""}`);
-      if (ws.onclose) ws.onclose({ code, reason: reason?.toString() || "" });
-    });
-    ws.on("error", (err) => {
-      log?.error?.("M365-COPILOT", `WS error: ${err.message}`);
-      if (ws.onerror) ws.onerror({ message: err.message });
-    });
-    ws.on("ping", (data) => log?.info?.("M365-COPILOT", `WS ping recv: ${data?.toString().slice(0, 50)}`));
-    ws.on("pong", (data) => log?.info?.("M365-COPILOT", `WS pong recv: ${data?.toString().slice(0, 50)}`));
-
     log?.info?.("M365-COPILOT", `WS readyState=${ws.readyState}, sending SignalR handshake`);
 
     // Send protocol handshake
@@ -589,6 +577,30 @@ export class M365CopilotExecutor extends BaseExecutor {
 
     log?.info?.("M365-COPILOT", `WS handshake OK, sending message`);
 
+    // Set up message listener BEFORE sending to avoid race condition
+    // Buffer messages until buildNonStreamingFromWs/buildStreamingFromWs sets ws.onmessage
+    const RS = "\u001e";
+    const messageBuffer = [];
+    let messageListenerActive = true;
+    const messageListener = (data) => {
+      const text = (typeof data === "string" ? data : data.toString()).replace(/\u001e$/, "");
+      log?.info?.("M365-COPILOT", `WS recv: ${text.slice(0, 200)}`);
+      if (ws.onmessage) {
+        ws.onmessage({ data: text });
+      } else {
+        messageBuffer.push(text);
+      }
+    };
+    ws.on("message", messageListener);
+    ws.on("close", (code, reason) => {
+      log?.info?.("M365-COPILOT", `WS close: code=${code}, reason=${reason?.toString() || ""}`);
+      if (ws.onclose) ws.onclose({ code, reason: reason?.toString() || "" });
+    });
+    ws.on("error", (err) => {
+      log?.error?.("M365-COPILOT", `WS error: ${err.message}`);
+      if (ws.onerror) ws.onerror({ message: err.message });
+    });
+
     // Send keep-alive ping (type 6)
     ws.send(JSON.stringify({ type: 6 }) + RS);
 
@@ -604,12 +616,18 @@ export class M365CopilotExecutor extends BaseExecutor {
     let finalResponse;
     if (stream) {
       const sseStream = buildStreamingFromWs(ws, model, cid, created, signal);
+      // Process buffered messages
+      for (const buf of messageBuffer) {
+        if (ws.onmessage) ws.onmessage({ data: buf });
+      }
+      messageBuffer.length = 0;
       finalResponse = new Response(sseStream, {
         status: 200,
         headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no" },
       });
     } else {
-      finalResponse = await buildNonStreamingFromWs(ws, model, cid, created, signal, log);
+      // Set up onmessage with buffer processing inside buildNonStreamingFromWs
+      finalResponse = await buildNonStreamingFromWs(ws, model, cid, created, signal, log, messageBuffer);
     }
 
     return { response: finalResponse, url: M365_WS_BASE, headers: {}, transformedBody: copilotMsg };
