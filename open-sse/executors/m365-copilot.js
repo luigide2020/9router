@@ -340,8 +340,10 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, mes
       }), { status: 504, headers: { "Content-Type": "application/json" } }));
     }, WS_RESPONSE_TIMEOUT_MS);
 
-    const handleMessage = (text) => {
+    const handleMessage = (rawText) => {
       try {
+        // Strip any trailing Record Separator (SignalR protocol)
+        const text = rawText.replace(/\u001e/g, "");
         const data = JSON.parse(text);
         log?.info?.("M365-COPILOT", `NonStream handler: type=${data.type}, hasItem=${!!data.item}, hasArgs=${!!data.arguments}, fullText_len=${fullText.length}`);
         // M365 SignalR: type 1 streaming updates use arguments[0].messages
@@ -583,7 +585,7 @@ export class M365CopilotExecutor extends BaseExecutor {
     // Buffer messages until buildNonStreamingFromWs/buildStreamingFromWs sets ws.onmessage
     const messageBuffer = [];
     const messageListener = (data) => {
-      const text = (typeof data === "string" ? data : data.toString()).replace(/\u001e$/, "");
+      const text = (typeof data === "string" ? data : data.toString()).replace(/\u001e/g, "");
       log?.info?.("M365-COPILOT", `WS recv: ${text.slice(0, 200)}`);
       if (ws.onmessage) {
         ws.onmessage({ data: text });
