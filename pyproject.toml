@@ -5,6 +5,7 @@ description = "M365 Copilot reverse-engineering test scripts"
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.28.1",
+    "playwright>=1.60.0",
     "pyjwt>=2.13.0",
     "python-dotenv>=1.2.2",
     "requests>=2.34.2",
