@@ -43,86 +43,54 @@ const M365_VARIANTS = [
   "feature.MacOutlookHubToHelix", "Agt_bizchat_enableGpt5ForHelix",
 ].join(",");
 
-/**
- * Decode JWT payload (no verification, just extract claims)
- */
+/** Decode JWT payload (no verification, just extract claims) */
 function decodeJwtPayload(token) {
   try {
     const parts = token.split(".");
     if (parts.length < 2) return null;
-    const payload = Buffer.from(parts[1], "base64url").toString("utf-8");
-    return JSON.parse(payload);
-  } catch {
-    return null;
-  }
+    return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf-8"));
+  } catch { return null; }
 }
 
-/**
- * Extract oid and tid from access token
- */
+/** Extract oid and tid from access token */
 function extractTokenClaims(token) {
   const claims = decodeJwtPayload(token);
   if (!claims) return { oid: "unknown", tid: "unknown" };
-  return {
-    oid: claims.oid || claims.sub || "unknown",
-    tid: claims.tid || "unknown",
-  };
+  return { oid: claims.oid || claims.sub || "unknown", tid: claims.tid || "unknown" };
 }
 
-/**
- * Parse OpenAI messages into a single user query string + conversation history
- */
+/** Parse OpenAI messages into a single user query string */
 function parseOpenAIMessages(messages) {
   const extracted = [];
   for (const msg of messages) {
     let role = String(msg.role || "user");
     if (role === "developer") role = "system";
     let content = "";
-    if (typeof msg.content === "string") {
-      content = msg.content;
-    } else if (Array.isArray(msg.content)) {
-      content = msg.content.filter((c) => c.type === "text").map((c) => String(c.text || "")).join(" ");
-    }
+    if (typeof msg.content === "string") content = msg.content;
+    else if (Array.isArray(msg.content)) content = msg.content.filter((c) => c.type === "text").map((c) => String(c.text || "")).join(" ");
     if (!content.trim()) continue;
     extracted.push({ role, text: content });
   }
-
-  // Find last user message
   let lastUserIdx = -1;
   for (let i = extracted.length - 1; i >= 0; i--) {
     if (extracted[i].role === "user") { lastUserIdx = i; break; }
   }
-
-  // Build context: prepend system + history as context, send last user message as prompt
   const contextParts = [];
   let userPrompt = "";
   for (let i = 0; i < extracted.length; i++) {
     const { role, text } = extracted[i];
-    if (i === lastUserIdx) {
-      userPrompt = text;
-    } else {
-      contextParts.push(`${role}: ${text}`);
-    }
+    if (i === lastUserIdx) userPrompt = text;
+    else contextParts.push(`${role}: ${text}`);
   }
-
-  // If there's context, prepend it
   if (contextParts.length > 0 && userPrompt) {
     userPrompt = contextParts.join("\n\n") + "\n\nuser: " + userPrompt;
   }
-
   return userPrompt;
 }
 
-/**
- * Build Copilot WebSocket message frame
- */
-/**
- * Map model ID to M365 Copilot model family option
- * M365 backend uses optionsSets / options to route to different model backends
- */
+/** Map model ID to M365 Copilot model family options */
 function resolveCopilotModelOptions(modelId) {
   const normalized = (modelId || "copilot").toLowerCase();
-  // Map of model IDs to their optionsSets and gptModelFamily
   const modelMap = {
     "gpt-5.5": { optionsSets: ["galileo"], options: { gptModelFamily: "gpt-5.5" } },
     "gpt-5.4": { optionsSets: ["galileo"], options: { gptModelFamily: "gpt-5.4" } },
@@ -140,15 +108,12 @@ function resolveCopilotModelOptions(modelId) {
 
 function buildCopilotMessage(text, invocationId, conversationId, sessionId, modelId) {
   const { optionsSets: modelOptionSets, options: modelOptions } = resolveCopilotModelOptions(modelId);
-  const baseOptionsSets = ["enterprise_flux_handoff_outlook_compose"];
-  const optionsSets = [...baseOptionsSets, ...modelOptionSets];
-
   return {
     arguments: [{
       source: "officeweb",
       clientCorrelationId: crypto.randomUUID(),
       sessionId,
-      optionsSets,
+      optionsSets: ["enterprise_flux_handoff_outlook_compose", ...modelOptionSets],
       options: { ...modelOptions },
       allowedMessageTypes: [
         "Chat", "Suggestion", "InternalSearchQuery", "InternalSearchResult",
@@ -190,6 +155,31 @@ function sseChunk(data) {
 }
 
 /**
+ * Safely parse a SignalR text payload that may contain multiple JSON records
+ * separated by \u001e (Record Separator). Returns array of parsed objects.
+ */
+function parseSignalRRecords(rawText) {
+  // Convert to string, strip all RS characters, then split on RS boundaries
+  const str = typeof rawText === "string" ? rawText : String(rawText);
+  // Split by \u001e to handle multi-record frames: "JSON1\u001eJSON2\u001e" → ["JSON1","JSON2",""]
+  const parts = str.split("\u001e");
+  const results = [];
+  for (const part of parts) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    try {
+      results.push(JSON.parse(trimmed));
+    } catch {
+      // Retry after stripping embedded control chars (0x00-0x1F except \t \n \r)
+      try {
+        results.push(JSON.parse(trimmed.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "")));
+      } catch { /* skip unparseable records */ }
+    }
+  }
+  return results;
+}
+
+/**
  * Build streaming SSE response from WebSocket messages
  */
 function buildStreamingFromWs(ws, model, cid, created, signal) {
@@ -197,7 +187,6 @@ function buildStreamingFromWs(ws, model, cid, created, signal) {
 
   return new ReadableStream({
     start(controller) {
-      // Send initial role chunk
       controller.enqueue(encoder.encode(sseChunk({
         id: cid, object: "chat.completion.chunk", created, model, system_fingerprint: null,
         choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null, logprobs: null }],
@@ -229,74 +218,65 @@ function buildStreamingFromWs(ws, model, cid, created, signal) {
         close();
       };
 
-      // Timeout for response
       const responseTimer = setTimeout(() => {
         if (!closed) sendError("M365 Copilot response timed out");
       }, WS_RESPONSE_TIMEOUT_MS);
 
-      ws.onmessage = (event) => {
-        try {
-          const rawText = typeof event.data === "string" ? event.data : "";
-          const text = rawText.replace(/\u001e/g, "").trim();
-          if (!text) return;
-          const data = JSON.parse(text);
-          // M365 SignalR: type 1 streaming updates use arguments[0].messages
-          if (data.type === 1) {
-            const payload = data.item || data.arguments?.[0];
-            if (payload?.messages) {
-              for (const msg of payload.messages) {
-                if (msg.text && msg.author === "bot") {
-                  const delta = msg.text.slice(fullText.length);
-                  if (delta) {
-                    fullText = msg.text;
-                    controller.enqueue(encoder.encode(sseChunk({
-                      id: cid, object: "chat.completion.chunk", created, model, system_fingerprint: null,
-                      choices: [{ index: 0, delta: { content: delta }, finish_reason: null, logprobs: null }],
-                    })));
-                  }
+      const processData = (data) => {
+        // Type 1: streaming text updates
+        if (data.type === 1) {
+          const payload = data.item || data.arguments?.[0];
+          if (payload?.messages) {
+            for (const msg of payload.messages) {
+              if (msg.text && msg.author === "bot") {
+                const delta = msg.text.slice(fullText.length);
+                if (delta) {
+                  fullText = msg.text;
+                  controller.enqueue(encoder.encode(sseChunk({
+                    id: cid, object: "chat.completion.chunk", created, model, system_fingerprint: null,
+                    choices: [{ index: 0, delta: { content: delta }, finish_reason: null, logprobs: null }],
+                  })));
                 }
               }
             }
           }
-          // Type 2: final complete message (M365 uses type 2 as completion signal)
-          if (data.type === 2) {
-            const payload = data.item || data.arguments?.[0];
-            if (payload?.messages) {
-              for (const msg of payload.messages) {
-                if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
-                  const delta = msg.text.slice(fullText.length);
-                  fullText = msg.text;
-                  if (delta) {
-                    controller.enqueue(encoder.encode(sseChunk({
-                      id: cid, object: "chat.completion.chunk", created, model, system_fingerprint: null,
-                      choices: [{ index: 0, delta: { content: delta }, finish_reason: null, logprobs: null }],
-                    })));
-                  }
+        }
+        // Type 2: final complete message (M365 completion signal)
+        if (data.type === 2) {
+          const payload = data.item || data.arguments?.[0];
+          if (payload?.messages) {
+            for (const msg of payload.messages) {
+              if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
+                const delta = msg.text.slice(fullText.length);
+                fullText = msg.text;
+                if (delta) {
+                  controller.enqueue(encoder.encode(sseChunk({
+                    id: cid, object: "chat.completion.chunk", created, model, system_fingerprint: null,
+                    choices: [{ index: 0, delta: { content: delta }, finish_reason: null, logprobs: null }],
+                  })));
                 }
               }
             }
-            // Check for result message
-            if (payload?.result?.value && payload.result.value !== "Success") {
-              sendError(payload.result.message || payload.result.value);
-              return;
-            }
-            // Type 2 = conversation turn complete in M365 Copilot
-            clearTimeout(responseTimer);
-            close();
+          }
+          // Check for errors (including Throttled) BEFORE closing
+          if (payload?.result?.value && payload.result.value !== "Success") {
+            sendError(payload.result.message || payload.result.value);
             return;
           }
-          // Type 3: end of conversation turn
-          if (data.type === 3) {
-            clearTimeout(responseTimer);
-            close();
-          }
-          // Error from server
-          if (data.type === 2 && data.item?.result?.value === "Throttled") {
-            sendError("M365 Copilot rate limited (Throttled)");
-          }
-        } catch {
-          // Non-JSON frames (e.g. empty init response) — ignore
+          clearTimeout(responseTimer);
+          close();
+          return;
         }
+        // Type 3: end of conversation turn
+        if (data.type === 3) {
+          clearTimeout(responseTimer);
+          close();
+        }
+      };
+
+      ws.onmessage = (event) => {
+        const records = parseSignalRRecords(event.data);
+        for (const data of records) processData(data);
       };
 
       ws.onerror = (err) => {
@@ -309,7 +289,6 @@ function buildStreamingFromWs(ws, model, cid, created, signal) {
         close();
       };
 
-      // Handle client abort
       if (signal) {
         signal.addEventListener("abort", () => {
           clearTimeout(responseTimer);
@@ -326,7 +305,6 @@ function buildStreamingFromWs(ws, model, cid, created, signal) {
 async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, messageBuffer) {
   return new Promise((resolve) => {
     let fullText = "";
-    const thinkingParts = [];
     let resolved = false;
 
     const doResolve = (response) => {
@@ -343,63 +321,59 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, mes
       }), { status: 504, headers: { "Content-Type": "application/json" } }));
     }, WS_RESPONSE_TIMEOUT_MS);
 
-    const handleMessage = (rawText) => {
-      try {
-        // Strip any Record Separator (SignalR protocol)
-        const text = rawText.replace(/\u001e/g, "").trim();
-        if (!text) return;
-        const data = JSON.parse(text);
-        log?.info?.("M365-COPILOT", `NonStream handler: type=${data.type}, hasItem=${!!data.item}, hasArgs=${!!data.arguments}, fullText_len=${fullText.length}`);
-        // M365 SignalR: type 1 streaming updates use arguments[0].messages
-        if (data.type === 1) {
-          const payload = data.item || data.arguments?.[0];
-          if (payload?.messages) {
-            for (const msg of payload.messages) {
-              if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
-                fullText = msg.text;
-              }
+    const makeCompletionResponse = () => {
+      const promptTokens = Math.ceil(fullText.length / 4);
+      const completionTokens = Math.ceil(fullText.length / 4);
+      return new Response(JSON.stringify({
+        id: cid, object: "chat.completion", created, model, system_fingerprint: null,
+        choices: [{ index: 0, message: { role: "assistant", content: fullText }, finish_reason: "stop", logprobs: null }],
+        usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+
+    const processData = (data) => {
+      // Type 1: streaming text updates
+      if (data.type === 1) {
+        const payload = data.item || data.arguments?.[0];
+        if (payload?.messages) {
+          for (const msg of payload.messages) {
+            if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
+              fullText = msg.text;
             }
           }
         }
-        // Type 2: final complete message (M365 uses type 2 as completion signal)
-        if (data.type === 2) {
-          const payload = data.item || data.arguments?.[0];
-          if (payload?.messages) {
-            for (const msg of payload.messages) {
-              if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
-                fullText = msg.text;
-              }
+      }
+      // Type 2: final complete message (M365 completion signal)
+      if (data.type === 2) {
+        const payload = data.item || data.arguments?.[0];
+        if (payload?.messages) {
+          for (const msg of payload.messages) {
+            if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
+              fullText = msg.text;
             }
           }
-          if (payload?.result?.value && payload.result.value !== "Success") {
-            doResolve(new Response(JSON.stringify({
-              error: { message: payload.result.message || payload.result.value, type: "upstream_error", code: "COPILOT_ERROR" },
-            }), { status: 502, headers: { "Content-Type": "application/json" } }));
-            return;
-          }
-          // Type 2 = conversation turn complete in M365 Copilot
-          log?.info?.("M365-COPILOT", `NonStream resolving: fullText_len=${fullText.length}`);
-          const promptTokens = Math.ceil(fullText.length / 4);
-          const completionTokens = Math.ceil(fullText.length / 4);
-          const msg = { role: "assistant", content: fullText };
+        }
+        if (payload?.result?.value && payload.result.value !== "Success") {
           doResolve(new Response(JSON.stringify({
-            id: cid, object: "chat.completion", created, model, system_fingerprint: null,
-            choices: [{ index: 0, message: msg, finish_reason: "stop", logprobs: null }],
-            usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
-          }), { status: 200, headers: { "Content-Type": "application/json" } }));
+            error: { message: payload.result.message || payload.result.value, type: "upstream_error", code: "COPILOT_ERROR" },
+          }), { status: 502, headers: { "Content-Type": "application/json" } }));
           return;
         }
-        if (data.type === 3) {
-          const promptTokens = Math.ceil(fullText.length / 4);
-          const completionTokens = Math.ceil(fullText.length / 4);
-          const msg = { role: "assistant", content: fullText };
-          doResolve(new Response(JSON.stringify({
-            id: cid, object: "chat.completion", created, model, system_fingerprint: null,
-            choices: [{ index: 0, message: msg, finish_reason: "stop", logprobs: null }],
-            usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
-          }), { status: 200, headers: { "Content-Type": "application/json" } }));
-        }
-      } catch (e) { log?.error?.("M365-COPILOT", `NonStream parse error: ${e.message}`); }
+        doResolve(makeCompletionResponse());
+        return;
+      }
+      // Type 3: end of conversation turn
+      if (data.type === 3) {
+        doResolve(makeCompletionResponse());
+      }
+    };
+
+    const handleMessage = (rawText) => {
+      const records = parseSignalRRecords(rawText);
+      for (const data of records) {
+        processData(data);
+        if (resolved) return;
+      }
     };
 
     // Set ws.onmessage to forward to handleMessage
@@ -412,15 +386,7 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, mes
     };
 
     ws.onclose = () => {
-      if (fullText) {
-        const promptTokens = Math.ceil(fullText.length / 4);
-        const completionTokens = Math.ceil(fullText.length / 4);
-        doResolve(new Response(JSON.stringify({
-          id: cid, object: "chat.completion", created, model, system_fingerprint: null,
-          choices: [{ index: 0, message: { role: "assistant", content: fullText }, finish_reason: "stop", logprobs: null }],
-          usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
-        }), { status: 200, headers: { "Content-Type": "application/json" } }));
-      }
+      if (fullText) doResolve(makeCompletionResponse());
     };
 
     if (signal) {
@@ -432,7 +398,6 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, mes
     }
 
     // Process buffered messages (race condition fix)
-    log?.info?.("M365-COPILOT", `NonStream processing ${messageBuffer.length} buffered messages`);
     for (const buf of messageBuffer) {
       handleMessage(buf);
       if (resolved) return;
@@ -452,7 +417,6 @@ export class M365CopilotExecutor extends BaseExecutor {
       return this._errorResponse("Missing or empty messages array", 400, "invalid_request");
     }
 
-    // Extract access token
     const accessToken = credentials.accessToken || credentials.apiKey;
     if (!accessToken) {
       return this._errorResponse(
@@ -461,19 +425,15 @@ export class M365CopilotExecutor extends BaseExecutor {
       );
     }
 
-    // Parse user prompt
     const userPrompt = parseOpenAIMessages(messages);
     if (!userPrompt.trim()) {
       return this._errorResponse("Empty query after processing", 400, "invalid_request");
     }
 
-    // Extract user identity from token
     const { oid, tid } = extractTokenClaims(accessToken);
 
-    // Build WebSocket URL matching browser behavior exactly (2025-06)
-    // Path: /m365Copilot/Chathub/{oid}@{tid}
-    // Session IDs: chatsessionid/clientrequestid use hex (no hyphens), X-SessionId uses UUID format
-    const rawHex = crypto.randomUUID().replace(/-/g, ""); // 32-char hex
+    // Build WebSocket URL matching browser behavior (2025-06)
+    const rawHex = crypto.randomUUID().replace(/-/g, "");
     const sessionIdHex = rawHex;
     const sessionIdUuid = `${rawHex.slice(0,8)}-${rawHex.slice(8,12)}-${rawHex.slice(12,16)}-${rawHex.slice(16,20)}-${rawHex.slice(20)}`;
     const conversationId = crypto.randomUUID();
@@ -498,7 +458,7 @@ export class M365CopilotExecutor extends BaseExecutor {
 
     log?.info?.("M365-COPILOT", `Connecting WebSocket: oid=${oid.slice(0, 8)}..., tid=${tid.slice(0, 8)}..., model=${model}, prompt_len=${userPrompt.length}`);
 
-    // Open WebSocket connection (via proxy tunnel if HTTPS_PROXY is set)
+    // Open WebSocket connection
     const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
     let ws;
 
@@ -524,12 +484,12 @@ export class M365CopilotExecutor extends BaseExecutor {
     }
 
     // Wait for WebSocket open
-    await new Promise((resolve, reject) => {
+    const connectError = await new Promise((resolvePromise) => {
       const timer = setTimeout(() => {
         try { ws.close(); } catch {}
-        reject(new Error("WebSocket connection timed out"));
+        resolvePromise("WebSocket connection timed out");
       }, WS_CONNECT_TIMEOUT_MS);
-      ws.on("open", () => { clearTimeout(timer); resolve(); });
+      ws.on("open", () => { clearTimeout(timer); resolvePromise(null); });
       ws.on("unexpected-response", (req, res) => {
         clearTimeout(timer);
         const hdrs = {};
@@ -538,16 +498,18 @@ export class M365CopilotExecutor extends BaseExecutor {
         }
         let body = '';
         res.on('data', (c) => { body += c; });
-        res.on('end', () => reject(new Error(`HTTP ${res.statusCode}: ${JSON.stringify(hdrs)}, body=${body.slice(0, 200)}`)));
+        res.on('end', () => resolvePromise(`HTTP ${res.statusCode}: ${JSON.stringify(hdrs)}, body=${body.slice(0, 200)}`));
       });
       ws.on("error", (err) => {
         clearTimeout(timer);
-        reject(new Error(`WebSocket error: ${err.message || err}`));
+        resolvePromise(`WebSocket error: ${err.message || err}`);
       });
-    }).catch((err) => {
-      log?.error?.("M365-COPILOT", `WebSocket connect failed: ${err.message}`);
-      return this._errorResponse(`M365 Copilot connection failed: ${err.message}`, 502, "upstream_error");
     });
+
+    if (connectError) {
+      log?.error?.("M365-COPILOT", `WebSocket connect failed: ${connectError}`);
+      return this._errorResponse(`M365 Copilot connection failed: ${connectError}`, 502, "upstream_error");
+    }
 
     log?.info?.("M365-COPILOT", `WS readyState=${ws.readyState}, sending SignalR handshake`);
 
@@ -557,58 +519,48 @@ export class M365CopilotExecutor extends BaseExecutor {
     ws.send(JSON.stringify({ protocol: "json", version: 1 }) + RS);
 
     // Wait for server handshake ack: {}\u001e
-    await new Promise((resolve, reject) => {
-      const ackTimer = setTimeout(() => reject(new Error("SignalR handshake timeout (10s)")), 10_000);
+    const handshakeError = await new Promise((resolvePromise) => {
+      const ackTimer = setTimeout(() => resolvePromise("SignalR handshake timeout (10s)"), 10_000);
       const onAck = (data) => {
         const text = typeof data === "string" ? data : data.toString();
         log?.info?.("M365-COPILOT", `WS handshake ack: ${text.slice(0, 100)}`);
-        // Check for handshake response ({} or error)
-        const payload = text.replace(/\u001e$/, "").trim();
+        const payload = text.replace(/\u001e/g, "").trim();
         if (payload) {
           try {
             const parsed = JSON.parse(payload);
             if (parsed.error) {
               clearTimeout(ackTimer);
               ws.removeListener("message", onAck);
-              reject(new Error(`Handshake rejected: ${parsed.error}`));
+              resolvePromise(`Handshake rejected: ${parsed.error}`);
               return;
             }
           } catch { /* not JSON, ignore */ }
         }
-        // Empty {} = handshake ack
         clearTimeout(ackTimer);
         ws.removeListener("message", onAck);
-        resolve();
+        resolvePromise(null);
       };
       ws.on("message", onAck);
     });
 
+    if (handshakeError) {
+      log?.error?.("M365-COPILOT", `SignalR handshake failed: ${handshakeError}`);
+      try { ws.close(); } catch {}
+      return this._errorResponse(`M365 Copilot handshake failed: ${handshakeError}`, 502, "upstream_error");
+    }
+
     log?.info?.("M365-COPILOT", `WS handshake OK, sending message`);
 
     // Set up message listener BEFORE sending to avoid race condition
-    // Buffer messages until buildNonStreamingFromWs/buildStreamingFromWs sets ws.onmessage
     const messageBuffer = [];
     const messageListener = (data) => {
-      // Handle different data types from ws library
       let rawStr;
-      if (Buffer.isBuffer(data)) {
-        rawStr = data.toString("utf8");
-      } else if (Array.isArray(data)) {
-        rawStr = Buffer.concat(data).toString("utf8");
-      } else if (data instanceof ArrayBuffer || data instanceof Uint8Array) {
-        rawStr = Buffer.from(data).toString("utf8");
-      } else {
-        rawStr = String(data);
-      }
-      // Strip ALL \u001e (Record Separator) characters
+      if (Buffer.isBuffer(data)) rawStr = data.toString("utf8");
+      else if (Array.isArray(data)) rawStr = Buffer.concat(data).toString("utf8");
+      else if (data instanceof ArrayBuffer || data instanceof Uint8Array) rawStr = Buffer.from(data).toString("utf8");
+      else rawStr = String(data);
+      // Strip RS and forward
       const text = rawStr.replace(/\u001e/g, "");
-      // Debug: log if text has non-JSON trailing chars
-      const trimmed = text.trim();
-      if (trimmed.length > 0 && trimmed[trimmed.length - 1] !== "}" && trimmed[trimmed.length - 1] !== "]") {
-        const tail = trimmed.slice(-10);
-        const codes = [...tail].map(c => `0x${c.charCodeAt(0).toString(16)}`);
-        log?.info?.("M365-COPILOT", `WS data tail: "${tail}" codes=[${codes.join(",")}]`);
-      }
       log?.info?.("M365-COPILOT", `WS recv: ${text.slice(0, 200)}`);
       if (ws.onmessage) {
         ws.onmessage({ data: text });
@@ -651,7 +603,6 @@ export class M365CopilotExecutor extends BaseExecutor {
         headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no" },
       });
     } else {
-      // Set up onmessage with buffer processing inside buildNonStreamingFromWs
       finalResponse = await buildNonStreamingFromWs(ws, model, cid, created, signal, log, messageBuffer);
     }
 
@@ -659,10 +610,12 @@ export class M365CopilotExecutor extends BaseExecutor {
   }
 
   _errorResponse(message, status, code) {
-    const errResp = new Response(JSON.stringify({
-      error: { message, type: code || "upstream_error", code: code || `HTTP_${status}` },
-    }), { status, headers: { "Content-Type": "application/json" } });
-    return { response: errResp, url: M365_WS_BASE, headers: {}, transformedBody: null };
+    return {
+      response: new Response(JSON.stringify({
+        error: { message, type: code || "upstream_error", code: code || `HTTP_${status}` },
+      }), { status, headers: { "Content-Type": "application/json" } }),
+      url: M365_WS_BASE, headers: {}, transformedBody: null,
+    };
   }
 }
 
