@@ -190,17 +190,25 @@ def do_login(page, email, password):
 
 def extract_tokens(page):
     """从 localStorage 提取 token"""
-    # 确保在 outlook.office.com 域（token 存储在这里）
-    current_url = page.url
-    if "outlook.office.com" not in current_url:
-        print("[TOKEN] 导航到 outlook.office.com 提取 token...")
-        try:
-            page.goto("https://outlook.office.com", wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(3000)
-        except Exception:
-            pass
-
+    # 先从当前域尝试提取
+    print("[TOKEN] 从当前页面提取 token...")
     result = page.evaluate(TOKEN_EXTRACT_JS)
+
+    # 如果当前域没有，尝试 outlook.office.com
+    if not result.get("accessToken"):
+        current_url = page.url
+        if "outlook.office.com" not in current_url:
+            print("[TOKEN] 当前域未找到 token，尝试 outlook.office.com...")
+            try:
+                page.goto("https://outlook.office.com", wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(3000)
+                result = page.evaluate(TOKEN_EXTRACT_JS)
+                # 导航回 M365
+                page.goto(URL, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(2000)
+            except Exception as e:
+                print(f"[TOKEN] 导航 outlook 失败: {e}")
+
     return result
 
 
