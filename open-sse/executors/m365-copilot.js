@@ -545,6 +545,8 @@ export class M365CopilotExecutor extends BaseExecutor {
 
     log?.info?.("M365-COPILOT", `WS readyState=${ws.readyState}, sending SignalR handshake`);
 
+    const RS = "\u001e";
+
     // Send protocol handshake
     ws.send(JSON.stringify({ protocol: "json", version: 1 }) + RS);
 
@@ -579,9 +581,7 @@ export class M365CopilotExecutor extends BaseExecutor {
 
     // Set up message listener BEFORE sending to avoid race condition
     // Buffer messages until buildNonStreamingFromWs/buildStreamingFromWs sets ws.onmessage
-    const RS = "\u001e";
     const messageBuffer = [];
-    let messageListenerActive = true;
     const messageListener = (data) => {
       const text = (typeof data === "string" ? data : data.toString()).replace(/\u001e$/, "");
       log?.info?.("M365-COPILOT", `WS recv: ${text.slice(0, 200)}`);
