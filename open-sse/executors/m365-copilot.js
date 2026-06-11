@@ -236,7 +236,10 @@ function buildStreamingFromWs(ws, model, cid, created, signal) {
 
       ws.onmessage = (event) => {
         try {
-          const data = JSON.parse(typeof event.data === "string" ? event.data : "");
+          const rawText = typeof event.data === "string" ? event.data : "";
+          const text = rawText.replace(/\u001e/g, "").trim();
+          if (!text) return;
+          const data = JSON.parse(text);
           // M365 SignalR: type 1 streaming updates use arguments[0].messages
           if (data.type === 1) {
             const payload = data.item || data.arguments?.[0];
@@ -342,8 +345,9 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, mes
 
     const handleMessage = (rawText) => {
       try {
-        // Strip any trailing Record Separator (SignalR protocol)
-        const text = rawText.replace(/\u001e/g, "");
+        // Strip any Record Separator (SignalR protocol)
+        const text = rawText.replace(/\u001e/g, "").trim();
+        if (!text) return;
         const data = JSON.parse(text);
         log?.info?.("M365-COPILOT", `NonStream handler: type=${data.type}, hasItem=${!!data.item}, hasArgs=${!!data.arguments}, fullText_len=${fullText.length}`);
         // M365 SignalR: type 1 streaming updates use arguments[0].messages
@@ -585,7 +589,26 @@ export class M365CopilotExecutor extends BaseExecutor {
     // Buffer messages until buildNonStreamingFromWs/buildStreamingFromWs sets ws.onmessage
     const messageBuffer = [];
     const messageListener = (data) => {
-      const text = (typeof data === "string" ? data : data.toString()).replace(/\u001e/g, "");
+      // Handle different data types from ws library
+      let rawStr;
+      if (Buffer.isBuffer(data)) {
+        rawStr = data.toString("utf8");
+      } else if (Array.isArray(data)) {
+        rawStr = Buffer.concat(data).toString("utf8");
+      } else if (data instanceof ArrayBuffer || data instanceof Uint8Array) {
+        rawStr = Buffer.from(data).toString("utf8");
+      } else {
+        rawStr = String(data);
+      }
+      // Strip ALL \u001e (Record Separator) characters
+      const text = rawStr.replace(/\u001e/g, "");
+      // Debug: log if text has non-JSON trailing chars
+      const trimmed = text.trim();
+      if (trimmed.length > 0 && trimmed[trimmed.length - 1] !== "}" && trimmed[trimmed.length - 1] !== "]") {
+        const tail = trimmed.slice(-10);
+        const codes = [...tail].map(c => `0x${c.charCodeAt(0).toString(16)}`);
+        log?.info?.("M365-COPILOT", `WS data tail: "${tail}" codes=[${codes.join(",")}]`);
+      }
       log?.info?.("M365-COPILOT", `WS recv: ${text.slice(0, 200)}`);
       if (ws.onmessage) {
         ws.onmessage({ data: text });
