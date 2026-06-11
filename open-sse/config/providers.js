@@ -384,7 +384,7 @@ export const PROVIDERS = {
   "m365-copilot": {
     baseUrl: "https://m365.cloud.microsoft/",
     format: "m365-copilot",
-    authType: "token"
+    authType: "cookie"
   },
   azure: {
     baseUrl: "",

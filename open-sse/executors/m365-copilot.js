@@ -93,15 +93,7 @@ function resolveCopilotModelOptions(modelId) {
   const normalized = (modelId || "copilot").toLowerCase();
   const modelMap = {
     "gpt-5.5": { optionsSets: ["galileo"], options: { gptModelFamily: "gpt-5.5" } },
-    "gpt-5.4": { optionsSets: ["galileo"], options: { gptModelFamily: "gpt-5.4" } },
-    "gpt-5.4-mini": { optionsSets: ["galileo"], options: { gptModelFamily: "gpt-5.4-mini" } },
     "gpt-5.2": { optionsSets: ["galileo"], options: { gptModelFamily: "gpt-5.2" } },
-    "gpt-5": { optionsSets: ["galileo"], options: { gptModelFamily: "gpt-5" } },
-    "gpt-5-mini": { optionsSets: ["galileo"], options: { gptModelFamily: "gpt-5-mini" } },
-    "gpt-4o": { optionsSets: [], options: { gptModelFamily: "gpt-4o" } },
-    "gpt-4.1": { optionsSets: [], options: { gptModelFamily: "gpt-4.1" } },
-    "o3": { optionsSets: ["reasoning"], options: { gptModelFamily: "o3" } },
-    "o4-mini": { optionsSets: ["reasoning"], options: { gptModelFamily: "o4-mini" } },
   };
   return modelMap[normalized] || { optionsSets: [], options: {} };
 }
@@ -559,13 +551,12 @@ export class M365CopilotExecutor extends BaseExecutor {
       else if (Array.isArray(data)) rawStr = Buffer.concat(data).toString("utf8");
       else if (data instanceof ArrayBuffer || data instanceof Uint8Array) rawStr = Buffer.from(data).toString("utf8");
       else rawStr = String(data);
-      // Strip RS and forward
-      const text = rawStr.replace(/\u001e/g, "");
-      log?.info?.("M365-COPILOT", `WS recv: ${text.slice(0, 200)}`);
+      // Keep RS (\u001e) delimiters intact for parseSignalRRecords to split multi-record frames
+      log?.info?.("M365-COPILOT", `WS recv: ${rawStr.replace(/\u001e/g, "|").slice(0, 200)}`);
       if (ws.onmessage) {
-        ws.onmessage({ data: text });
+        ws.onmessage({ data: rawStr });
       } else {
-        messageBuffer.push(text);
+        messageBuffer.push(rawStr);
       }
     };
     ws.on("message", messageListener);
