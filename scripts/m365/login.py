@@ -22,6 +22,7 @@ import os
 import re
 import sys
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -195,12 +196,14 @@ def main():
             record(tok, url + " (frame)", "ws-frame")
 
     def on_ws(ws):
-        print(f"\n[WS] {ws.url[:100]}")
+        print("[WS]", ws.url[:120])
+        # 1) token 在 URL query 里
         m = re.search(r"[?&]access_token=([^&]+)", ws.url)
         if m:
-            record(m.group(1), ws.url, "ws-query")
-        # 有些实现把 token 放在第一帧
-        ws.on("framesent", lambda frame: _scan_frame(frame.get("payload", ""), ws.url))
+            record(urllib.parse.unquote(m.group(1)), ws.url, "ws-query")
+        # 2) token 在帧里(payload 直接就是 str/bytes,别用 .get)
+        ws.on("framesent", lambda payload: _scan_frame(payload, ws.url + " [sent]"))
+        ws.on("framereceived", lambda payload: _scan_frame(payload, ws.url + " [recv]"))
 
     # ── 启动浏览器 ────────────────────────────────────────────────────────────
     with sync_playwright() as p:
