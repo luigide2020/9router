@@ -1,32 +1,24 @@
 """
-M365 Copilot 登录 + WebSocket 抓包脚本
+M365 Copilot 登录 + access_token 抓取脚本
+
+原理：拦截页面 HTTP 请求，从 Authorization: Bearer 头中提取 access_token。
+      比解析 localStorage 更可靠（MSAL v4 会加密存储）。
 
 用法:
-    # 首次运行：设置环境变量后运行
     export M365_EMAIL="your@email.com"
     export M365_PASSWORD="your_password"
-    uv run scripts/m365/login.py
-
-    # 后续运行：会复用缓存的登录态
-    uv run scripts/m365/login.py
-
-    # 只抓包不登录（已有登录态时）
-    uv run scripts/m365/login.py --sniff-only
-
-    # 指定模式对比
-    uv run scripts/m365/login.py --compare-modes
-
-功能:
-    1. 自动登录 M365（或复用缓存登录态）
-    2. 拦截 WebSocket send，打印 optionsSets / options
-    3. 提取 access token 和 refresh token 到 ~/.9router/m365-token.json
+    uv run scripts/m365/login.py                # 登录 + 抓 token
+    uv run scripts/m365/login.py --sniff-only   # 复用缓存登录态
 """
 
 import argparse
+import base64
 import json
 import os
+import re
 import sys
-import base64
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -36,128 +28,30 @@ except ImportError:
     sys.exit(1)
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
-URL = "https://m365.cloud.microsoft/chat"
+CHAT_URL = "https://m365.cloud.microsoft/chat"
 USER_DATA_DIR = str(Path(__file__).parent / ".browser_profile")
 TOKEN_DIR = Path.home() / ".9router"
 TOKEN_FILE = TOKEN_DIR / "m365-token.json"
 
-# ── WebSocket 拦截器（注入到页面） ────────────────────────────────────────────
-WS_INTERCEPTOR_JS = """
-() => {
-    window.__wsCaptures = [];
-    const OrigWS = window.WebSocket;
+# 我们关心的 token 目标 host（按优先级）
+TARGET_HOSTS = [
+    "substrate.office.com",  # Copilot WebSocket 用的 token
+]
 
-    window.WebSocket = function(url, protocols) {
-        const ws = protocols ? new OrigWS(url, protocols) : new OrigWS(url);
 
-        if (typeof url === 'string' && (url.includes('substrate') || url.includes('Chathub'))) {
-            console.log('[HOOK] Copilot WebSocket detected');
-
-            // 拦截 send
-            const origSend = ws.send.bind(ws);
-            ws.send = function(data) {
-                if (typeof data === 'string') {
-                    try {
-                        const cleaned = data.replace(/\\u001e$/, '');
-                        const msg = JSON.parse(cleaned);
-                        if (msg.arguments && msg.arguments[0]) {
-                            const capture = {
-                                timestamp: Date.now(),
-                                optionsSets: msg.arguments[0].optionsSets || [],
-                                options: msg.arguments[0].options || {},
-                                text: msg.arguments[0].message?.text || '',
-                                target: msg.target || '',
-                                type: msg.type,
-                            };
-                            window.__wsCaptures.push(capture);
-                            console.log('[CAPTURED]', JSON.stringify(capture, null, 2));
-                        }
-                    } catch (e) {}
-                }
-                return origSend(data);
-            };
-
-            // 监听消息（用于调试）
-            ws.addEventListener('message', (event) => {
-                if (typeof event.data === 'string' && event.data.includes('"type":2')) {
-                    console.log('[RESPONSE] Received type=2 (completion)');
-                }
-            });
-        }
-
-        return ws;
-    };
-
-    // 保持原型链
-    window.WebSocket.prototype = OrigWS.prototype;
-    window.WebSocket.CONNECTING = OrigWS.CONNECTING;
-    window.WebSocket.OPEN = OrigWS.OPEN;
-    window.WebSocket.CLOSING = OrigWS.CLOSING;
-    window.WebSocket.CLOSED = OrigWS.CLOSED;
-
-    console.log('[HOOK] WebSocket interceptor installed ✅');
-}
-"""
-
-# ── Token 提取器 ──────────────────────────────────────────────────────────────
-TOKEN_EXTRACT_JS = """
-() => {
-    const result = { accessToken: null, refreshToken: null, clientId: null, claims: null };
-
-    try {
-        const keys = Object.keys(localStorage);
-
-        // 1. 找 access token
-        for (const key of keys) {
-            const value = localStorage.getItem(key);
-            if (!value) continue;
-            try {
-                const parsed = JSON.parse(value);
-                if (parsed.secret && (parsed.credentialType === 'AccessToken' || key.includes('accesstoken'))) {
-                    const target = parsed.target || key || '';
-                    if (target.includes('substrate') || target.includes('sydney') ||
-                        key.includes('substrate') || key.includes('sydney')) {
-                        const parts = parsed.secret.split('.');
-                        if (parts.length >= 2) {
-                            const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
-                            if (payload.exp && payload.exp * 1000 > Date.now()) {
-                                result.accessToken = parsed.secret;
-                                result.claims = payload;
-                                result.clientId = payload.appid || payload.azp || null;
-                            }
-                        }
-                    }
-                }
-            } catch {}
-        }
-
-        // 2. 找 refresh token
-        if (result.claims) {
-            const uid = result.claims.oid || result.claims.sub || '';
-            const utid = result.claims.tid || '';
-            const homeAccountId = `${uid}.${utid}`;
-
-            for (const key of keys) {
-                if (!key.includes('refreshtoken')) continue;
-                const value = localStorage.getItem(key);
-                if (!value) continue;
-                try {
-                    const parsed = JSON.parse(value);
-                    if (parsed.homeAccountId === homeAccountId) {
-                        // 尝试 secret 字段（旧版 MSAL），再尝试 data 字段（新版加密）
-                        result.refreshToken = parsed.secret || parsed.data || null;
-                        break;
-                    }
-                } catch {}
-            }
-        }
-    } catch (e) {
-        result.error = e.message;
-    }
-
-    return result;
-}
-"""
+def decode_jwt_payload(token: str) -> dict | None:
+    """解码 JWT payload（不验证签名）"""
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        payload = parts[1]
+        padding = 4 - len(payload) % 4
+        if padding != 4:
+            payload += "=" * padding
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:
+        return None
 
 
 def is_logged_in(page):
@@ -188,152 +82,43 @@ def do_login(page, email, password):
     print("[LOGIN] ✅ 登录成功")
 
 
-def extract_tokens(page):
-    """从 localStorage 提取 token"""
-    # 先从当前域尝试提取
-    print("[TOKEN] 从当前页面提取 token...")
-    result = page.evaluate(TOKEN_EXTRACT_JS)
-
-    # 如果当前域没有，尝试 outlook.office.com
-    if not result.get("accessToken"):
-        current_url = page.url
-        if "outlook.office.com" not in current_url:
-            print("[TOKEN] 当前域未找到 token，尝试 outlook.office.com...")
-            try:
-                page.goto("https://outlook.office.com", wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(3000)
-                result = page.evaluate(TOKEN_EXTRACT_JS)
-                # 导航回 M365
-                page.goto(URL, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(2000)
-            except Exception as e:
-                print(f"[TOKEN] 导航 outlook 失败: {e}")
-
-    return result
-
-
-def save_tokens(token_data):
-    """保存 token 到文件"""
+def save_token(token: str) -> None:
+    """保存 access token 到文件"""
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
 
-    claims = token_data.get("claims") or {}
-    token_file_data = {
-        "accessToken": token_data.get("accessToken"),
-        "refreshToken": token_data.get("refreshToken"),
-        "clientId": token_data.get("clientId"),
-        "extractedAt": __import__("datetime").datetime.now().isoformat(),
-        "expiresAt": __import__("datetime").datetime.fromtimestamp(claims["exp"]).isoformat() if claims.get("exp") else "unknown",
-        "userPrincipalName": claims.get("upn") or claims.get("preferred_username") or "unknown",
-        "tenantId": claims.get("tid") or "unknown",
-        "objectId": claims.get("oid") or "unknown",
+    claims = decode_jwt_payload(token) or {}
+    exp = claims.get("exp")
+    expires_at = datetime.fromtimestamp(exp, tz=timezone.utc).isoformat() if exp else "unknown"
+    user = claims.get("upn") or claims.get("preferred_username") or "unknown"
+
+    data = {
+        "accessToken": token,
+        "extractedAt": datetime.now(tz=timezone.utc).isoformat(),
+        "expiresAt": expires_at,
+        "userPrincipalName": user,
+        "tenantId": claims.get("tid", "unknown"),
+        "objectId": claims.get("oid", "unknown"),
+        "clientId": claims.get("appid") or claims.get("azp") or "unknown",
     }
 
-    TOKEN_FILE.write_text(json.dumps(token_file_data, indent=2, ensure_ascii=False))
-    print(f"[TOKEN] ✅ 已保存到 {TOKEN_FILE}")
-    print(f"  用户: {token_file_data['userPrincipalName']}")
-    print(f"  过期: {token_file_data['expiresAt']}")
-    print(f"  Refresh token: {'有' if token_file_data['refreshToken'] else '无（加密格式不可用）'}")
-    return token_file_data
+    TOKEN_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    print(f"\n[TOKEN] ✅ 已保存到 {TOKEN_FILE}")
+    print(f"  用户: {user}")
+    print(f"  过期: {expires_at}")
+    print(f"  Client: {data['clientId']}")
 
-
-def wait_for_captures(page, prompt_text="Hello", timeout_sec=30):
-    """发送消息并等待 WebSocket 捕获"""
-    print(f"\n[SNIFF] 请在浏览器中发送消息，或等待自动发送...")
-    print(f"[SNIFF] 等待 {timeout_sec} 秒内的 WebSocket 消息...")
-
-    # 尝试在输入框中输入并发送
-    try:
-        textarea = page.locator('textarea, [contenteditable="true"], [role="textbox"]').first
-        if textarea.is_visible(timeout=3000):
-            textarea.fill(prompt_text)
-            page.wait_for_timeout(500)
-            # 按 Enter 发送
-            page.keyboard.press("Enter")
-            print(f"[SNIFF] 已自动发送: {prompt_text}")
-    except Exception as e:
-        print(f"[SNIFF] 自动发送失败: {e}")
-        print(f"[SNIFF] 请手动在浏览器中发送一条消息")
-
-    # 等待捕获
-    page.wait_for_timeout(timeout_sec * 1000)
-
-    # 读取捕获结果
-    captures = page.evaluate("() => window.__wsCaptures || []")
-    return captures
-
-
-def print_captures(captures):
-    """打印捕获的 WebSocket 消息"""
-    if not captures:
-        print("\n[RESULT] ❌ 未捕获到任何 WebSocket 消息")
-        print("[HINT] 可能需要手动在浏览器中发送消息")
-        return
-
-    print(f"\n{'='*60}")
-    print(f"[RESULT] 捕获到 {len(captures)} 条 WebSocket 消息")
-    print(f"{'='*60}")
-
-    for i, cap in enumerate(captures):
-        print(f"\n--- 消息 #{i+1} ---")
-        print(f"  时间: {cap.get('timestamp', 'N/A')}")
-        print(f"  文本: {cap.get('text', '')[:80]}")
-        print(f"  type: {cap.get('type', 'N/A')}")
-        print(f"  target: {cap.get('target', 'N/A')}")
-        print(f"  optionsSets: {json.dumps(cap.get('optionsSets', []), ensure_ascii=False)}")
-        print(f"  options: {json.dumps(cap.get('options', {}), ensure_ascii=False)}")
-
-
-def compare_modes(page):
-    """对比不同模式的 optionsSets"""
-    print("\n" + "="*60)
-    print("  模式对比：Quick vs Think Deeper")
-    print("="*60)
-
-    captures = []
-
-    # 模式 1: Auto/Quick
-    print("\n[MODE 1] Auto/Quick 模式")
-    print("[INFO] 请在浏览器中用 Quick 模式发送一条消息...")
-    page.wait_for_timeout(20000)
-    caps1 = page.evaluate("() => window.__wsCaptures || []")
-    if caps1:
-        captures.extend(caps1)
-        print(f"  捕获到 {len(caps1)} 条")
-
-    # 清空
-    page.evaluate("() => { window.__wsCaptures = []; }")
-
-    # 模式 2: Think Deeper
-    print("\n[MODE 2] Think Deeper 模式")
-    print("[INFO] 请切换到 Think Deeper 模式，再发送一条消息...")
-    page.wait_for_timeout(30000)
-    caps2 = page.evaluate("() => window.__wsCaptures || []")
-    if caps2:
-        captures.extend(caps2)
-        print(f"  捕获到 {len(caps2)} 条")
-
-    print_captures(captures)
-
-    # 对比差异
-    if len(captures) >= 2:
-        print(f"\n{'='*60}")
-        print("  差异分析")
-        print(f"{'='*60}")
-        s1 = set(json.dumps(captures[0].get("optionsSets", [])))
-        s2 = set(json.dumps(captures[-1].get("optionsSets", [])))
-        if s1 == s2:
-            print("  optionsSets 相同（可能模式切换未生效）")
-        else:
-            print(f"  Quick:  {captures[0].get('optionsSets', [])}")
-            print(f"  Think:  {captures[-1].get('optionsSets', [])}")
+    if exp and exp < time.time():
+        print("[TOKEN] ⚠️  注意：token 已过期！")
+    elif exp:
+        remaining = exp - time.time()
+        print(f"  剩余: {remaining/60:.0f} 分钟")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="M365 Copilot 登录 + WebSocket 抓包")
-    parser.add_argument("--sniff-only", action="store_true", help="跳过登录，直接抓包（需已有登录态）")
-    parser.add_argument("--compare-modes", action="store_true", help="对比 Quick 和 Think Deeper 模式")
-    parser.add_argument("--prompt", default="What is 2+2?", help="自动发送的测试消息")
-    parser.add_argument("--headless", action="store_true", help="无头模式（不显示浏览器窗口）")
+    parser = argparse.ArgumentParser(description="M365 Copilot 登录 + access_token 抓取")
+    parser.add_argument("--sniff-only", action="store_true", help="跳过登录，直接抓 token（需已有登录态）")
+    parser.add_argument("--headless", action="store_true", help="无头模式")
+    parser.add_argument("--timeout", type=int, default=60, help="等待 token 的超时秒数（默认 60）")
     args = parser.parse_args()
 
     email = os.environ.get("M365_EMAIL", "")
@@ -341,10 +126,34 @@ def main():
 
     if not args.sniff_only and (not email or not password):
         print("[ERROR] 请设置环境变量 M365_EMAIL 和 M365_PASSWORD")
-        print("  export M365_EMAIL='your@email.com'")
-        print("  export M365_PASSWORD='your_password'")
         sys.exit(1)
 
+    # ── 抓取状态 ──────────────────────────────────────────────────────────────
+    captured_tokens: dict[str, str] = {}   # host -> token
+    substrate_token: str | None = None
+
+    def on_request(req):
+        nonlocal substrate_token
+        auth = req.headers.get("authorization", "")
+        if not auth.lower().startswith("bearer "):
+            return
+        token = auth[7:]
+        if len(token) < 100:  # 过滤掉短 token
+            return
+
+        # 提取 host
+        host = re.sub(r"^https?://([^/]+)/.*$", r"\1", req.url)
+
+        if host not in captured_tokens:
+            captured_tokens[host] = token
+            print(f"[捕获] {host}  (token 前40字符: {token[:40]}...)")
+
+        # 检测 substrate token
+        if host in TARGET_HOSTS and substrate_token is None:
+            substrate_token = token
+            print(f"[✅] 捕获到 substrate access_token!")
+
+    # ── 启动浏览器 ────────────────────────────────────────────────────────────
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             USER_DATA_DIR,
@@ -353,12 +162,12 @@ def main():
         )
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
-        # 注入 WebSocket 拦截器（在导航前）
-        page.add_init_script(WS_INTERCEPTOR_JS)
+        # 注册请求拦截
+        page.on("request", on_request)
 
-        # 导航到 M365
-        page.goto(URL, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(3000)
+        # 导航
+        page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(2000)
 
         # 登录
         if not args.sniff_only:
@@ -367,49 +176,40 @@ def main():
             else:
                 do_login(page, email, password)
 
-        # 等待页面完全加载
-        page.wait_for_timeout(5000)
-        print(f"[INFO] 当前页面: {page.url}")
-        print(f"[INFO] 标题: {page.title()}")
+        # 等待页面加载并触发带 token 的请求
+        print(f"\n[INFO] 页面: {page.url}")
+        print(f"[INFO] 等待 Copilot 请求（最多 {args.timeout} 秒）...\n")
 
-        # 提取 token
-        print("\n[TOKEN] 提取 token...")
-        token_data = extract_tokens(page)
-        if token_data.get("accessToken"):
-            saved = save_tokens(token_data)
-        else:
-            print("[TOKEN] ⚠️  未能提取 access token")
-            if token_data.get("error"):
-                print(f"[TOKEN] 错误: {token_data['error']}")
+        # 等待 substrate token 出现
+        deadline = time.time() + args.timeout
+        while substrate_token is None and time.time() < deadline:
+            page.wait_for_timeout(1000)
 
-        # 抓包模式
-        if args.compare_modes:
-            compare_modes(page)
-        else:
-            captures = wait_for_captures(page, prompt_text=args.prompt)
-            print_captures(captures)
-
-        # 保持浏览器打开，按 q 退出
+        # ── 结果 ──────────────────────────────────────────────────────────────
         print(f"\n{'='*60}")
-        print("[INFO] 浏览器保持打开中")
-        print("[INFO] 你可以在浏览器中继续操作")
-        print("[INFO] 按 Ctrl+C 退出")
-        try:
-            while True:
-                page.wait_for_timeout(2000)
-                # 持续检查新的捕获
-                new_caps = page.evaluate("() => (window.__wsCaptures || []).length")
-                if new_caps > len(captures) if 'captures' in dir() else 0:
-                    all_caps = page.evaluate("() => window.__wsCaptures || []")
-                    print(f"[CAPTURED] 新增 {len(all_caps) - len(captures)} 条捕获")
-                    captures = all_caps
-        except KeyboardInterrupt:
-            pass
+        print(f"  抓到的 token（按 host）")
+        print(f"{'='*60}")
+        for host in sorted(captured_tokens.keys()):
+            marker = " ⬅ substrate" if host in TARGET_HOSTS else ""
+            print(f"  {host}{marker}")
 
-        # 最终输出所有捕获
-        final_caps = page.evaluate("() => window.__wsCaptures || []")
-        if final_caps:
-            print_captures(final_caps)
+        if substrate_token:
+            save_token(substrate_token)
+        else:
+            print(f"\n[WARN] ❌ 未捕获到 substrate.office.com 的 token")
+            print(f"[HINT] 已捕获 {len(captured_tokens)} 个 host 的 token，但都不是 substrate")
+            print(f"[HINT] 尝试手动在浏览器中打开 Copilot 对话触发请求")
+
+            # 如果有其他 token，保存第一个作为备选
+            if captured_tokens:
+                first_host = next(iter(captured_tokens))
+                first_token = captured_tokens[first_host]
+                claims = decode_jwt_payload(first_token) or {}
+                aud = claims.get("aud", "")
+                print(f"[HINT] 已捕获的 token aud: {aud}")
+                # 如果 aud 包含 substrate 或 sydney，也保存
+                if "substrate" in aud or "sydney" in aud:
+                    save_token(first_token)
 
         ctx.close()
 
