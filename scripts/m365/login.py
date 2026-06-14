@@ -105,42 +105,48 @@ def push_to_remote(token, remote_url, remote_password=None):
 
     auth_cookie = None
 
+    def dump_cookies(stage):
+        print(f"\n[DEBUG] Cookies after {stage}:")
+        for c in cookie_jar:
+            print(f"  - {c.name}={c.value}  domain={c.domain} path={c.path}")
+
     # ===== 登录 =====
     if remote_password:
         login_url = base + "/api/auth/login"
-        login_payload = json.dumps({
-            "password": remote_password
-        }).encode("utf-8")
+        payload = json.dumps({"password": remote_password}).encode("utf-8")
 
         req = urllib.request.Request(
             login_url,
-            data=login_payload,
+            data=payload,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
 
         try:
             resp = opener.open(req, timeout=15)
+            print("[DEBUG] login status:", resp.status)
+            print("[DEBUG] login headers:", dict(resp.headers))
+
             body = json.loads(resp.read().decode("utf-8"))
+            print("[DEBUG] login body:", body)
+
+            dump_cookies("login")
 
             if not body.get("success"):
-                print(f"[REMOTE] ❌ 远程登录失败: {body.get('error')}")
+                print("[REMOTE] ❌ 登录失败")
                 return False
 
-            # ✅ 强制提取 cookie
             for c in cookie_jar:
                 if c.name == "auth_token":
                     auth_cookie = f"{c.name}={c.value}"
                     break
 
-            if not auth_cookie:
-                print("[REMOTE] ❌ 登录成功但未获取 auth_token cookie")
-                return False
+            print("[DEBUG] extracted auth_cookie:", auth_cookie)
 
-            print("[REMOTE] ✅ 远程登录成功")
-
-        except Exception as e:
-            print(f"[REMOTE] ❌ 远程登录异常: {e}")
+        except urllib.error.HTTPError as e:
+            print("[DEBUG] login HTTPError status:", e.code)
+            print("[DEBUG] login HTTPError headers:", dict(e.headers))
+            print("[DEBUG] login HTTPError body:", e.read().decode("utf-8"))
             return False
 
     # ===== 推送 =====
@@ -154,9 +160,11 @@ def push_to_remote(token, remote_url, remote_password=None):
         "Content-Type": "application/json",
     }
 
-    # ✅ 关键修复：手动塞 Cookie
     if auth_cookie:
         headers["Cookie"] = auth_cookie
+
+    print("\n[DEBUG] push request headers:", headers)
+    print("[DEBUG] push url:", url)
 
     req = urllib.request.Request(
         url,
@@ -167,21 +175,24 @@ def push_to_remote(token, remote_url, remote_password=None):
 
     try:
         resp = opener.open(req, timeout=15)
+        print("[DEBUG] push status:", resp.status)
+        print("[DEBUG] push headers:", dict(resp.headers))
+
         body = json.loads(resp.read().decode("utf-8"))
+        print("[DEBUG] push body:", body)
 
         if body.get("success"):
-            print(f"[REMOTE] ✅ 已推送到 {remote_url}")
+            print("[REMOTE] ✅ 推送成功")
             return True
 
-        print(f"[REMOTE] ❌ 推送失败: {body.get('error')}")
+        print("[REMOTE] ❌ 推送失败:", body)
         return False
 
     except urllib.error.HTTPError as e:
-        try:
-            err = json.loads(e.read().decode("utf-8"))
-            print(f"[REMOTE] ❌ 推送失败: {err.get('error')}")
-        except Exception:
-            print(f"[REMOTE] ❌ 推送失败: {e}")
+        print("\n[DEBUG] push HTTPError status:", e.code)
+        print("[DEBUG] push HTTPError headers:", dict(e.headers))
+        raw = e.read().decode("utf-8")
+        print("[DEBUG] push HTTPError body:", raw)
         return False
 
 
