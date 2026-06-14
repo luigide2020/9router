@@ -20,7 +20,7 @@ TOKEN_FILE = TOKEN_DIR / "m365-token.json"
 CHATHUB_PATH = "m365copilot/chathub/"
 PROVIDER = "m365-copilot"
 AUTH_TYPE = "cookie"
-DEFAULT_REMOTE = "http://jiaguwen.plain.ccwu.cc"
+DEFAULT_REMOTE = "http://jiaguwen.plain.ccwu.cc:20128"
 
 
 def get_db_path():
@@ -90,16 +90,55 @@ def update_db(token, claims):
         return False
 
 
-def push_to_remote(token, remote_url):
-    """通过 API 将 token 推送到远程 9router 服务。"""
-    url = remote_url.rstrip("/") + "/api/oauth/m365-copilot"
+def push_to_remote(token, remote_url, remote_password=None):
+    """通过 API 将 token 推送到远程 9router 服务（自动登录获取认证 cookie）。"""
+    base = remote_url.rstrip("/")
+
+    # 第一步：登录获取 auth_token cookie
+    auth_cookie = None
+    if remote_password:
+        login_url = base + "/api/auth/login"
+        login_payload = json.dumps({"password": remote_password}).encode("utf-8")
+        login_req = urllib.request.Request(
+            login_url, data=login_payload,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(login_req, timeout=15) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                if resp.status == 200 and body.get("success"):
+                    # 从 Set-Cookie 提取 auth_token
+                    for h in resp.headers.get_all("Set-Cookie") or []:
+                        if "auth_token=" in h:
+                            auth_cookie = h.split("auth_token=")[1].split(";")[0]
+                            break
+                    if auth_cookie:
+                        print(f"[REMOTE] ✅ 远程登录成功")
+                    else:
+                        print(f"[REMOTE] ⚠️ 登录成功但未获取到 auth_token cookie")
+                else:
+                    err = body.get("error", "unknown")
+                    print(f"[REMOTE] ❌ 远程登录失败: {err}")
+                    return False
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = json.loads(e.read().decode("utf-8"))
+                err_msg = err_body.get("error", str(e))
+            except Exception:
+                err_msg = str(e)
+            print(f"[REMOTE] ❌ 远程登录失败: {err_msg}")
+            return False
+        except Exception as e:
+            print(f"[REMOTE] ❌ 远程登录异常: {e}")
+            return False
+
+    # 第二步：推送 token
+    url = base + "/api/oauth/m365-copilot"
     payload = json.dumps({"action": "save", "accessToken": token}).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    headers = {"Content-Type": "application/json"}
+    if auth_cookie:
+        headers["Cookie"] = f"auth_token={auth_cookie}"
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             body = json.loads(resp.read().decode("utf-8"))
@@ -113,8 +152,13 @@ def push_to_remote(token, remote_url):
                 err = body.get("error", "unknown error")
                 print(f"[REMOTE] ❌ 推送失败: {err}")
                 return False
-    except urllib.error.URLError as e:
-        print(f"[REMOTE] ❌ 连接失败 ({remote_url}): {e.reason}")
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = json.loads(e.read().decode("utf-8"))
+            err_msg = err_body.get("error", str(e))
+        except Exception:
+            err_msg = str(e)
+        print(f"[REMOTE] ❌ 推送失败: {err_msg}")
         return False
     except Exception as e:
         print(f"[REMOTE] ❌ 推送异常: {e}")
@@ -163,6 +207,8 @@ def main():
                     help="抓到 token 后通过 API 推送到远程 9router 服务")
     ap.add_argument("--remote-url", default=DEFAULT_REMOTE,
                     help=f"远程 9router 地址（默认: {DEFAULT_REMOTE}）")
+    ap.add_argument("--remote-password", default=None,
+                    help="远程 9router 的 dashboard 密码（也可通过 REMOTE_PASSWORD 环境变量设置）")
     ap.add_argument("--attempts", type=int, default=6)
     ap.add_argument("--wait", type=int, default=12)
     ap.add_argument("--close", action="store_true")
@@ -199,7 +245,8 @@ def main():
         if args.update_db:
             update_db(token, c)
         if args.push_remote:
-            push_to_remote(token, args.remote_url)
+            rp = args.remote_password or os.environ.get("REMOTE_PASSWORD", "")
+            push_to_remote(token, args.remote_url, rp)
 
     def capture_from_url(url):
         if CHATHUB_PATH not in url.lower():
