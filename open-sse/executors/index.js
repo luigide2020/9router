@@ -17,6 +17,7 @@ import { M365CopilotExecutor } from "./m365-copilot.js";
 import { OllamaLocalExecutor } from "./ollama-local.js";
 import { CommandCodeExecutor } from "./commandcode.js";
 import { XiaomiTokenplanExecutor } from "./xiaomi-tokenplan.js";
+import { MimoFreeExecutor } from "./mimo-free.js";
 import { DefaultExecutor } from "./default.js";
 
 const executors = {
@@ -41,6 +42,8 @@ const executors = {
   "ollama-local": new OllamaLocalExecutor(),
   commandcode: new CommandCodeExecutor(),
   "xiaomi-tokenplan": new XiaomiTokenplanExecutor(),
+  "mimo-free": new MimoFreeExecutor(),
+  mmf: new MimoFreeExecutor(), // Alias for mimo-free
 };
 
 const defaultCache = new Map();
@@ -76,3 +79,4 @@ export { M365CopilotExecutor } from "./m365-copilot.js";
 export { OllamaLocalExecutor } from "./ollama-local.js";
 export { CommandCodeExecutor } from "./commandcode.js";
 export { XiaomiTokenplanExecutor } from "./xiaomi-tokenplan.js";
+export { MimoFreeExecutor } from "./mimo-free.js";
