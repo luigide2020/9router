@@ -92,10 +92,16 @@ def update_db(token, claims):
 
 def push_to_remote(token, remote_url, remote_password=None):
     """通过 API 将 token 推送到远程 9router 服务（自动登录获取认证 cookie）。"""
+    import http.cookiejar
     base = remote_url.rstrip("/")
 
+    # 使用 CookieJar 自动管理 cookie（跨请求自动携带）
+    cookie_jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(cookie_jar),
+    )
+
     # 第一步：登录获取 auth_token cookie
-    auth_cookie = None
     if remote_password:
         login_url = base + "/api/auth/login"
         login_payload = json.dumps({"password": remote_password}).encode("utf-8")
@@ -104,22 +110,18 @@ def push_to_remote(token, remote_url, remote_password=None):
             headers={"Content-Type": "application/json"}, method="POST",
         )
         try:
-            with urllib.request.urlopen(login_req, timeout=15) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-                if resp.status == 200 and body.get("success"):
-                    # 从 Set-Cookie 提取 auth_token
-                    for h in resp.headers.get_all("Set-Cookie") or []:
-                        if "auth_token=" in h:
-                            auth_cookie = h.split("auth_token=")[1].split(";")[0]
-                            break
-                    if auth_cookie:
-                        print(f"[REMOTE] ✅ 远程登录成功")
-                    else:
-                        print(f"[REMOTE] ⚠️ 登录成功但未获取到 auth_token cookie")
+            resp = opener.open(login_req, timeout=15)
+            body = json.loads(resp.read().decode("utf-8"))
+            if body.get("success"):
+                cookie_names = [c.name for c in cookie_jar]
+                if "auth_token" in cookie_names:
+                    print(f"[REMOTE] ✅ 远程登录成功，已获取 auth_token")
                 else:
-                    err = body.get("error", "unknown")
-                    print(f"[REMOTE] ❌ 远程登录失败: {err}")
-                    return False
+                    print(f"[REMOTE] ⚠️ 登录成功但未获取到 auth_token cookie (got: {cookie_names})")
+            else:
+                err = body.get("error", "unknown")
+                print(f"[REMOTE] ❌ 远程登录失败: {err}")
+                return False
         except urllib.error.HTTPError as e:
             try:
                 err_body = json.loads(e.read().decode("utf-8"))
@@ -132,26 +134,26 @@ def push_to_remote(token, remote_url, remote_password=None):
             print(f"[REMOTE] ❌ 远程登录异常: {e}")
             return False
 
-    # 第二步：推送 token
+    # 第二步：推送 token（opener 会自动携带登录 cookie）
     url = base + "/api/oauth/m365-copilot"
     payload = json.dumps({"action": "save", "accessToken": token}).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    if auth_cookie:
-        headers["Cookie"] = f"auth_token={auth_cookie}"
-    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-            if resp.status == 200 and body.get("success"):
-                upn = body.get("userPrincipalName", "unknown")
-                exp = body.get("expiresAt", "unknown")
-                print(f"[REMOTE] ✅ 已推送到 {remote_url}")
-                print(f"  用户: {upn}  过期: {exp}")
-                return True
-            else:
-                err = body.get("error", "unknown error")
-                print(f"[REMOTE] ❌ 推送失败: {err}")
-                return False
+        resp = opener.open(req, timeout=15)
+        body = json.loads(resp.read().decode("utf-8"))
+        if body.get("success"):
+            upn = body.get("userPrincipalName", "unknown")
+            exp = body.get("expiresAt", "unknown")
+            print(f"[REMOTE] ✅ 已推送到 {remote_url}")
+            print(f"  用户: {upn}  过期: {exp}")
+            return True
+        else:
+            err = body.get("error", "unknown error")
+            print(f"[REMOTE] ❌ 推送失败: {err}")
+            return False
     except urllib.error.HTTPError as e:
         try:
             err_body = json.loads(e.read().decode("utf-8"))
