@@ -44,6 +44,7 @@ $DATA_DIR/
 ├── db/
 │   ├── data.sqlite       # main SQLite database
 │   └── backups/          # auto backups
+├── m365-token.json       # M365 Copilot extracted token (optional)
 └── ...                   # certs, logs, runtime configs
 ```
 
