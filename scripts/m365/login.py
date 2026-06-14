@@ -3,7 +3,7 @@ M365 Copilot access_token 抓取（修正 websocket 监听挂载点）
 关键修正：websocket 是 Page 事件，不是 BrowserContext 事件。
 必须 page.on("websocket", ...)，之前 ctx.on("websocket") 永不触发。
 """
-import argparse, base64, json, os, re, sqlite3, sys, time, urllib.parse, uuid
+import argparse, base64, json, os, re, sqlite3, sys, time, urllib.parse, urllib.request, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,6 +20,7 @@ TOKEN_FILE = TOKEN_DIR / "m365-token.json"
 CHATHUB_PATH = "m365copilot/chathub/"
 PROVIDER = "m365-copilot"
 AUTH_TYPE = "cookie"
+DEFAULT_REMOTE = "http://jiaguwen.plain.ccwu.cc"
 
 
 def get_db_path():
@@ -89,6 +90,37 @@ def update_db(token, claims):
         return False
 
 
+def push_to_remote(token, remote_url):
+    """通过 API 将 token 推送到远程 9router 服务。"""
+    url = remote_url.rstrip("/") + "/api/oauth/m365-copilot"
+    payload = json.dumps({"action": "save", "accessToken": token}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            if resp.status == 200 and body.get("success"):
+                upn = body.get("userPrincipalName", "unknown")
+                exp = body.get("expiresAt", "unknown")
+                print(f"[REMOTE] ✅ 已推送到 {remote_url}")
+                print(f"  用户: {upn}  过期: {exp}")
+                return True
+            else:
+                err = body.get("error", "unknown error")
+                print(f"[REMOTE] ❌ 推送失败: {err}")
+                return False
+    except urllib.error.URLError as e:
+        print(f"[REMOTE] ❌ 连接失败 ({remote_url}): {e.reason}")
+        return False
+    except Exception as e:
+        print(f"[REMOTE] ❌ 推送异常: {e}")
+        return False
+
+
 def decode_jwt_payload(token):
     try:
         parts = token.split(".")
@@ -126,7 +158,11 @@ def main():
     ap.add_argument("--sniff-only", action="store_true")
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--update-db", action="store_true",
-                    help="抓到 token 后直接写入 SQLite 数据库（供 executor 使用，无需再通过页面操作）")
+                    help="抓到 token 后直接写入本地 SQLite 数据库")
+    ap.add_argument("--push-remote", action="store_true",
+                    help="抓到 token 后通过 API 推送到远程 9router 服务")
+    ap.add_argument("--remote-url", default=DEFAULT_REMOTE,
+                    help=f"远程 9router 地址（默认: {DEFAULT_REMOTE}）")
     ap.add_argument("--attempts", type=int, default=6)
     ap.add_argument("--wait", type=int, default=12)
     ap.add_argument("--close", action="store_true")
@@ -162,6 +198,8 @@ def main():
             print(f"  剩余: {(exp - time.time())/60:.0f} 分钟")
         if args.update_db:
             update_db(token, c)
+        if args.push_remote:
+            push_to_remote(token, args.remote_url)
 
     def capture_from_url(url):
         if CHATHUB_PATH not in url.lower():
