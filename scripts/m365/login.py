@@ -3,7 +3,7 @@ M365 Copilot access_token 抓取（修正 websocket 监听挂载点）
 关键修正：websocket 是 Page 事件，不是 BrowserContext 事件。
 必须 page.on("websocket", ...)，之前 ctx.on("websocket") 永不触发。
 """
-import argparse, base64, json, os, re, sqlite3, sys, time, urllib.parse, urllib.request, uuid
+import argparse, base64, json, os, re, sys, time, urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,14 +18,6 @@ USER_DATA_DIR = str(Path(__file__).parent / ".browser_profile")
 TOKEN_DIR = Path.home() / ".9router"
 TOKEN_FILE = TOKEN_DIR / "m365-token.json"
 CHATHUB_PATH = "m365copilot/chathub/"
-PROVIDER = "m365-copilot"
-AUTH_TYPE = "cookie"
-DEFAULT_REMOTE = "http://jiaguwen.plain.ccwu.cc:20128"
-
-
-def get_db_path():
-    data_dir = os.environ.get("DATA_DIR", str(TOKEN_DIR))
-    return Path(data_dir) / "db" / "data.sqlite"
 
 
 def atomic_write(path, text):
@@ -36,164 +28,6 @@ def atomic_write(path, text):
         os.fsync(f.fileno())
     os.replace(tmp, path)
 
-
-def iso_from_ts(ts):
-    """Unix 秒 → UTC ISO 字符串，空值返回 None。"""
-    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
-
-
-def update_db(token, claims):
-    """将 token 写入 SQLite providerConnections 表，供 executor 使用。"""
-    db_path = get_db_path()
-    if not db_path.exists():
-        print(f"[DB] ⚠️ 数据库不存在: {db_path}")
-        print(f"[DB] 请先启动 9router 初始化数据库，或设置 DATA_DIR 指向正确路径")
-        return False
-
-    now = datetime.now(tz=timezone.utc).isoformat()
-    upn = claims.get("upn") or claims.get("preferred_username") or "unknown"
-    data_obj = {"apiKey": token, "testStatus": "active"}
-    if expires_at := iso_from_ts(claims.get("exp")):
-        data_obj["expiresAt"] = expires_at
-
-    try:
-        with sqlite3.connect(str(db_path), timeout=10) as conn:
-            conn.execute("PRAGMA busy_timeout = 5000")
-            row = conn.execute(
-                "SELECT id, data FROM providerConnections WHERE provider = ? LIMIT 1",
-                (PROVIDER,),
-            ).fetchone()
-            if row:
-                row_id, raw_data = row
-                try:
-                    existing = json.loads(raw_data) if raw_data else {}
-                except json.JSONDecodeError:
-                    existing = {}
-                existing.update(data_obj)
-                conn.execute(
-                    "UPDATE providerConnections SET data = ?, updatedAt = ?, isActive = 1 WHERE id = ?",
-                    (json.dumps(existing), now, row_id),
-                )
-                print(f"[DB] ✅ 已更新现有 m365-copilot 连接 (id={row_id[:8]}...)")
-            else:
-                new_id = str(uuid.uuid4())
-                conn.execute(
-                    """INSERT INTO providerConnections
-                       (id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt)
-                       VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)""",
-                    (new_id, PROVIDER, AUTH_TYPE, f"M365 ({upn})", upn, 1, json.dumps(data_obj), now, now),
-                )
-                print(f"[DB] ✅ 已创建新 m365-copilot 连接 (id={new_id[:8]}...)")
-        return True
-    except sqlite3.Error as e:
-        print(f"[DB] ❌ SQLite 错误: {e}")
-        return False
-
-
-def push_to_remote(token, remote_url, remote_password=None):
-    import json
-    import urllib.request
-    import urllib.error
-    import http.cookiejar
-
-    base = remote_url.rstrip("/")
-
-    cookie_jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(
-        urllib.request.HTTPCookieProcessor(cookie_jar),
-    )
-
-    auth_cookie = None
-
-    def dump_cookies(stage):
-        print(f"\n[DEBUG] Cookies after {stage}:")
-        for c in cookie_jar:
-            print(f"  - {c.name}={c.value}  domain={c.domain} path={c.path}")
-
-    # ===== 登录 =====
-    if remote_password:
-        login_url = base + "/api/auth/login"
-        payload = json.dumps({"password": remote_password}).encode("utf-8")
-
-        req = urllib.request.Request(
-            login_url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-
-        try:
-            resp = opener.open(req, timeout=15)
-            print("[DEBUG] login status:", resp.status)
-            print("[DEBUG] login headers:", dict(resp.headers))
-
-            body = json.loads(resp.read().decode("utf-8"))
-            print("[DEBUG] login body:", body)
-
-            dump_cookies("login")
-
-            if not body.get("success"):
-                print("[REMOTE] ❌ 登录失败")
-                return False
-
-            for c in cookie_jar:
-                if c.name == "auth_token":
-                    auth_cookie = f"{c.name}={c.value}"
-                    break
-
-            print("[DEBUG] extracted auth_cookie:", auth_cookie)
-
-        except urllib.error.HTTPError as e:
-            print("[DEBUG] login HTTPError status:", e.code)
-            print("[DEBUG] login HTTPError headers:", dict(e.headers))
-            print("[DEBUG] login HTTPError body:", e.read().decode("utf-8"))
-            return False
-
-    # ===== 推送 =====
-    url = base + "/api/oauth/m365-copilot"
-    payload = json.dumps({
-        "action": "save",
-        "accessToken": token,
-    }).encode("utf-8")
-
-    headers = {
-        "Content-Type": "application/json",
-    }
-
-    if auth_cookie:
-        headers["Cookie"] = auth_cookie
-
-    print("\n[DEBUG] push request headers:", headers)
-    print("[DEBUG] push url:", url)
-
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers=headers,
-        method="POST",
-    )
-
-    try:
-        resp = opener.open(req, timeout=15)
-        print("[DEBUG] push status:", resp.status)
-        print("[DEBUG] push headers:", dict(resp.headers))
-
-        body = json.loads(resp.read().decode("utf-8"))
-        print("[DEBUG] push body:", body)
-
-        if body.get("success"):
-            print("[REMOTE] ✅ 推送成功")
-            return True
-
-        print("[REMOTE] ❌ 推送失败:", body)
-        return False
-
-    except urllib.error.HTTPError as e:
-        print("\n[DEBUG] push HTTPError status:", e.code)
-        print("[DEBUG] push HTTPError headers:", dict(e.headers))
-        raw = e.read().decode("utf-8")
-        print("[DEBUG] push HTTPError body:", raw)
-        return False
 
 
 def decode_jwt_payload(token):
@@ -232,14 +66,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sniff-only", action="store_true")
     ap.add_argument("--headless", action="store_true")
-    ap.add_argument("--update-db", action="store_true",
-                    help="抓到 token 后直接写入本地 SQLite 数据库")
-    ap.add_argument("--push-remote", action="store_true",
-                    help="抓到 token 后通过 API 推送到远程 9router 服务")
-    ap.add_argument("--remote-url", default=DEFAULT_REMOTE,
-                    help=f"远程 9router 地址（默认: {DEFAULT_REMOTE}）")
-    ap.add_argument("--remote-password", default=None,
-                    help="远程 9router 的 dashboard 密码（也可通过 REMOTE_PASSWORD 环境变量设置）")
     ap.add_argument("--attempts", type=int, default=6)
     ap.add_argument("--wait", type=int, default=12)
     ap.add_argument("--close", action="store_true")
@@ -262,7 +88,7 @@ def main():
             "source": "ws-chathub",
             "wsUrl": source_url.split("access_token=")[0] + "access_token=<redacted>",
             "extractedAt": datetime.now(tz=timezone.utc).isoformat(),
-            "expiresAt": iso_from_ts(exp) or "unknown",
+            "expiresAt": datetime.fromtimestamp(exp, tz=timezone.utc).isoformat() if exp else "unknown",
             "aud": c.get("aud", "unknown"),
             "scp": c.get("scp", "unknown"),
             "userPrincipalName": c.get("upn") or c.get("preferred_username") or "unknown",
@@ -273,11 +99,6 @@ def main():
         print(f"  aud={data['aud']} scp={data['scp']}")
         if exp:
             print(f"  剩余: {(exp - time.time())/60:.0f} 分钟")
-        if args.update_db:
-            update_db(token, c)
-        if args.push_remote:
-            rp = args.remote_password or os.environ.get("REMOTE_PASSWORD", "")
-            push_to_remote(token, args.remote_url, rp)
 
     def capture_from_url(url):
         if CHATHUB_PATH not in url.lower():
