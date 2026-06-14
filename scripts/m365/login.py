@@ -91,37 +91,64 @@ def update_db(token, claims):
 
 
 def push_to_remote(token, remote_url, remote_password=None):
-    """通过 API 将 token 推送到远程 9router 服务（自动登录获取认证 cookie）。"""
+    """
+    通过 API 将 token 推送到远程 9router 服务：
+    1. 可选登录，获取 auth_token cookie
+    2. 将 auth_token 显式放入 Authorization header
+    3. 推送 m365 access token
+    """
+    import json
+    import urllib.request
+    import urllib.error
     import http.cookiejar
+
     base = remote_url.rstrip("/")
 
-    # 使用 CookieJar 自动管理 cookie（跨请求自动携带）
+    # Cookie 管理
     cookie_jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(
         urllib.request.HTTPCookieProcessor(cookie_jar),
     )
 
-    # 第一步：登录获取 auth_token cookie
+    auth_token = None
+
+    # ===== 第一步：登录，获取 auth_token =====
     if remote_password:
         login_url = base + "/api/auth/login"
-        login_payload = json.dumps({"password": remote_password}).encode("utf-8")
+        login_payload = json.dumps({
+            "password": remote_password
+        }).encode("utf-8")
+
         login_req = urllib.request.Request(
-            login_url, data=login_payload,
-            headers={"Content-Type": "application/json"}, method="POST",
+            login_url,
+            data=login_payload,
+            headers={
+                "Content-Type": "application/json",
+            },
+            method="POST",
         )
+
         try:
             resp = opener.open(login_req, timeout=15)
             body = json.loads(resp.read().decode("utf-8"))
-            if body.get("success"):
-                cookie_names = [c.name for c in cookie_jar]
-                if "auth_token" in cookie_names:
-                    print(f"[REMOTE] ✅ 远程登录成功，已获取 auth_token")
-                else:
-                    print(f"[REMOTE] ⚠️ 登录成功但未获取到 auth_token cookie (got: {cookie_names})")
-            else:
+
+            if not body.get("success"):
                 err = body.get("error", "unknown")
                 print(f"[REMOTE] ❌ 远程登录失败: {err}")
                 return False
+
+            # 从 cookie 中提取 auth_token
+            for c in cookie_jar:
+                if c.name == "auth_token":
+                    auth_token = c.value
+                    break
+
+            if auth_token:
+                print("[REMOTE] ✅ 远程登录成功，已获取 auth_token")
+            else:
+                print("[REMOTE] ⚠️ 登录成功，但未获取到 auth_token cookie")
+                return False
+
         except urllib.error.HTTPError as e:
             try:
                 err_body = json.loads(e.read().decode("utf-8"))
@@ -134,16 +161,33 @@ def push_to_remote(token, remote_url, remote_password=None):
             print(f"[REMOTE] ❌ 远程登录异常: {e}")
             return False
 
-    # 第二步：推送 token（opener 会自动携带登录 cookie）
+    # ===== 第二步：推送 token =====
     url = base + "/api/oauth/m365-copilot"
-    payload = json.dumps({"action": "save", "accessToken": token}).encode("utf-8")
+    payload = json.dumps({
+        "action": "save",
+        "accessToken": token,
+    }).encode("utf-8")
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+    # ✅ 关键修复：显式加入 Authorization
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+
     req = urllib.request.Request(
-        url, data=payload,
-        headers={"Content-Type": "application/json"}, method="POST",
+        url,
+        data=payload,
+        headers=headers,
+        method="POST",
     )
+
     try:
         resp = opener.open(req, timeout=15)
         body = json.loads(resp.read().decode("utf-8"))
+
         if body.get("success"):
             upn = body.get("userPrincipalName", "unknown")
             exp = body.get("expiresAt", "unknown")
@@ -154,6 +198,7 @@ def push_to_remote(token, remote_url, remote_password=None):
             err = body.get("error", "unknown error")
             print(f"[REMOTE] ❌ 推送失败: {err}")
             return False
+
     except urllib.error.HTTPError as e:
         try:
             err_body = json.loads(e.read().decode("utf-8"))
