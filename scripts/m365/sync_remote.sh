@@ -4,7 +4,7 @@
 # 前置条件：
 #   - 远程与本地 clone 同一个 9router 项目
 #   - ~/.ssh/config 中配置 Host oracle
-#   - ~/.zshrc 中设置 M365_EMAIL 和 M365_PASSWORD
+#   - .env 中填写 M365_EMAIL 和 M365_PASSWORD
 #
 # 用法：
 #   ./scripts/m365/sync_remote.sh              # headless 模式（默认）
@@ -12,15 +12,18 @@
 
 set -e
 
-# 加载 ~/.zshrc 获取环境变量（sh 子进程不会自动加载）
-[ -f "$HOME/.zshrc" ] && source "$HOME/.zshrc" 2>/dev/null || true
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENV_FILE="$(cd "$SCRIPT_DIR/../.." && pwd)/.env"
+
+# 从项目 .env 文件读取凭证（优先使用已 export 的环境变量）
+M365_EMAIL="${M365_EMAIL:-$(grep '^M365_EMAIL=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "\"'")}"
+M365_PASSWORD="${M365_PASSWORD:-$(grep '^M365_PASSWORD=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "\"'")}"
 
 HOST="${HOST:-oracle}"
 REMOTE_TOKEN_DIR='~/.9router'
 REMOTE_SCRIPT='~/9router/scripts/m365/update_db.py'
 TOKEN_DIR="$HOME/.9router"
 TOKEN_FILE="$TOKEN_DIR/m365-token.json"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # headless 参数（默认 headless，传 --no-headless 则显示浏览器）
 HEADLESS="--headless"
