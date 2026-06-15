@@ -4,17 +4,16 @@
 # 前置条件：
 #   - 远程与本地 clone 同一个 9router 项目
 #   - ~/.ssh/config 中配置 Host oracle
-#   - .zshrc 中 export M365_EMAIL 和 M365_PASSWORD
+#   - ~/.zshrc 中设置 M365_EMAIL 和 M365_PASSWORD
 #
 # 用法：
 #   ./scripts/m365/sync_remote.sh              # headless 模式（默认）
 #   ./scripts/m365/sync_remote.sh --no-headless # 有浏览器界面
-#
-# 环境变量（必须 export）：
-#   M365_EMAIL       M365 邮箱
-#   M365_PASSWORD    M365 密码
 
 set -e
+
+# 加载 ~/.zshrc 获取环境变量（sh 子进程不会自动加载）
+[ -f "$HOME/.zshrc" ] && source "$HOME/.zshrc" 2>/dev/null || true
 
 HOST="${HOST:-oracle}"
 REMOTE_TOKEN_DIR='~/.9router'
@@ -23,21 +22,16 @@ TOKEN_DIR="$HOME/.9router"
 TOKEN_FILE="$TOKEN_DIR/m365-token.json"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# 确保环境变量被 export
-export M365_EMAIL
-export M365_PASSWORD
-
 # headless 参数（默认 headless，传 --no-headless 则显示浏览器）
 HEADLESS="--headless"
 if [ "$1" = "--no-headless" ]; then
     HEADLESS=""
 fi
 
-echo "[DEBUG] HEADLESS='$HEADLESS' EMAIL=${M365_EMAIL:+已设置} PASSWORD=${M365_PASSWORD:+已设置}"
-
 # ========== 第一步：本地抓 token ==========
 echo "========== [STEP 1] 本地抓取 token =========="
-uv run python "$SCRIPT_DIR/login.py" $HEADLESS --close
+env M365_EMAIL="$M365_EMAIL" M365_PASSWORD="$M365_PASSWORD" \
+    uv run python "$SCRIPT_DIR/login.py" $HEADLESS --close
 
 if [ ! -f "$TOKEN_FILE" ]; then
     echo "[ERROR] token 文件未生成: $TOKEN_FILE"
