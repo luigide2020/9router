@@ -1,24 +1,19 @@
 #!/bin/bash
-# M365 Token 全流程：本地抓取 → 本地 DB → 同步远程 → 远程 DB
-#
-# 前置条件：
-#   - 远程与本地 clone 同一个 9router 项目
-#   - ~/.ssh/config 中配置 Host oracle
-#   - .env 中填写 M365_EMAIL 和 M365_PASSWORD
-#
-# 用法：
-#   ./scripts/m365/sync_remote.sh              # headless 模式（默认）
-#   ./scripts/m365/sync_remote.sh --no-headless # 有浏览器界面
-
 set -e
 
-# launchd/cron 的 PATH 极其有限，需显式补充
+# launchd 环境极简，显式补 PATH
 export PATH="/Users/liujie/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ENV_FILE="$(cd "$SCRIPT_DIR/../.." && pwd)/.env"
+# 自动定位 uv（找不到就用绝对路径兜底，记得按 which uv 的结果改）
+UV="$(command -v uv 2>/dev/null || echo /Users/liujie/.local/bin/uv)"
 
-# 从项目 .env 文件读取凭证（优先使用已 export 的环境变量）
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+ENV_FILE="$PROJECT_DIR/.env"
+
+# 进入项目目录，确保 uv run 能找到正确的 venv / pyproject.toml
+cd "$PROJECT_DIR"
+
 M365_EMAIL="${M365_EMAIL:-$(grep '^M365_EMAIL=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "\"'")}"
 M365_PASSWORD="${M365_PASSWORD:-$(grep '^M365_PASSWORD=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "\"'")}"
 
@@ -28,36 +23,22 @@ REMOTE_SCRIPT='~/9router/scripts/m365/update_db.py'
 TOKEN_DIR="$HOME/.9router"
 TOKEN_FILE="$TOKEN_DIR/m365-token.json"
 
-# headless 参数（默认 headless，传 --no-headless 则显示浏览器）
 HEADLESS="--headless"
-if [ "$1" = "--no-headless" ]; then
-    HEADLESS=""
-fi
+[ "$1" = "--no-headless" ] && HEADLESS=""
 
-# ========== 第一步：本地抓 token ==========
 echo "========== [STEP 1] 本地抓取 token =========="
 env M365_EMAIL="$M365_EMAIL" M365_PASSWORD="$M365_PASSWORD" \
-    uv run python "$SCRIPT_DIR/login.py" $HEADLESS --close
+    "$UV" run python "$SCRIPT_DIR/login.py" $HEADLESS --close
 
-if [ ! -f "$TOKEN_FILE" ]; then
-    echo "[ERROR] token 文件未生成: $TOKEN_FILE"
-    exit 1
-fi
+[ -f "$TOKEN_FILE" ] || { echo "[ERROR] token 文件未生成: $TOKEN_FILE"; exit 1; }
 
-# ========== 第二步：更新本地 DB ==========
-echo ""
 echo "========== [STEP 2] 更新本地 DB =========="
-python3 "$SCRIPT_DIR/update_db.py"
+"$UV" run python "$SCRIPT_DIR/update_db.py"     # ← 改用 uv run
 
-# ========== 第三步：同步 token 到远程 ==========
-echo ""
-echo "========== [STEP 3] scp → $HOST:$REMOTE_TOKEN_DIR/ =========="
+echo "========== [STEP 3] scp → $HOST =========="
 scp "$TOKEN_FILE" "$HOST:$REMOTE_TOKEN_DIR/m365-token.json"
 
-# ========== 第四步：更新远程 DB ==========
-echo ""
 echo "========== [STEP 4] ssh $HOST → update_db =========="
-ssh "$HOST" "python3 $REMOTE_SCRIPT"
+ssh "$HOST" "python3 $REMOTE_SCRIPT"   # 远程同理，最好也确认远程用对了 python/venv
 
-echo ""
 echo "✅ 全流程完成"
