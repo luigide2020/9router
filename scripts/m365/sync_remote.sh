@@ -34,7 +34,7 @@ fi
 # ========== 第一步：本地抓 token ==========
 echo "========== [STEP 1] 本地抓取 token =========="
 env M365_EMAIL="$M365_EMAIL" M365_PASSWORD="$M365_PASSWORD" \
-    uv run python "$SCRIPT_DIR/login.py" $HEADLESS --close
+    /usr/bin/env uv run python "$SCRIPT_DIR/login.py" $HEADLESS --close
 
 if [ ! -f "$TOKEN_FILE" ]; then
     echo "[ERROR] token 文件未生成: $TOKEN_FILE"
