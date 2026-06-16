@@ -12,6 +12,9 @@
 
 set -e
 
+# launchd/cron 的 PATH 极其有限，需显式补充
+export PATH="/Users/liujie/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="$(cd "$SCRIPT_DIR/../.." && pwd)/.env"
 
@@ -34,7 +37,7 @@ fi
 # ========== 第一步：本地抓 token ==========
 echo "========== [STEP 1] 本地抓取 token =========="
 env M365_EMAIL="$M365_EMAIL" M365_PASSWORD="$M365_PASSWORD" \
-    /usr/bin/env uv run python "$SCRIPT_DIR/login.py" $HEADLESS --close
+    uv run python "$SCRIPT_DIR/login.py" $HEADLESS --close
 
 if [ ! -f "$TOKEN_FILE" ]; then
     echo "[ERROR] token 文件未生成: $TOKEN_FILE"
