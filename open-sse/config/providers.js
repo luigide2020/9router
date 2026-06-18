@@ -1,3 +1,6 @@
+// Barrel: PROVIDERS now built from providers/registry (transport co-located with models)
+import { PROVIDERS } from "../providers/index.js";
+export { PROVIDERS, PROVIDER_OAUTH } from "../providers/index.js";
 import { platform, arch } from "os";
 
 // === OS/Arch helpers ===
@@ -469,12 +472,9 @@ export function resolveOllamaLocalHost(credentials) {
   return (raw || OLLAMA_LOCAL_DEFAULT_HOST).replace(/\/$/, "");
 }
 
-export const XIAOMI_TOKENPLAN_REGIONS = {
-  sgp: "https://token-plan-sgp.xiaomimimo.com/v1",
-  cn: "https://token-plan-cn.xiaomimimo.com/v1",
-  ams: "https://token-plan-ams.xiaomimimo.com/v1"
-};
-export const XIAOMI_TOKENPLAN_DEFAULT_REGION = "sgp";
+// Region URLs single-source from registry xiaomi-tokenplan.transport
+export const XIAOMI_TOKENPLAN_REGIONS = PROVIDERS["xiaomi-tokenplan"]?.regions || {};
+export const XIAOMI_TOKENPLAN_DEFAULT_REGION = PROVIDERS["xiaomi-tokenplan"]?.defaultRegion;
 
 export function resolveXiaomiTokenplanBaseUrl(credentials) {
   const region = credentials?.providerSpecificData?.region;

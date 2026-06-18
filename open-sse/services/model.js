@@ -1,22 +1,8 @@
-// Provider alias to ID mapping
-const ALIAS_TO_PROVIDER_ID = {
-  cc: "claude",
-  cx: "codex",
-  gc: "gemini-cli",
-  qw: "qwen",
-  if: "iflow",
-  ag: "antigravity",
-  gh: "github",
-  kr: "kiro",
-  cu: "cursor",
-  kc: "kilocode",
-  kmc: "kimi-coding",
-  cl: "cline",
-  oc: "opencode",
-  ocg: "opencode-go",
-  qd: "qoder",
-  qoder: "qoder",
-  // TTS providers
+import REGISTRY from "../providers/registry/index.js";
+
+// Alias→id derived from registry single-source: id→id, alias→id, aliases[]→id.
+// Media-only providers without a registry transport entry keep explicit aliases here.
+const MEDIA_ONLY_ALIASES = {
   el: "elevenlabs",
   // API Key providers
   openai: "openai",
@@ -93,56 +79,16 @@ const ALIAS_TO_PROVIDER_ID = {
   // Embedding/rerank
   jina: "jina-ai",
   "jina-ai": "jina-ai",
-  // TTS
   polly: "aws-polly",
   "aws-polly": "aws-polly",
-  // Free-tier providers (synced from OmniRoute)
-  agentrouter: "agentrouter",
-  aimlapi: "aimlapi",
-  aiml: "aimlapi",
-  novita: "novita",
-  modal: "modal",
-  mdl: "modal",
-  reka: "reka",
-  nlpcloud: "nlpcloud",
-  nlpc: "nlpcloud",
-  bazaarlink: "bazaarlink",
-  bzl: "bazaarlink",
-  completions: "completions",
-  cpl: "completions",
-  enally: "enally",
-  enly: "enally",
-  freetheai: "freetheai",
-  fta: "freetheai",
-  llm7: "llm7",
-  lepton: "lepton",
-  kluster: "kluster",
-  ai21: "ai21",
-  "inference-net": "inference-net",
-  inet: "inference-net",
-  predibase: "predibase",
-  bytez: "bytez",
-  morph: "morph",
-  longcat: "longcat",
-  lc: "longcat",
-  puter: "puter",
-  pu: "puter",
-  uncloseai: "uncloseai",
-  unc: "uncloseai",
-  scaleway: "scaleway",
-  scw: "scaleway",
-  deepinfra: "deepinfra",
-  sambanova: "sambanova",
-  samba: "sambanova",
-  nscale: "nscale",
-  baseten: "baseten",
-  publicai: "publicai",
-  "nous-research": "nous-research",
-  nous: "nous-research",
-  glhf: "glhf",
-  bb: "blackbox",
-  blackbox: "blackbox",
 };
+
+const ALIAS_TO_PROVIDER_ID = { ...MEDIA_ONLY_ALIASES };
+for (const entry of REGISTRY) {
+  ALIAS_TO_PROVIDER_ID[entry.id] = entry.id;
+  if (entry.alias) ALIAS_TO_PROVIDER_ID[entry.alias] = entry.id;
+  for (const a of entry.aliases || []) ALIAS_TO_PROVIDER_ID[a] = entry.id;
+}
 
 /**
  * Resolve provider alias to provider ID
@@ -243,6 +189,15 @@ export async function getModelInfoCore(modelStr, aliasesOrGetter) {
   };
 }
 
+// Config-driven prefix → provider inference (first match wins, fallback "openai").
+const MODEL_PREFIX_PROVIDERS = [
+  [/^claude-/, "anthropic"],
+  [/^gemini-/, "gemini"],
+  [/^gpt-/, "openai"],
+  [/^o[134]/, "openai"],
+  [/^deepseek-/, "openrouter"],
+];
+
 /**
  * Infer provider from model name prefix
  * Used as fallback when no provider prefix or alias is given
@@ -250,12 +205,5 @@ export async function getModelInfoCore(modelStr, aliasesOrGetter) {
 function inferProviderFromModelName(modelName) {
   if (!modelName) return "openai";
   const m = modelName.toLowerCase();
-  if (m.startsWith("claude-")) return "anthropic";
-  if (m.startsWith("gemini-")) return "gemini";
-  if (m.startsWith("gpt-")) return "openai";
-  if (m.startsWith("o1") || m.startsWith("o3") || m.startsWith("o4"))
-    return "openai";
-  if (m.startsWith("deepseek-")) return "openrouter";
-  // Default fallback
-  return "openai";
+  return MODEL_PREFIX_PROVIDERS.find(([re]) => re.test(m))?.[1] || "openai";
 }
