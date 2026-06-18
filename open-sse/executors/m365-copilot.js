@@ -88,25 +88,60 @@ function parseOpenAIMessages(messages) {
   return userPrompt;
 }
 
-/** Map model ID to M365 Copilot model family options */
-function resolveCopilotModelOptions(modelId) {
-  const normalized = (modelId || "copilot").toLowerCase();
-  const modelMap = {
-    "gpt-5.5": { optionsSets: ["galileo"], options: { gptModelFamily: "gpt-5.5" } },
-    "gpt-5.2": { optionsSets: ["galileo"], options: { gptModelFamily: "gpt-5.2" } },
-  };
-  return modelMap[normalized] || { optionsSets: [], options: {} };
+/** Default M365 Copilot feature flags (captured from real browser traffic) */
+const M365_DEFAULT_OPTIONS_SETS = [
+  "search_result_progress_messages_with_search_queries",
+  "update_textdoc_response_after_streaming",
+  "deepleo_networking_timeout_10minutes_canmore",
+  "cwc_flux_image",
+  "cwc_code_interpreter",
+  "cwc_code_interpreter_amsfix",
+  "cwcfluxgptv",
+  "flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch",
+  "gptvnorm2048",
+  "cwc_code_interpreter_citation_fix",
+  "code_interpreter_interactive_charts",
+  "cwc_code_interpreter_interactive_charts_inline_image",
+  "code_interpreter_matplotlib_patching",
+  "cwc_fileupload_odb",
+  "update_memory_plugin",
+  "add_custom_instructions",
+  "cwc_flux_v3",
+  "flux_v3_progress_messages",
+  "enable_batch_token_processing",
+  "flux_v3_image_gen_enable_dimensions",
+  "flux_v3_image_gen_enable_non_watermarked_storage",
+  "flux_v3_image_gen_enable_icon_dimensions",
+  "flux_v3_image_gen_enable_system_text_with_params",
+  "flux_v3_image_gen_enable_designer_dimensions_meta_prompting_in_system_prompts",
+  "flux_v3_image_gen_enable_story",
+  "rich_responses",
+  "pages_citations",
+  "pages_citations_multiturn",
+];
+
+/**
+ * Build M365 Copilot feature flags.
+ * @param {boolean} enableReasoning - if true, add "enable_gg_gpt" for deep thinking
+ * @returns {string[]}
+ */
+function buildCopilotOptionsSets(enableReasoning = false) {
+  const sets = [...M365_DEFAULT_OPTIONS_SETS];
+  if (enableReasoning && !sets.includes("enable_gg_gpt")) {
+    sets.push("enable_gg_gpt");
+  }
+  return sets;
 }
 
-function buildCopilotMessage(text, invocationId, conversationId, sessionId, modelId) {
-  const { optionsSets: modelOptionSets, options: modelOptions } = resolveCopilotModelOptions(modelId);
+function buildCopilotMessage(text, invocationId, conversationId, sessionId, enableReasoning = false) {
   return {
     arguments: [{
       source: "officeweb",
       clientCorrelationId: crypto.randomUUID(),
       sessionId,
-      optionsSets: ["enterprise_flux_handoff_outlook_compose", ...modelOptionSets],
-      options: { ...modelOptions },
+      optionsSets: ["enterprise_flux_handoff_outlook_compose", ...buildCopilotOptionsSets(enableReasoning)],
+      options: {},
+      tone: enableReasoning ? "Reasoning" : "Balanced",
       allowedMessageTypes: [
         "Chat", "Suggestion", "InternalSearchQuery", "InternalSearchResult",
         "Disengaged", "InternalLoaderMessage", "RenderCardRequest",
@@ -424,6 +459,10 @@ export class M365CopilotExecutor extends BaseExecutor {
 
     const { oid, tid } = extractTokenClaims(accessToken);
 
+    // Extract reasoning / deep thinking preference from body
+    const enableReasoning = body?.reasoning === true || body?.enable_deep_thinking === true;
+    const reasoningEffort = body?.reasoning_effort || null;
+
     // Build WebSocket URL matching browser behavior (2025-06)
     const rawHex = crypto.randomUUID().replace(/-/g, "");
     const sessionIdHex = rawHex;
@@ -573,7 +612,7 @@ export class M365CopilotExecutor extends BaseExecutor {
     ws.send(JSON.stringify({ type: 6 }) + RS);
 
     // Send user message
-    const copilotMsg = buildCopilotMessage(userPrompt, 0, conversationId, sessionIdUuid, model);
+    const copilotMsg = buildCopilotMessage(userPrompt, 0, conversationId, sessionIdUuid, enableReasoning);
     ws.send(JSON.stringify(copilotMsg) + RS);
 
     log?.info?.("M365-COPILOT", `Message sent (model=${model}), waiting for response stream`);
