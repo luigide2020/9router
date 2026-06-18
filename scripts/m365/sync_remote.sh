@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+# 清除可能冲突的环境变量（cron 环境可能带有 Hermes 的 VIRTUAL_ENV）
+unset VIRTUAL_ENV
+
 # launchd 环境极简，显式补 PATH
 export PATH="/Users/liujie/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
