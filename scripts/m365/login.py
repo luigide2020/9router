@@ -3,7 +3,7 @@ M365 Copilot access_token 抓取（修正 websocket 监听挂载点）
 关键修正：websocket 是 Page 事件，不是 BrowserContext 事件。
 必须 page.on("websocket", ...)，之前 ctx.on("websocket") 永不触发。
 """
-import argparse, base64, json, os, re, sys, time, urllib.parse
+import argparse, base64, json, os, re, sys, time, urllib.parse, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,6 +14,44 @@ except ImportError:
     sys.exit(1)
 
 CHAT_URL = "https://m365.cloud.microsoft/chat"
+
+# 允许执行的国家/地区代码
+ALLOWED_COUNTRY_CODES = {"CN", "HK", "MO", "TW"}
+
+
+def detect_region_by_ip():
+    """通过出口 IP 归属地检测网络区域（走 TUN/代理出口）"""
+    apis = [
+        ("http://ip-api.com/json/?fields=status,countryCode,country,query", "ip-api"),
+        ("https://ipapi.co/json/", "ipapi.co"),
+    ]
+    for url, name in apis:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode())
+            if name == "ip-api" and data.get("status") == "success":
+                return data.get("countryCode", ""), data.get("country", ""), data.get("query", "")
+            if name == "ipapi.co" and "country_code" in data:
+                return data.get("country_code", ""), data.get("country_name", ""), data.get("ip", "")
+        except Exception as e:
+            print(f"[REGION] {name} 查询失败: {e}")
+            continue
+    return None, None, None
+
+
+def check_region_or_exit():
+    """区域预检：通过出口 IP 判断，仅允许 CN/HK/MO/TW"""
+    code, country, ip = detect_region_by_ip()
+    if code and code.upper() in ALLOWED_COUNTRY_CODES:
+        print(f"[REGION] ✅ 出口 IP: {ip}，区域: {country}({code})，允许执行")
+        return
+    if code:
+        print(f"[REGION] ❌ 出口 IP: {ip}，区域: {country}({code})，不在允许列表 (CN/HK/MO/TW)，退出")
+    else:
+        print("[REGION] ❌ 无法检测出口 IP 归属地，退出")
+    sys.exit(0)
+
 USER_DATA_DIR = str(Path(__file__).parent / ".browser_profile")
 TOKEN_DIR = Path.home() / ".9router"
 TOKEN_FILE = TOKEN_DIR / "m365-token.json"
@@ -69,7 +107,11 @@ def main():
     ap.add_argument("--attempts", type=int, default=6)
     ap.add_argument("--wait", type=int, default=12)
     ap.add_argument("--close", action="store_true")
+    ap.add_argument("--skip-region-check", action="store_true", help="跳过区域检测")
     args = ap.parse_args()
+
+    if not args.skip_region_check:
+        check_region_or_exit()
 
     email = os.environ.get("M365_EMAIL", "")
     password = os.environ.get("M365_PASSWORD", "")
