@@ -50,7 +50,7 @@ const CLAUDE_CLI_SPOOF_HEADERS = {
 // Shared baseUrls
 const KIMI_CODING_BASE_URL = "https://api.kimi.com/coding/v1/messages";
 
-export const PROVIDERS = {
+const PROVIDERS_LOCAL = {
   claude: {
     baseUrl: "https://api.anthropic.com/v1/messages",
     format: "claude",
