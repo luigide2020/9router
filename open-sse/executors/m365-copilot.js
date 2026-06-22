@@ -460,7 +460,11 @@ export class M365CopilotExecutor extends BaseExecutor {
     const { oid, tid } = extractTokenClaims(accessToken);
 
     // Extract reasoning / deep thinking preference from body
-    const enableReasoning = body?.reasoning === true || body?.enable_deep_thinking === true;
+    // gpt-5.5 defaults to reasoning mode unless explicitly disabled
+    const isGpt55 = model === "gpt-5.5" || model.toLowerCase().includes("gpt-5.5");
+    const enableReasoning = isGpt55
+      ? body?.reasoning !== false && body?.enable_deep_thinking !== false
+      : (body?.reasoning === true || body?.enable_deep_thinking === true);
     const reasoningEffort = body?.reasoning_effort || null;
 
     // Build WebSocket URL matching browser behavior (2025-06)
