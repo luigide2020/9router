@@ -133,7 +133,10 @@ function buildCopilotOptionsSets(enableReasoning = false) {
   return sets;
 }
 
-function buildCopilotMessage(text, invocationId, conversationId, sessionId, enableReasoning = false) {
+function buildCopilotMessage(text, invocationId, conversationId, sessionId, enableReasoning = false, modelId = null) {
+  // Build threadLevelGptId based on model selection
+  const threadLevelGptId = modelId ? { [conversationId]: modelId } : {};
+
   return {
     arguments: [{
       source: "officeweb",
@@ -149,7 +152,7 @@ function buildCopilotMessage(text, invocationId, conversationId, sessionId, enab
         "ConfirmationCard", "AuthError", "DeveloperLogs",
       ],
       sliceIds: [],
-      threadLevelGptId: {},
+      threadLevelGptId,
       conversationId,
       traceId: crypto.randomUUID(),
       isStartOfSession: invocationId === 0,
@@ -615,8 +618,10 @@ export class M365CopilotExecutor extends BaseExecutor {
     // Send keep-alive ping (type 6)
     ws.send(JSON.stringify({ type: 6 }) + RS);
 
-    // Send user message
-    const copilotMsg = buildCopilotMessage(userPrompt, 0, conversationId, sessionIdUuid, enableReasoning);
+    // Send user message — pass model so M365 uses the correct GPT variant
+    // "copilot" (auto) means let M365 decide the model
+    const modelId = model === "copilot" ? null : model;
+    const copilotMsg = buildCopilotMessage(userPrompt, 0, conversationId, sessionIdUuid, enableReasoning, modelId);
     ws.send(JSON.stringify(copilotMsg) + RS);
 
     log?.info?.("M365-COPILOT", `Message sent (model=${model}), waiting for response stream`);
