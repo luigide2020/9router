@@ -80,13 +80,41 @@ def decode_jwt_payload(token):
 
 
 def is_logged_in(page):
-    return page.locator('input[type="email"]').count() == 0
+    # 如果页面上有邮箱输入框，说明未登录
+    # 但 M365 登录页可能用不同的 selector，所以也检查 URL
+    if page.locator('input[type="email"]').count() > 0:
+        return False
+    if page.locator('input[name="loginfmt"]').count() > 0:
+        return False
+    if 'login' in page.url.lower() or 'login.microsoftonline' in page.url.lower():
+        return False
+    return True
+
+
+def is_on_chat_page(page):
+    # 如果已经在 chat 页面，说明登录成功了
+    return 'chat' in page.url
 
 
 def do_login(page, email, password):
+    print("[LOGIN] 等待登录页面加载...")
+    # Wait for login page - try multiple possible selectors
+    try:
+        page.wait_for_selector('input[type="email"]', timeout=10000)
+    except PwTimeout:
+        try:
+            page.wait_for_selector('input[name="loginfmt"]', timeout=10000)
+        except PwTimeout:
+            try:
+                page.wait_for_selector('input[name="login"]', timeout=10000)
+            except PwTimeout:
+                # Last resort: wait for any visible input on the page
+                page.wait_for_selector('input', timeout=10000)
+    
+    print(f"[LOGIN] 当前 URL: {page.url}")
     print("[LOGIN] 输入邮箱...")
-    page.fill('input[type="email"]', email)
-    page.click('input[type="submit"]')
+    page.fill('input[type="email"], input[name="loginfmt"], input[name="login"], input', email)
+    page.click('input[type="submit"], button[type="submit"], input[type="submit"]')
     print("[LOGIN] 等待密码框...")
     page.wait_for_selector('input[type="password"]', timeout=15000)
     page.fill('input[type="password"]', password)
@@ -96,6 +124,7 @@ def do_login(page, email, password):
         page.click('#idSIButton9')
     except PwTimeout:
         pass
+    # Wait for chat page to load (login success)
     page.wait_for_url("**m365.cloud.microsoft/**", timeout=30000)
     print("[LOGIN] ✅ 登录成功")
 
@@ -108,6 +137,7 @@ def main():
     ap.add_argument("--wait", type=int, default=12)
     ap.add_argument("--close", action="store_true")
     ap.add_argument("--skip-region-check", action="store_true", help="跳过区域检测")
+    ap.add_argument("--force-clear", action="store_true", help="强制清空浏览器缓存，清除旧登录态")
     args = ap.parse_args()
 
     if not args.skip_region_check:
@@ -118,6 +148,18 @@ def main():
     if not args.sniff_only and (not email or not password):
         print("[ERROR] 请设置 M365_EMAIL 和 M365_PASSWORD")
         sys.exit(1)
+
+    # Force clear browser cache to remove old login state
+    if args.force_clear:
+        import shutil
+        browser_profile = Path(USER_DATA_DIR)
+        if browser_profile.exists():
+            print(f"[CLEAR] 删除旧浏览器缓存: {browser_profile}")
+            shutil.rmtree(browser_profile)
+            browser_profile.mkdir(parents=True, exist_ok=True)
+            print("[CLEAR] ✅ 缓存已清空")
+        else:
+            print("[CLEAR] 缓存目录不存在，跳过")
 
     target = {"token": None}
 

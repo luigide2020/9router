@@ -27,11 +27,15 @@ TOKEN_DIR="$HOME/.9router"
 TOKEN_FILE="$TOKEN_DIR/m365-token.json"
 
 HEADLESS="--headless"
-[ "$1" = "--no-headless" ] && HEADLESS=""
+FORCE_CLEAR=""
+for arg in "$@"; do
+  [ "$arg" = "--no-headless" ] && HEADLESS=""
+  [ "$arg" = "--force-clear" ] && FORCE_CLEAR="--force-clear"
+done
 
 echo "========== [STEP 1] 本地抓取 token =========="
 env M365_EMAIL="$M365_EMAIL" M365_PASSWORD="$M365_PASSWORD" \
-    "$UV" run python "$SCRIPT_DIR/login.py" $HEADLESS --close
+    "$UV" run python "$SCRIPT_DIR/login.py" $HEADLESS --close $FORCE_CLEAR || exit 1
 
 [ -f "$TOKEN_FILE" ] || { echo "[ERROR] token 文件未生成: $TOKEN_FILE"; exit 1; }
 
