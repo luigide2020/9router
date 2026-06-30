@@ -2,6 +2,8 @@ import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import WsClient from "ws";
 import { HttpsProxyAgent } from "https-proxy-agent";
+import { resolveSessionId } from "../utils/sessionManager.js";
+import { createHash, randomUUID } from "crypto";
 
 const M365_WS_BASE = "wss://substrate.office.com/m365Copilot/Chathub";
 const M365_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.3.1 Safari/605.1.15";
@@ -59,35 +61,6 @@ function extractTokenClaims(token) {
   return { oid: claims.oid || claims.sub || "unknown", tid: claims.tid || "unknown" };
 }
 
-/** Parse OpenAI messages into a single user query string */
-function parseOpenAIMessages(messages) {
-  const extracted = [];
-  for (const msg of messages) {
-    let role = String(msg.role || "user");
-    if (role === "developer") role = "system";
-    let content = "";
-    if (typeof msg.content === "string") content = msg.content;
-    else if (Array.isArray(msg.content)) content = msg.content.filter((c) => c.type === "text").map((c) => String(c.text || "")).join(" ");
-    if (!content.trim()) continue;
-    extracted.push({ role, text: content });
-  }
-  let lastUserIdx = -1;
-  for (let i = extracted.length - 1; i >= 0; i--) {
-    if (extracted[i].role === "user") { lastUserIdx = i; break; }
-  }
-  const contextParts = [];
-  let userPrompt = "";
-  for (let i = 0; i < extracted.length; i++) {
-    const { role, text } = extracted[i];
-    if (i === lastUserIdx) userPrompt = text;
-    else contextParts.push(`${role}: ${text}`);
-  }
-  if (contextParts.length > 0 && userPrompt) {
-    userPrompt = contextParts.join("\n\n") + "\n\nuser: " + userPrompt;
-  }
-  return userPrompt;
-}
-
 /** Default M365 Copilot feature flags (captured from real browser traffic) */
 const M365_DEFAULT_OPTIONS_SETS = [
   "search_result_progress_messages_with_search_queries",
@@ -123,38 +96,71 @@ const M365_DEFAULT_OPTIONS_SETS = [
 /**
  * Build M365 Copilot feature flags.
  * @param {boolean} enableReasoning - if true, add "enable_gg_gpt" for deep thinking
+ * @param {boolean} disableExecution - if true, strip code interpreter / tool execution flags
  * @returns {string[]}
  */
-function buildCopilotOptionsSets(enableReasoning = false) {
+function buildCopilotOptionsSets(enableReasoning = false, disableExecution = false) {
   const sets = [...M365_DEFAULT_OPTIONS_SETS];
   if (enableReasoning && !sets.includes("enable_gg_gpt")) {
     sets.push("enable_gg_gpt");
   }
+  if (disableExecution) {
+    const executionFlags = [
+      "cwc_code_interpreter", "cwc_code_interpreter_amsfix",
+      "cwc_code_interpreter_citation_fix", "code_interpreter_interactive_charts",
+      "cwc_code_interpreter_interactive_charts_inline_image",
+      "code_interpreter_matplotlib_patching", "cwc_fileupload_odb",
+      "cwc_flux_image", "cwcfluxgptv",
+      "flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch",
+      "cwc_flux_v3", "flux_v3_image_gen_enable_dimensions",
+      "flux_v3_image_gen_enable_non_watermarked_storage",
+      "flux_v3_image_gen_enable_icon_dimensions",
+      "flux_v3_image_gen_enable_system_text_with_params",
+      "flux_v3_image_gen_enable_designer_dimensions_meta_prompting_in_system_prompts",
+      "flux_v3_image_gen_enable_story",
+      "search_result_progress_messages_with_search_queries",
+      "update_textdoc_response_after_streaming",
+      "rich_responses",
+      "pages_citations", "pages_citations_multiturn",
+    ];
+    for (let i = sets.length - 1; i >= 0; i--) {
+      if (executionFlags.includes(sets[i])) sets.splice(i, 1);
+    }
+  }
   return sets;
 }
 
-function buildCopilotMessage(text, invocationId, conversationId, sessionId, enableReasoning = false, modelId = null) {
-  // Build threadLevelGptId based on model selection
+function buildCopilotMessage(text, invocationId, conversationId, sessionId, enableReasoning = false, modelId = null, disableExecution = false) {
   const threadLevelGptId = modelId ? { [conversationId]: modelId } : {};
 
-  return {
-    arguments: [{
-      source: "officeweb",
-      clientCorrelationId: crypto.randomUUID(),
-      sessionId,
-      optionsSets: ["enterprise_flux_handoff_outlook_compose", ...buildCopilotOptionsSets(enableReasoning)],
-      options: {},
-      tone: enableReasoning ? "Reasoning" : "Balanced",
-      allowedMessageTypes: [
+  const allowedMessageTypes = disableExecution
+    ? ["Chat", "Suggestion", "InternalLoaderMessage", "Disengaged", "AuthError"]
+    : [
         "Chat", "Suggestion", "InternalSearchQuery", "InternalSearchResult",
         "Disengaged", "InternalLoaderMessage", "RenderCardRequest",
         "AdsQuery", "SemanticSerp", "GenerateContentQuery", "SearchQuery",
         "ConfirmationCard", "AuthError", "DeveloperLogs",
-      ],
+      ];
+
+  const plugins = disableExecution
+    ? []
+    : [{ Id: "BingWebSearch", Source: "BuiltIn" }];
+
+  const experienceType = disableExecution ? "Deep" : "Default";
+
+  return {
+    arguments: [{
+      source: "officeweb",
+      clientCorrelationId: randomUUID(),
+      sessionId,
+      optionsSets: ["enterprise_flux_handoff_outlook_compose", ...buildCopilotOptionsSets(enableReasoning, disableExecution)],
+      options: {},
+      tone: enableReasoning ? "Reasoning" : "Balanced",
+      allowedMessageTypes,
       sliceIds: [],
       threadLevelGptId,
       conversationId,
-      traceId: crypto.randomUUID(),
+      traceId: randomUUID(),
       isStartOfSession: invocationId === 0,
       productThreadType: "Office",
       clientInfo: { clientPlatform: "web" },
@@ -163,16 +169,16 @@ function buildCopilotMessage(text, invocationId, conversationId, sessionId, enab
         inputMethod: "Keyboard",
         text,
         entityAnnotationTypes: ["People", "File", "Event"],
-        requestId: crypto.randomUUID(),
+        requestId: randomUUID(),
         locationInfo: {
           timeZoneOffset: new Date().getTimezoneOffset() / -60,
           timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
         },
         locale: "en-US",
         messageType: "Chat",
-        experienceType: "Default",
+        experienceType,
       },
-      plugins: [{ Id: "BingWebSearch", Source: "BuiltIn" }],
+      plugins,
     }],
     invocationId: String(invocationId),
     target: "chat",
@@ -211,9 +217,13 @@ function parseSignalRRecords(rawText) {
 
 /**
  * Build streaming SSE response from WebSocket messages
+ * When toolMeta.hasTools is true, content is buffered until stream end so the
+ * response translator can detect ```json-tool blocks and convert them to
+ * proper OpenAI tool_calls. Without tools, content streams normally.
  */
-function buildStreamingFromWs(ws, model, cid, created, signal) {
+function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
   const encoder = new TextEncoder();
+  const bufferForTools = !!toolMeta?.hasTools;
 
   return new ReadableStream({
     start(controller) {
@@ -225,8 +235,25 @@ function buildStreamingFromWs(ws, model, cid, created, signal) {
       let fullText = "";
       let closed = false;
 
+      const emitContent = (text) => {
+        if (!text || closed) return;
+        controller.enqueue(encoder.encode(sseChunk({
+          id: cid, object: "chat.completion.chunk", created, model, system_fingerprint: null,
+          choices: [{ index: 0, delta: { content: text }, finish_reason: null, logprobs: null }],
+        })));
+      };
+
       const close = () => {
         if (closed) return;
+        // When buffering for tools, emit all accumulated text as one chunk
+        // BEFORE setting closed=true (emitContent checks the closed flag)
+        if (bufferForTools && fullText) {
+          const hasCmd = /^CMD:/m.test(fullText);
+          const hasRemoteExec = /\/mnt\//.test(fullText) && /cwd:/m.test(fullText);
+          console.log(`[M365-CLOSE] Buffering tools: textLen=${fullText.length}, hasJsonTool=${fullText.includes('```json-tool')}, hasCmd=${hasCmd}, hasRemoteExec=${hasRemoteExec}`);
+          console.log(`[M365-CLOSE-FULL] ${fullText.slice(0, 1000)}`);
+          emitContent(fullText);
+        }
         closed = true;
         try {
           controller.enqueue(encoder.encode(sseChunk({
@@ -241,6 +268,7 @@ function buildStreamingFromWs(ws, model, cid, created, signal) {
 
       const sendError = (msg) => {
         if (closed) return;
+        if (bufferForTools && fullText) emitContent(fullText);
         controller.enqueue(encoder.encode(sseChunk({
           id: cid, object: "chat.completion.chunk", created, model, system_fingerprint: null,
           choices: [{ index: 0, delta: { content: `[Error: ${msg}]` }, finish_reason: null, logprobs: null }],
@@ -253,42 +281,38 @@ function buildStreamingFromWs(ws, model, cid, created, signal) {
       }, WS_RESPONSE_TIMEOUT_MS);
 
       const processData = (data) => {
-        // Type 1: streaming text updates
         if (data.type === 1) {
           const payload = data.item || data.arguments?.[0];
           if (payload?.messages) {
             for (const msg of payload.messages) {
+              if (msg.author !== "bot") {
+                console.log(`[M365-T1-NONBOT] author=${msg.author} keys=${Object.keys(msg).join(",")} text=${(msg.text||"").slice(0,200)}`);
+              }
               if (msg.text && msg.author === "bot") {
                 const delta = msg.text.slice(fullText.length);
                 if (delta) {
                   fullText = msg.text;
-                  controller.enqueue(encoder.encode(sseChunk({
-                    id: cid, object: "chat.completion.chunk", created, model, system_fingerprint: null,
-                    choices: [{ index: 0, delta: { content: delta }, finish_reason: null, logprobs: null }],
-                  })));
+                  if (!bufferForTools) emitContent(delta);
                 }
               }
             }
           }
         }
-        // Type 2: final complete message (M365 completion signal)
         if (data.type === 2) {
           const payload = data.item || data.arguments?.[0];
           if (payload?.messages) {
             for (const msg of payload.messages) {
+              const msgKeys = Object.keys(msg || {}).join(",");
+              const msgAuthor = msg?.author || "NONE";
+              const msgText = (msg?.text || "").slice(0, 100);
+              console.log(`[M365-T2] author=${msgAuthor} keys=${msgKeys} text=${msgText}`);
               if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
                 const delta = msg.text.slice(fullText.length);
                 fullText = msg.text;
-                if (delta) {
-                  controller.enqueue(encoder.encode(sseChunk({
-                    id: cid, object: "chat.completion.chunk", created, model, system_fingerprint: null,
-                    choices: [{ index: 0, delta: { content: delta }, finish_reason: null, logprobs: null }],
-                  })));
-                }
+                if (!bufferForTools && delta) emitContent(delta);
               }
             }
           }
-          // Check for errors (including Throttled) BEFORE closing
           if (payload?.result?.value && payload.result.value !== "Success") {
             sendError(payload.result.message || payload.result.value);
             return;
@@ -297,7 +321,6 @@ function buildStreamingFromWs(ws, model, cid, created, signal) {
           close();
           return;
         }
-        // Type 3: end of conversation turn
         if (data.type === 3) {
           clearTimeout(responseTimer);
           close();
@@ -442,11 +465,6 @@ export class M365CopilotExecutor extends BaseExecutor {
   }
 
   async execute({ model, body, stream, credentials, signal, log }) {
-    const messages = body?.messages;
-    if (!messages || !Array.isArray(messages) || messages.length === 0) {
-      return this._errorResponse("Missing or empty messages array", 400, "invalid_request");
-    }
-
     const accessToken = credentials.accessToken || credentials.apiKey;
     if (!accessToken) {
       return this._errorResponse(
@@ -455,26 +473,47 @@ export class M365CopilotExecutor extends BaseExecutor {
       );
     }
 
-    const userPrompt = parseOpenAIMessages(messages);
+    const userPrompt = body._m365Prompt || "";
     if (!userPrompt.trim()) {
       return this._errorResponse("Empty query after processing", 400, "invalid_request");
     }
 
+    const toolMeta = body._m365ToolMeta || { hasTools: false, toolNameMap: new Map(), toolCallMetaMap: new Map() };
+
     const { oid, tid } = extractTokenClaims(accessToken);
 
-    // Extract reasoning / deep thinking preference from body
-    // gpt-5.5 defaults to reasoning mode unless explicitly disabled
     const isGpt55 = model === "gpt-5.5" || model.toLowerCase().includes("gpt-5.5");
     const enableReasoning = isGpt55
       ? body?.reasoning !== false && body?.enable_deep_thinking !== false
       : (body?.reasoning === true || body?.enable_deep_thinking === true);
-    const reasoningEffort = body?.reasoning_effort || null;
 
-    // Build WebSocket URL matching browser behavior (2025-06)
-    const rawHex = crypto.randomUUID().replace(/-/g, "");
-    const sessionIdHex = rawHex;
-    const sessionIdUuid = `${rawHex.slice(0,8)}-${rawHex.slice(8,12)}-${rawHex.slice(12,16)}-${rawHex.slice(16,20)}-${rawHex.slice(20)}`;
-    const conversationId = crypto.randomUUID();
+    // Use session manager for stable conversation/session IDs (enables multi-turn tool calling)
+    const connectionId = credentials?.connectionId || credentials?.email || `${oid}@${tid}`;
+    
+    // Generate stable conversationId for multi-turn dialogue
+    const conversationIdBase = resolveSessionId({
+      headers: credentials?.rawHeaders,
+      body,
+      connectionId,
+      scope: "m365-copilot"
+    });
+    
+    // Generate stable sessionId
+    const sessionIdBase = resolveSessionId({
+      headers: credentials?.rawHeaders,
+      body,
+      connectionId: `${connectionId}:session`,
+      scope: "m365-copilot-session"
+    });
+    
+    // Convert to UUID format (M365 requires UUID format for conversationId)
+    const conversationIdHash = createHash("sha256").update(conversationIdBase).digest("hex");
+    const conversationId = `${conversationIdHash.slice(0,8)}-${conversationIdHash.slice(8,12)}-${conversationIdHash.slice(12,16)}-${conversationIdHash.slice(16,20)}-${conversationIdHash.slice(20,32)}`;
+    
+    // Convert to UUID format for sessionId
+    const sessionIdHash = createHash("sha256").update(sessionIdBase).digest("hex");
+    const sessionIdUuid = `${sessionIdHash.slice(0,8)}-${sessionIdHash.slice(8,12)}-${sessionIdHash.slice(12,16)}-${sessionIdHash.slice(16,20)}-${sessionIdHash.slice(20,32)}`;
+    const sessionIdHex = sessionIdHash.slice(0, 32);
 
     const wsParams = new URLSearchParams({
       "chatsessionid": sessionIdHex,
@@ -494,6 +533,12 @@ export class M365CopilotExecutor extends BaseExecutor {
     });
     const wsUrl = `${M365_WS_BASE}/${encodeURIComponent(oid)}@${encodeURIComponent(tid)}?${wsParams.toString()}`;
 
+    log?.info?.("M365-COPILOT", `Session: conversationId=${conversationId}, sessionId=${sessionIdUuid}`);
+    log?.info?.("M365-COPILOT", `Tool meta: hasTools=${toolMeta.hasTools}, toolCount=${toolMeta.toolNameMap?.size || 0}, shellTools=${JSON.stringify(toolMeta.shellToolNames || [])}`);
+    const schemas = toolMeta.shellToolSchemas || {};
+    for (const [name, schema] of Object.entries(schemas)) {
+      log?.info?.("M365-COPILOT", `  Shell tool schema: ${name} → ${JSON.stringify(schema)?.slice(0, 300)}`);
+    }
     log?.info?.("M365-COPILOT", `Connecting WebSocket: oid=${oid.slice(0, 8)}..., tid=${tid.slice(0, 8)}..., model=${model}, prompt_len=${userPrompt.length}`);
 
     // Open WebSocket connection
@@ -621,17 +666,18 @@ export class M365CopilotExecutor extends BaseExecutor {
     // Send user message — pass model so M365 uses the correct GPT variant
     // "copilot" (auto) means let M365 decide the model
     const modelId = model === "copilot" ? null : model;
-    const copilotMsg = buildCopilotMessage(userPrompt, 0, conversationId, sessionIdUuid, enableReasoning, modelId);
+    const copilotMsg = buildCopilotMessage(userPrompt, 0, conversationId, sessionIdUuid, enableReasoning, modelId, toolMeta.hasTools);
+    log?.info?.("M365-COPILOT", `WS send: optionsSets=${JSON.stringify(copilotMsg.arguments[0].optionsSets)}, plugins=${JSON.stringify(copilotMsg.arguments[0].plugins)}, allowedMessageTypes=${JSON.stringify(copilotMsg.arguments[0].allowedMessageTypes)}`);
     ws.send(JSON.stringify(copilotMsg) + RS);
 
     log?.info?.("M365-COPILOT", `Message sent (model=${model}), waiting for response stream`);
 
-    const cid = `chatcmpl-m365-${crypto.randomUUID().slice(0, 12)}`;
+    const cid = `chatcmpl-m365-${randomUUID().slice(0, 12)}`;
     const created = Math.floor(Date.now() / 1000);
 
     let finalResponse;
     if (stream) {
-      const sseStream = buildStreamingFromWs(ws, model, cid, created, signal);
+      const sseStream = buildStreamingFromWs(ws, model, cid, created, signal, toolMeta);
       // Process buffered messages
       for (const buf of messageBuffer) {
         if (ws.onmessage) ws.onmessage({ data: buf });

@@ -4,6 +4,9 @@ WORKDIR /app
 
 FROM base AS builder
 
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+
 RUN apk --no-cache upgrade && apk --no-cache add python3 make g++ linux-headers
 
 COPY package.json package-lock.json* ./

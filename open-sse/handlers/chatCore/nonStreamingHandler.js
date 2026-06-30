@@ -3,17 +3,72 @@ import { needsTranslation } from "../../translator/index.js";
 import { ollamaBodyToOpenAI } from "../../translator/response/ollama-to-openai.js";
 import { addBufferToUsage, filterUsageForFormat } from "../../utils/usageTracking.js";
 import { createErrorResult } from "../../utils/error.js";
+import { randomUUID } from "crypto";
 import { HTTP_STATUS } from "../../config/runtimeConfig.js";
 import { parseSSEToOpenAIResponse } from "./sseToJsonHandler.js";
 import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, saveUsageStats } from "./requestDetail.js";
 import { appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { decloakToolNames } from "../../utils/claudeCloaking.js";
+import { OPENAI_FINISH } from "../../translator/schema/index.js";
+
+const JSON_TOOL_RE = /```json-tool\s*\n([\s\S]*?)```/g;
+
+function extractToolCallsFromText(text) {
+  const calls = [];
+  let match;
+  JSON_TOOL_RE.lastIndex = 0;
+  while ((match = JSON_TOOL_RE.exec(text)) !== null) {
+    const raw = match[1].trim();
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && parsed.name) {
+        const callId = `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+        const args = parsed.arguments || parsed.input || {};
+        calls.push({ id: callId, type: "function", function: { name: String(parsed.name), arguments: typeof args === "string" ? args : JSON.stringify(args) } });
+      }
+    } catch {
+      const nameMatch = raw.match(/"name"\s*:\s*"([^"]+)"/);
+      if (nameMatch) {
+        const callId = `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+        const argMatch = raw.match(/"arguments"\s*:\s*(\{[\s\S]*\})/);
+        let args = "{}";
+        if (argMatch) { try { JSON.parse(argMatch[1]); args = argMatch[1]; } catch { args = argMatch[1]; } }
+        calls.push({ id: callId, type: "function", function: { name: nameMatch[1], arguments: args } });
+      }
+    }
+  }
+  return calls;
+}
+
+function stripToolBlocksFromText(text) {
+  return text.replace(JSON_TOOL_RE, "").trim();
+}
 
 /**
  * Translate non-streaming response body from provider format → OpenAI format.
  */
-export function translateNonStreamingResponse(responseBody, targetFormat, sourceFormat) {
+export function translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, translatedBody) {
   if (targetFormat === sourceFormat || targetFormat === FORMATS.OPENAI) return responseBody;
+
+  // M365 Copilot: detect ```json-tool blocks in content and convert to tool_calls
+  if (targetFormat === FORMATS.M365_COPILOT) {
+    const hasTools = !!translatedBody?._m365ToolMeta?.hasTools;
+    if (!hasTools || !responseBody.choices?.[0]?.message?.content) return responseBody;
+
+    const content = responseBody.choices[0].message.content;
+    const toolCalls = extractToolCallsFromText(content);
+
+    if (toolCalls.length > 0) {
+      const cleanContent = stripToolBlocksFromText(content);
+      const message = { role: "assistant" };
+      if (cleanContent) message.content = cleanContent;
+      else message.content = "";
+      message.tool_calls = toolCalls;
+      responseBody.choices[0].message = message;
+      responseBody.choices[0].finish_reason = OPENAI_FINISH.TOOL_CALLS;
+    }
+    return responseBody;
+  }
 
   // Gemini / Antigravity
   if (targetFormat === FORMATS.GEMINI || targetFormat === FORMATS.ANTIGRAVITY || targetFormat === FORMATS.GEMINI_CLI || targetFormat === FORMATS.VERTEX) {
@@ -177,7 +232,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint });
 
   const translatedResponse = needsTranslation(targetFormat, sourceFormat)
-    ? translateNonStreamingResponse(responseBody, targetFormat, sourceFormat)
+    ? translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, translatedBody)
     : responseBody;
 
   // Fix finish_reason for tool_calls: some providers return non-standard values (e.g. "other")

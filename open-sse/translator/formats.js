@@ -12,7 +12,8 @@ export const FORMATS = {
   KIRO: "kiro",
   CURSOR: "cursor",
   OLLAMA: "ollama",
-  COMMANDCODE: "commandcode"
+  COMMANDCODE: "commandcode",
+  M365_COPILOT: "m365-copilot"
 };
 
 /**
