@@ -737,7 +737,6 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
         }, effectiveProxy);
         return { valid: res.ok, error: res.ok ? null : "Invalid API key" };
       }
-      }
       default:
         return { valid: false, error: "Provider test not supported" };
     }
