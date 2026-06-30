@@ -53,10 +53,14 @@ function buildToolMeta(tools) {
     toolNameMap.set(name, { name });
 
     const desc = (func.description || "").toLowerCase();
-    if (desc.includes("shell") || desc.includes("command") || desc.includes("bash") ||
+    const isShellTool = desc.includes("shell") || desc.includes("command") || desc.includes("bash") ||
         desc.includes("exec") || desc.includes("terminal") || desc.includes("run") ||
         name.includes("shell") || name.includes("bash") || name.includes("exec") ||
-        name === "local_shell" || name === "run_command" || name === "execute_command") {
+        name === "local_shell" || name === "run_command" || name === "execute_command" ||
+        name === "Bash" || name === "bash" ||
+        name === "execute_bash" || name === "run_bash" || name === "shell_exec" ||
+        name === "computer_terminal" || name === "terminal";
+    if (isShellTool) {
       shellToolNames.push(name);
       shellToolSchemas[name] = func.parameters || null;
     }

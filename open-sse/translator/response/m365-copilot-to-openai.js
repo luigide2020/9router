@@ -46,7 +46,8 @@ function extractShellToolName(toolMeta) {
   if (map) {
     for (const [name] of map) {
       if (name.includes("shell") || name.includes("bash") || name.includes("exec") ||
-          name === "local_shell" || name === "run_command" || name === "execute_command") {
+          name === "local_shell" || name === "run_command" || name === "execute_command" ||
+          name === "Bash" || name === "execute_bash" || name === "terminal") {
         return name;
       }
     }
