@@ -1,0 +1,7 @@
+2026/06/30-09:55:52.890 52ac74 Reusing MANIFEST /Users/liujie/work/project/9router/scripts/m365/.browser_profile/Default/Local Storage/leveldb/MANIFEST-000001
+2026/06/30-09:55:52.892 52ac74 Recovering log #106
+2026/06/30-09:55:52.892 52ac74 Level-0 table #108: started
+2026/06/30-09:55:52.893 52ac74 Level-0 table #108: 57036 bytes OK
+2026/06/30-09:55:52.893 52ac74 Recovering log #108
+2026/06/30-09:55:52.893 52ac74 Reusing old log /Users/liujie/work/project/9router/scripts/m365/.browser_profile/Default/Local Storage/leveldb/000108.log 
+2026/06/30-09:55:52.895 52ac74 Delete type=0 #106

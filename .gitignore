@@ -83,3 +83,5 @@ __pycache__/
 *.egg-info/
 dist/
 .env.local
+.graphifyignore
+graphify-out/*
