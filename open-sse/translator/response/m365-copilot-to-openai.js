@@ -201,7 +201,7 @@ function m365CopilotToOpenAIResponse(chunk, state) {
 
   const choice = chunk.choices[0];
   const delta = choice.delta;
-  const hasToolMeta = !!state._m365ToolMeta?.hasTools;
+  const hasToolMeta = !!state._m365ToolMeta?.needsLocalExec;
 
   if (!state._m365Init) {
     state._m365Init = true;

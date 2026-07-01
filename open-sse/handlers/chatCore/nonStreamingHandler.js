@@ -107,8 +107,8 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
 
   // M365 Copilot: detect ```json-tool blocks in content and convert to tool_calls
   if (targetFormat === FORMATS.M365_COPILOT) {
-    const hasTools = !!translatedBody?._m365ToolMeta?.hasTools;
-    if (!hasTools || !responseBody.choices?.[0]?.message?.content) return responseBody;
+    const needsLocalExec = !!translatedBody?._m365ToolMeta?.needsLocalExec;
+    if (!needsLocalExec || !responseBody.choices?.[0]?.message?.content) return responseBody;
 
     const content = responseBody.choices[0].message.content;
     const toolCalls = extractToolCallsFromText(content);

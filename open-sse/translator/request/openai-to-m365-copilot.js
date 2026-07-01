@@ -3,30 +3,49 @@
  *
  * M365 Copilot's WebSocket protocol does NOT support native tool calling.
  * Worse, M365 has a server-side Code Interpreter that automatically executes
- * commands in a remote sandbox when it detects tool-like requests — and there
- * is NO client-side flag to fully disable this behavior.
+ * commands in a remote sandbox — and there is NO client-side flag to fully
+ * disable this behavior.
  *
- * Strategy (dual approach):
+ * Strategy (tool classification):
  *
- *   A) PROACTIVE: Rephrase the user's message to avoid triggering M365's
- *      Code Interpreter. Instead of passing tool schemas (which M365 sees as
- *      "the user wants me to execute code"), we use a lightweight natural
- *      language instruction that tells M365 to ONLY output the command it
- *      would run, without actually running it.
+ *   Agent tools are classified into three categories:
+ *   - SHELL: Bash, exec_command, run_command → must execute locally,
+ *     never remotely. Inject anti-execution prompt, buffer for tool_calls.
+ *   - SEARCH: WebSearch, WebFetch → M365's web search is useful;
+ *     keep BingWebSearch plugin enabled.
+ *   - FILE_OPS: Read, Edit, Write, Glob → need local execution too,
+ *     treated as needsLocalExec (shell commands under the hood).
  *
- *   B) REACTIVE: In the response translator, detect M365's remote execution
- *      results (paths like /mnt/*, format like "cwd: /mnt/...") and convert
- *      them into OpenAI tool_calls so the local agent (codex) can handle them.
- *
- * The translator:
- *   1. Extracts tool names from `tools[]` for response mapping
- *   2. Flattens OpenAI messages[] into a single user prompt
- *   3. Injects a concise instruction to prevent remote execution
- *   4. Stashes tool metadata on `body._m365ToolMeta` for the response translator
+ *   M365 capability control is fine-grained:
+ *   - disableCodeInterpreter: when needsLocalExec (shell + file ops)
+ *   - enableSearch: always true (search enriches responses)
+ *   - bufferForTools: when needsLocalExec (detect JSON tool_calls in response)
  */
 import { register } from "../index.js";
 import { FORMATS } from "../formats.js";
 import { ROLE } from "../schema/index.js";
+
+const SEARCH_TOOL_PATTERNS = [
+  "websearch", "web_search", "webfetch", "web_fetch",
+  "search_web", "searchweb", "bing_search",
+  "mcp__exa__web_search", "mcp__exa__web_fetch",
+  "browser_navigate", "browser_snapshot", "browser_click",
+  "browser_type", "browser_screenshot", "browser_go_back", "browser_go_forward",
+  "browser_wait", "browser_press_key",
+];
+
+const SHELL_TOOL_NAMES = new Set([
+  "local_shell", "run_command", "execute_command",
+  "Bash", "bash", "execute_bash", "run_bash",
+  "shell_exec", "computer_terminal", "terminal",
+]);
+
+const FILE_OP_TOOL_NAMES = new Set([
+  "Read", "Write", "Edit", "Glob", "Grep", "NotebookEdit",
+  "view_file", "write_to_file", "replace_file_content",
+  "multi_replace_file_content", "list_dir", "find_by_name",
+  "grep_search", "view_content_chunk",
+]);
 
 function extractContent(content) {
   if (typeof content === "string") return content;
@@ -39,12 +58,30 @@ function extractContent(content) {
   return "";
 }
 
+function classifyTool(name, description) {
+  const n = name.toLowerCase();
+  const d = (description || "").toLowerCase();
+
+  const isShell = d.includes("shell") || d.includes("command") || d.includes("bash") ||
+      d.includes("exec") || d.includes("terminal") || d.includes("run") ||
+      n.includes("shell") || n.includes("bash") || n.includes("exec") ||
+      SHELL_TOOL_NAMES.has(name);
+
+  const isSearch = SEARCH_TOOL_PATTERNS.some(p => n.includes(p) || d.includes(p));
+
+  const isFileOp = FILE_OP_TOOL_NAMES.has(name);
+
+  return { isShell, isSearch, isFileOp };
+}
+
 function buildToolMeta(tools) {
   if (!tools || tools.length === 0) return null;
 
   const toolNameMap = new Map();
   const shellToolNames = [];
   const shellToolSchemas = {};
+  const searchToolNames = [];
+  const fileOpToolNames = [];
 
   for (const tool of tools) {
     const func = tool.function;
@@ -52,24 +89,38 @@ function buildToolMeta(tools) {
     const name = func.name || "unknown";
     toolNameMap.set(name, { name });
 
-    const desc = (func.description || "").toLowerCase();
-    const isShellTool = desc.includes("shell") || desc.includes("command") || desc.includes("bash") ||
-        desc.includes("exec") || desc.includes("terminal") || desc.includes("run") ||
-        name.includes("shell") || name.includes("bash") || name.includes("exec") ||
-        name === "local_shell" || name === "run_command" || name === "execute_command" ||
-        name === "Bash" || name === "bash" ||
-        name === "execute_bash" || name === "run_bash" || name === "shell_exec" ||
-        name === "computer_terminal" || name === "terminal";
-    if (isShellTool) {
+    const { isShell, isSearch, isFileOp } = classifyTool(name, func.description);
+    if (isShell) {
       shellToolNames.push(name);
       shellToolSchemas[name] = func.parameters || null;
     }
+    if (isSearch) {
+      searchToolNames.push(name);
+    }
+    if (isFileOp) {
+      fileOpToolNames.push(name);
+      if (!isShell) {
+        shellToolNames.push(name);
+        shellToolSchemas[name] = null;
+      }
+    }
   }
 
-  return { toolNameMap, shellToolNames, shellToolSchemas };
+  const needsLocalExec = shellToolNames.length > 0 || fileOpToolNames.length > 0;
+  const hasSearchTools = searchToolNames.length > 0;
+
+  return {
+    toolNameMap,
+    shellToolNames,
+    shellToolSchemas,
+    searchToolNames,
+    fileOpToolNames,
+    needsLocalExec,
+    hasSearchTools,
+  };
 }
 
-function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas) {
+function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas, hasSearchTools) {
   if (!shellToolNames || shellToolNames.length === 0) return "";
 
   const primaryTool = shellToolNames[0];
@@ -98,6 +149,16 @@ function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas) {
       `When you need to execute a command, output JSON like:`,
       `{"name": "${primaryTool}", "arguments": {"command": "<the_command>"}}`,
     ].join("\n");
+  }
+
+  if (hasSearchTools) {
+    return [
+      "IMPORTANT: Do NOT execute any shell commands or code. Do NOT use your code interpreter or sandbox.",
+      "Do NOT use web search or browse the internet — the user has local search tools for that.",
+      "For ANY user request (checking config, reading files, searching, listing, etc.), output a JSON instruction and I will run it locally:",
+      schemaInstr,
+      "Do NOT run any command yourself. Just output the JSON and stop.",
+    ].join(" ");
   }
 
   return [
@@ -246,9 +307,14 @@ function openaiToM365CopilotRequest(model, body, stream, credentials) {
     flatMessages = flattenMessages(messages, toolCallMetaMap);
   }
 
+  const needsLocalExec = !!toolMeta?.needsLocalExec;
   let finalPrompt;
-  if (!hasToolResults && toolMeta && toolMeta.shellToolNames.length > 0) {
-    const antiExecPrompt = buildAntiExecutionPrompt(toolMeta.shellToolNames, toolMeta.shellToolSchemas);
+  if (!hasToolResults && needsLocalExec) {
+    const antiExecPrompt = buildAntiExecutionPrompt(
+      toolMeta.shellToolNames,
+      toolMeta.shellToolSchemas,
+      toolMeta.hasSearchTools,
+    );
     finalPrompt = `${antiExecPrompt}\n\n---\n\n${flatMessages}`;
   } else {
     finalPrompt = flatMessages;
@@ -260,10 +326,14 @@ function openaiToM365CopilotRequest(model, body, stream, credentials) {
     _m365Prompt: finalPrompt,
     _m365ToolMeta: {
       hasTools: !!(tools && tools.length > 0),
+      needsLocalExec,
+      hasSearchTools: !!toolMeta?.hasSearchTools,
       toolNameMap: toolMeta?.toolNameMap || new Map(),
       toolCallMetaMap,
       shellToolNames: toolMeta?.shellToolNames || [],
       shellToolSchemas: toolMeta?.shellToolSchemas || {},
+      searchToolNames: toolMeta?.searchToolNames || [],
+      fileOpToolNames: toolMeta?.fileOpToolNames || [],
     },
     stream,
   };
