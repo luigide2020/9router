@@ -47,6 +47,29 @@ const FILE_OP_TOOL_NAMES = new Set([
   "grep_search", "view_content_chunk",
 ]);
 
+function classifyToolName(name) {
+  if (SHELL_TOOL_NAMES.has(name)) return "shell";
+  if (FILE_OP_TOOL_NAMES.has(name)) return "fileOp";
+  const n = name.toLowerCase();
+  if (SEARCH_TOOL_PATTERNS.some(p => n.includes(p))) return "search";
+  return "shell";
+}
+
+function formatToolResult(tcName, resultStr) {
+  const kind = classifyToolName(tcName);
+  if (kind === "fileOp") {
+    const label = tcName === "Read" || tcName === "view_file" || tcName === "view_content_chunk"
+      ? "File content"
+      : tcName === "Glob" || tcName === "find_by_name" || tcName === "list_dir"
+        ? "File listing"
+        : tcName === "Grep" || tcName === "grep_search"
+          ? "Search results"
+          : "File operation result";
+    return `[${label} (${tcName})]:\n${resultStr}`;
+  }
+  return `[Command output (${tcName})]:\n${resultStr}`;
+}
+
 function extractContent(content) {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -230,7 +253,7 @@ function flattenMessages(messages, toolCallMetaMap) {
       const tcName = toolCallMetaMap.get(tcId) || "unknown";
       const result = extractContent(msg.content) || msg.content || "";
       const resultStr = typeof result === "string" ? result : JSON.stringify(result, null, 2);
-      parts.push(`[Command output]: ${resultStr}`);
+      parts.push(formatToolResult(tcName, resultStr));
       continue;
     }
   }
@@ -259,7 +282,7 @@ function extractLatestUserInput(messages, toolCallMetaMap) {
       const tcName = toolCallMetaMap.get(tcId) || "unknown";
       const result = extractContent(messages[i].content) || messages[i].content || "";
       const resultStr = typeof result === "string" ? result : JSON.stringify(result, null, 2);
-      resultParts.unshift(resultStr);
+      resultParts.unshift(formatToolResult(tcName, resultStr));
       i--;
     }
 
