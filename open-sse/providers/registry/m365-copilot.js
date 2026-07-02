@@ -21,7 +21,7 @@ export default {
   },
   models: [
     { id: "copilot", name: "M365 Copilot (Auto)" },
-    { id: "gpt-5.5", name: "GPT-5.5 (via Copilot)", defaultReasoning: true },
-    { id: "gpt-5.2", name: "GPT-5.2 (via Copilot)" },
+    { id: "gpt-5.5", name: "GPT-5.5 深度思考", defaultReasoning: true },
+    { id: "gpt-5.5-fast", name: "GPT-5.5 快速响应" },
   ],
 };

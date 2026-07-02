@@ -491,9 +491,12 @@ export class M365CopilotExecutor extends BaseExecutor {
     const { oid, tid } = extractTokenClaims(accessToken);
 
     const isGpt55 = model === "gpt-5.5" || model.toLowerCase().includes("gpt-5.5");
-    const enableReasoning = isGpt55
-      ? body?.reasoning !== false && body?.enable_deep_thinking !== false
-      : (body?.reasoning === true || body?.enable_deep_thinking === true);
+    const isGpt55Fast = model === "gpt-5.5-fast" || model.toLowerCase().includes("gpt-5.5-fast");
+    const enableReasoning = isGpt55Fast
+      ? false
+      : isGpt55
+        ? body?.reasoning !== false && body?.enable_deep_thinking !== false
+        : (body?.reasoning === true || body?.enable_deep_thinking === true);
 
     // Use session manager for stable conversation/session IDs (enables multi-turn tool calling)
     const connectionId = credentials?.connectionId || credentials?.email || `${oid}@${tid}`;
