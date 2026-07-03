@@ -35,6 +35,8 @@ const NAKED_CMD_JSON_RE = /\{\s*"(cmd|command|code|run)"\s*:\s*"([^"]+)"\s*\}/g;
 
 const COMMON_COMMANDS_RE = /\b(ls|pwd|cat|find|grep|head|tail|wc|echo|mkdir|rm|cp|mv|chmod|curl|wget|git|npm|node|python|pip|docker|make|gcc|javac|java)\b/;
 
+const COMMAND_INTENT_RE = /\b(run|execute|try|type|enter|issue|invoke)\s+(this\s+)?(command|the\s+following|it|now)|^CMD:/im;
+
 function isRemoteExecutionResult(text) {
   return REMOTE_EXEC_INDICATORS.some(re => re.test(text));
 }
@@ -167,9 +169,12 @@ function extractToolCallsFromText(text, toolMeta) {
   if (calls.length === 0) {
     const inlineCmd = text.match(/`([^`]+)`/);
     if (inlineCmd && COMMON_COMMANDS_RE.test(inlineCmd[1])) {
-      const toolName = extractShellToolName(toolMeta);
-      const argName = getShellToolCommandArgName(toolMeta);
-      calls.push(makeToolCall(toolName, { [argName]: inlineCmd[1].trim() }));
+      const beforeCmd = text.slice(0, text.indexOf(inlineCmd[0]));
+      if (COMMAND_INTENT_RE.test(beforeCmd)) {
+        const toolName = extractShellToolName(toolMeta);
+        const argName = getShellToolCommandArgName(toolMeta);
+        calls.push(makeToolCall(toolName, { [argName]: inlineCmd[1].trim() }));
+      }
     }
   }
 

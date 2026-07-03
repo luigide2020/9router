@@ -188,6 +188,22 @@ function buildCopilotMessage(text, invocationId, conversationId, sessionId, enab
   };
 }
 
+const SEARCH_MESSAGE_TYPES = new Set([
+  "InternalSearchQuery", "InternalSearchResult", "SemanticSerp",
+  "SearchQuery", "AdsQuery", "GenerateContentQuery",
+]);
+
+function isSearchBotMessage(msg) {
+  if (msg.author !== "bot") return false;
+  const mt = msg.messageType || msg.type || "";
+  if (SEARCH_MESSAGE_TYPES.has(mt)) return true;
+  if (msg.hiddenText && typeof msg.hiddenText === "string" && msg.hiddenText.includes("WebPages")) return true;
+  const text = msg.text || "";
+  if (text.startsWith('{"query"') && text.includes('"WebPages"')) return true;
+  if (text.startsWith('[{"query"') && text.includes('"WebPages"')) return true;
+  return false;
+}
+
 function sseChunk(data) {
   return `data: ${JSON.stringify(data)}\n\n`;
 }
@@ -296,6 +312,10 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
                   console.log(`[M365-SEARCH] type=${msgType} text=${(msg.text||"").slice(0,300)}`);
                 }
               }
+              if (isSearchBotMessage(msg)) {
+                console.log(`[M365-SEARCH-BOT] skipped search payload in bot message (len=${(msg.text||"").length})`);
+                continue;
+              }
               if (msg.text && msg.author === "bot") {
                 const delta = msg.text.slice(fullText.length);
                 if (delta) {
@@ -314,6 +334,10 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
               const msgAuthor = msg?.author || "NONE";
               const msgText = (msg?.text || "").slice(0, 100);
               console.log(`[M365-T2] author=${msgAuthor} keys=${msgKeys} text=${msgText}`);
+              if (isSearchBotMessage(msg)) {
+                console.log(`[M365-SEARCH-BOT] skipped search payload in T2 bot message (len=${(msg.text||"").length})`);
+                continue;
+              }
               if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
                 const delta = msg.text.slice(fullText.length);
                 fullText = msg.text;
@@ -398,6 +422,7 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, mes
         const payload = data.item || data.arguments?.[0];
         if (payload?.messages) {
           for (const msg of payload.messages) {
+            if (isSearchBotMessage(msg)) continue;
             if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
               fullText = msg.text;
             }
@@ -409,6 +434,7 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, mes
         const payload = data.item || data.arguments?.[0];
         if (payload?.messages) {
           for (const msg of payload.messages) {
+            if (isSearchBotMessage(msg)) continue;
             if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
               fullText = msg.text;
             }
