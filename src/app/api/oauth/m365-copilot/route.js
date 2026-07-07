@@ -95,9 +95,9 @@ export async function POST(request) {
         }, { status: 400 });
       }
 
-      // Check if puppeteer is available
+      // Check if puppeteer is available (dynamic to avoid build-time resolution)
       try {
-        await import("puppeteer");
+        await import(/* webpackIgnore: true */ "puppeteer");
       } catch {
         return NextResponse.json({
           error: "puppeteer is not installed. Run: npm install puppeteer && npx puppeteer browsers install chrome",
