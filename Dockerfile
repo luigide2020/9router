@@ -6,11 +6,12 @@ FROM base AS builder
 
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
+ARG NPM_REGISTRY=https://registry.npmjs.org
 
 RUN apk --no-cache upgrade && apk --no-cache add python3 make g++ linux-headers
 
 COPY package.json package-lock.json* ./
-RUN npm install --registry=https://registry.npmmirror.com
+RUN npm install --registry=$NPM_REGISTRY
 
 COPY . ./
 ENV NEXT_TELEMETRY_DISABLED=1
