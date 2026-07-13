@@ -37,6 +37,29 @@ const COMMON_COMMANDS_RE = /\b(ls|pwd|cat|find|grep|head|tail|wc|echo|mkdir|rm|c
 
 const COMMAND_INTENT_RE = /\b(run|execute|try|type|enter|issue|invoke)\s+(this\s+)?(command|the\s+following|it|now)|^CMD:/im;
 
+const DESTRUCTIVE_COMMAND_PATTERNS = [
+  /\brm\s+(-[rRfF]+\s+|--recursive|--force)\s*\S/i,
+  /\brm\s+\S.*\S\s*$/m,
+  /\brmdir\b/i,
+  /\bdel\b\s+/i,
+  /\bshred\b/i,
+  /\bformat\b/i,
+  /\berase\b/i,
+  /\btruncate\b\s+-s/i,
+  /\bchmod\s+(0+[0-7]*|000|777)\b/i,
+  /\bkill\s+(-9\s+)?\d+/,
+  /\bkillall\b/i,
+  /\bdd\s+if=.*of=\/dev\//i,
+  /\bmv\s+.*\s+\/dev\/null/i,
+  /\b>\s*\/dev\//,
+];
+
+function isDestructiveCommand(cmd) {
+  const c = cmd.trim();
+  if (!c) return false;
+  return DESTRUCTIVE_COMMAND_PATTERNS.some(p => p.test(c));
+}
+
 function isRemoteExecutionResult(text) {
   return REMOTE_EXEC_INDICATORS.some(re => re.test(text));
 }
@@ -201,6 +224,62 @@ function stripToolPatternsFromText(text) {
   return cleaned;
 }
 
+function buildToolCallResults(toolCalls, textBuffer, chunk, hasToolMeta, choice) {
+  const results = [];
+
+  if (toolCalls.length > 0) {
+    const cleanContent = stripToolPatternsFromText(textBuffer);
+    if (cleanContent) {
+      results.push({
+        id: chunk.id,
+        object: "chat.completion.chunk",
+        created: chunk.created,
+        model: chunk.model,
+        system_fingerprint: null,
+        choices: [{ index: 0, delta: { content: cleanContent }, finish_reason: null, logprobs: null }],
+      });
+    }
+
+    results.push({
+      id: chunk.id,
+      object: "chat.completion.chunk",
+      created: chunk.created,
+      model: chunk.model,
+      system_fingerprint: null,
+      choices: [{
+        index: 0,
+        delta: { role: "assistant", tool_calls: toolCalls.map((tc, idx) => ({ index: idx, id: tc.id, type: "function", function: tc.function })) },
+        finish_reason: null,
+        logprobs: null,
+      }],
+    });
+
+    results.push({
+      id: chunk.id,
+      object: "chat.completion.chunk",
+      created: chunk.created,
+      model: chunk.model,
+      system_fingerprint: null,
+      choices: [{ index: 0, delta: {}, finish_reason: OPENAI_FINISH.TOOL_CALLS, logprobs: null }],
+    });
+
+    return results;
+  }
+
+  if (textBuffer) {
+    results.push({
+      id: chunk.id,
+      object: "chat.completion.chunk",
+      created: chunk.created,
+      model: chunk.model,
+      system_fingerprint: null,
+      choices: [{ index: 0, delta: { content: textBuffer }, finish_reason: null, logprobs: null }],
+    });
+  }
+  results.push(chunk);
+  return results;
+}
+
 function m365CopilotToOpenAIResponse(chunk, state) {
   if (!chunk || !chunk.choices || !chunk.choices[0]) return [chunk];
 
@@ -220,59 +299,32 @@ function m365CopilotToOpenAIResponse(chunk, state) {
 
   if (hasToolMeta && (choice.finish_reason === "stop" || choice.finish_reason === OPENAI_FINISH.STOP)) {
     const toolCalls = extractToolCallsFromText(state._m365TextBuffer, state._m365ToolMeta);
-    const results = [];
+    const isGpt56 = state.model && (state.model === "gpt-5.6" || state.model.toLowerCase().includes("gpt-5.6"));
 
-    if (toolCalls.length > 0) {
-      const cleanContent = stripToolPatternsFromText(state._m365TextBuffer);
-      if (cleanContent) {
-        results.push({
-          id: chunk.id,
-          object: "chat.completion.chunk",
-          created: chunk.created,
-          model: chunk.model,
-          system_fingerprint: null,
-          choices: [{ index: 0, delta: { content: cleanContent }, finish_reason: null, logprobs: null }],
-        });
+    if (isGpt56 && toolCalls.length > 0) {
+      const safeCalls = toolCalls.filter(tc => {
+        try {
+          const args = typeof tc.function.arguments === "string" ? JSON.parse(tc.function.arguments) : tc.function.arguments;
+          const cmd = args?.cmd || args?.command || args?.code || args?.run || JSON.stringify(args);
+          if (isDestructiveCommand(cmd)) {
+            return false;
+          }
+        } catch { /* passthrough */ }
+        return true;
+      });
+
+      const blockedCount = toolCalls.length - safeCalls.length;
+      if (blockedCount > 0) {
+        const blockedMsg = `[SAFETY: ${blockedCount} destructive command(s) blocked by gpt-5.6 guardrail. Refusing rm/del/format/kill/overwrite operations.]`;
+        state._m365TextBuffer = state._m365TextBuffer
+          ? `${state._m365TextBuffer}\n\n${blockedMsg}`
+          : blockedMsg;
       }
 
-      results.push({
-        id: chunk.id,
-        object: "chat.completion.chunk",
-        created: chunk.created,
-        model: chunk.model,
-        system_fingerprint: null,
-        choices: [{
-          index: 0,
-          delta: { role: "assistant", tool_calls: toolCalls.map((tc, idx) => ({ index: idx, id: tc.id, type: "function", function: tc.function })) },
-          finish_reason: null,
-          logprobs: null,
-        }],
-      });
-
-      results.push({
-        id: chunk.id,
-        object: "chat.completion.chunk",
-        created: chunk.created,
-        model: chunk.model,
-        system_fingerprint: null,
-        choices: [{ index: 0, delta: {}, finish_reason: OPENAI_FINISH.TOOL_CALLS, logprobs: null }],
-      });
-
-      return results;
+      return buildToolCallResults(safeCalls, state._m365TextBuffer, chunk, hasToolMeta, choice);
     }
 
-    if (state._m365TextBuffer) {
-      results.push({
-        id: chunk.id,
-        object: "chat.completion.chunk",
-        created: chunk.created,
-        model: chunk.model,
-        system_fingerprint: null,
-        choices: [{ index: 0, delta: { content: state._m365TextBuffer }, finish_reason: null, logprobs: null }],
-      });
-    }
-    results.push(chunk);
-    return results;
+    return buildToolCallResults(toolCalls, state._m365TextBuffer, chunk, hasToolMeta, choice);
   }
 
   return [chunk];

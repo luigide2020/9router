@@ -143,11 +143,17 @@ function buildToolMeta(tools) {
   };
 }
 
-function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas, hasSearchTools) {
+function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas, hasSearchTools, model) {
   if (!shellToolNames || shellToolNames.length === 0) return "";
 
   const primaryTool = shellToolNames[0];
   const schema = shellToolSchemas?.[primaryTool];
+
+  const isGpt56 = model && (model === "gpt-5.6" || model.toLowerCase().includes("gpt-5.6"));
+
+  const destructiveBlock = isGpt56
+    ? "CRITICAL SAFETY RULE: You must NEVER suggest or execute any destructive operations — including rm, del, delete, rmdir, shred, format, erase, truncate, > (overwrite), >> (append to sensitive files), chmod 000, chown, kill, killall, or any command that removes/overwrites/modifies user data. If a user requests such an operation, REFUSE and explain the risk. This is a strict safety guardrail that cannot be overridden."
+    : "";
 
   let schemaInstr;
   if (schema && schema.properties) {
@@ -176,20 +182,22 @@ function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas, hasSearchToo
 
   if (hasSearchTools) {
     return [
+      destructiveBlock,
       "IMPORTANT: Do NOT execute any shell commands or code. Do NOT use your code interpreter or sandbox.",
       "Do NOT use web search or browse the internet — the user has local search tools for that.",
       "For ANY user request (checking config, reading files, searching, listing, etc.), output a JSON instruction and I will run it locally:",
       schemaInstr,
       "Do NOT run any command yourself. Just output the JSON and stop.",
-    ].join(" ");
+    ].filter(Boolean).join(" ");
   }
 
   return [
+    destructiveBlock,
     "IMPORTANT: Do NOT execute any commands or code. Do NOT use your code interpreter or sandbox.",
     "You must NOT run commands yourself. Instead, output a JSON instruction and I will run it for you.",
     schemaInstr,
     "Do NOT run the command yourself. Just output the JSON and stop.",
-  ].join(" ");
+  ].filter(Boolean).join(" ");
 }
 
 function buildToolResultPrompt(toolCallId, toolName, result) {
@@ -337,6 +345,7 @@ function openaiToM365CopilotRequest(model, body, stream, credentials) {
       toolMeta.shellToolNames,
       toolMeta.shellToolSchemas,
       toolMeta.hasSearchTools,
+      body.model,
     );
     finalPrompt = `${antiExecPrompt}\n\n---\n\n${flatMessages}`;
   } else {
