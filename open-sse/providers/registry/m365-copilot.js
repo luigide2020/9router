@@ -23,5 +23,9 @@ export default {
     { id: "copilot", name: "M365 Copilot (Auto)" },
     { id: "gpt-5.5", name: "GPT-5.5 深度思考", defaultReasoning: true },
     { id: "gpt-5.5-fast", name: "GPT-5.5 快速响应" },
+    { id: "gpt-5.6", name: "GPT-5.6", defaultReasoning: true },
+    { id: "gpt-5.6-luna", name: "GPT-5.6 Luna" },
+    { id: "gpt-5.6-terra", name: "GPT-5.6 Terra", defaultReasoning: true },
+    { id: "gpt-5.6-sol", name: "GPT-5.6 Sol", defaultReasoning: true },
   ],
 };

@@ -518,9 +518,13 @@ export class M365CopilotExecutor extends BaseExecutor {
 
     const isGpt55 = model === "gpt-5.5" || model.toLowerCase().includes("gpt-5.5");
     const isGpt55Fast = model === "gpt-5.5-fast" || model.toLowerCase().includes("gpt-5.5-fast");
-    const enableReasoning = isGpt55Fast
+    const isGpt56 = model === "gpt-5.6" || model.toLowerCase().includes("gpt-5.6");
+    const isGpt56Luna = model === "gpt-5.6-luna" || model.toLowerCase().includes("gpt-5.6-luna");
+    const isFastModel = isGpt55Fast || isGpt56Luna;
+    const isDeepModel = isGpt55 || (isGpt56 && !isGpt56Luna);
+    const enableReasoning = isFastModel
       ? false
-      : isGpt55
+      : isDeepModel
         ? body?.reasoning !== false && body?.enable_deep_thinking !== false
         : (body?.reasoning === true || body?.enable_deep_thinking === true);
 
