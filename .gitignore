@@ -88,3 +88,4 @@ graphify-out/*
 
 # M365 browser profile temp files
 scripts/m365/.browser_profile/
+.next-analyze/*
