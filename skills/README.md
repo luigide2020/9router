@@ -4,7 +4,7 @@ Drop-in skills for any AI agent (Claude, Cursor, ChatGPT, custom SDK). Just **co
 
 > Tip: start with the **9router** entry skill — it covers setup and links to all capability skills.
 
-## Skills
+## User Skills (API Usage)
 
 | Capability | Copy link below and paste to your AI |
 |---|---|
@@ -16,6 +16,16 @@ Drop-in skills for any AI agent (Claude, Cursor, ChatGPT, custom SDK). Just **co
 | Embeddings | https://raw.githubusercontent.com/decolua/9router/refs/heads/master/skills/9router-embeddings/SKILL.md |
 | Web search | https://raw.githubusercontent.com/decolua/9router/refs/heads/master/skills/9router-web-search/SKILL.md |
 | Web fetch (URL → markdown) | https://raw.githubusercontent.com/decolua/9router/refs/heads/master/skills/9router-web-fetch/SKILL.md |
+
+## Developer Skills (Internal Architecture)
+
+M365 Copilot integration knowledge for developers working on 9router source code.
+
+| Topic | File | Content |
+|---|---|---|
+| **Architecture** | `skills/m365-copilot/m365-copilot-architecture.md` | Core problem, dual strategy (proactive + reactive), implementation details, request flow, key files |
+| **Fix History** | `skills/m365-copilot/m365-copilot-fixes.md` | All 15 fixes with before/after, verification status, known limitations |
+| **Reference** | `skills/m365-copilot/m365-copilot-reference.md` | Detection patterns, tool classification matrix, model registry, search filtering, crypto imports, routing pitfalls |
 
 ## How to use
 

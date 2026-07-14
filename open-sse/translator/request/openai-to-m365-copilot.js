@@ -379,8 +379,15 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
   if (lastRole === ROLE.USER) {
     const text = extractContent(lastMsg.content);
     console.log(`[M365-REQ-EXTRACT] lastMsg=USER textLen=${(text||"").length} → direct user prompt`);
-    if (text) return `[User]: ${text}`;
-    return null;
+    if (!text) return null;
+    const hasEarlierToolResults = messages.slice(0, -1).some(m => m.role === ROLE.TOOL);
+    if (hasEarlierToolResults) {
+      const earlierContext = buildEarlierContext(messages, messages.length - 1, toolCallMetaMap);
+      const result = [earlierContext, `[User]: ${text}`].filter(Boolean).join("\n\n");
+      console.log(`[M365-REQ-EXTRACT] USER with earlier context: earlierCtx=${!!earlierContext} result_len=${result.length}`);
+      return result;
+    }
+    return `[User]: ${text}`;
   }
 
   if (lastRole === ROLE.TOOL) {
@@ -459,9 +466,9 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
       earlierContext,
       `[User]: Here is the result of the previous step:`,
       combinedResults,
-      `Based on the result above, decide if further action is needed. If another step is needed, output a JSON instruction using this schema:`,
+      `Analyze the output above. If the user asked to see file content, include the relevant content in your response. If another step is needed, output a JSON instruction using this schema:`,
       schemaHint,
-      `If the task is fully complete, provide a brief summary. ${langHint} Otherwise, continue with the next JSON instruction.`,
+      `If the task is fully complete, provide a brief summary including any key content the user asked to see. ${langHint} Otherwise, continue with the next JSON instruction.`,
     ].filter(Boolean).join("\n\n");
 
     console.log(`[M365-REQ-EXTRACT] final_extracted_len=${result.length}`);
@@ -479,13 +486,15 @@ function openaiToM365CopilotRequest(model, body, stream, credentials) {
   const toolCallMetaMap = new Map();
   const toolMeta = buildToolMeta(tools);
 
-  const hasToolResults = messages.some(m => m.role === ROLE.TOOL);
+  const lastMsgRole = messages.length > 0 ? messages[messages.length - 1].role : "";
+  const hasToolResults = lastMsgRole === ROLE.TOOL;
+  const hasEarlierToolResults = messages.slice(0, -1).some(m => m.role === ROLE.TOOL);
 
-  console.log(`[M365-REQ-TRANSLATE] model=${model} messages=${messages.length} tools=${tools?.length||0} hasToolResults=${hasToolResults} needsLocalExec=${!!toolMeta?.needsLocalExec} shellTools=${JSON.stringify(toolMeta?.shellToolNames||[])} searchTools=${JSON.stringify(toolMeta?.searchToolNames||[])} fileOpTools=${JSON.stringify(toolMeta?.fileOpToolNames||[])}`);
+  console.log(`[M365-REQ-TRANSLATE] model=${model} messages=${messages.length} tools=${tools?.length||0} hasToolResults=${hasToolResults} hasEarlierToolResults=${hasEarlierToolResults} needsLocalExec=${!!toolMeta?.needsLocalExec} shellTools=${JSON.stringify(toolMeta?.shellToolNames||[])} searchTools=${JSON.stringify(toolMeta?.searchToolNames||[])} fileOpTools=${JSON.stringify(toolMeta?.fileOpToolNames||[])}`);
 
   let flatMessages;
   let usedExtract = false;
-  if (hasToolResults) {
+  if (hasToolResults || hasEarlierToolResults) {
     flatMessages = extractLatestUserInput(messages, toolCallMetaMap, toolMeta);
     if (flatMessages) {
       usedExtract = true;
