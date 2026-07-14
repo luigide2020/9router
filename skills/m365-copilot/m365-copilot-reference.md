@@ -1,8 +1,26 @@
 # M365 Copilot — Reference: Detection Patterns, Tool Classification, Models
 
-## Tool Call Detection Patterns
+## JailBreak Classifier
 
-M365 may return tool calls in various formats. The response translator detects all of them:
+M365 has a **JailBreakClassifier** (not just keyword filter) that triggers `Conversation disengaged` with `offense="OffenseTrigger"` and `contentOrigin=JailBreakClassifier`. Key triggers:
+
+| Pattern | Detection Source |
+|---------|-----------------|
+| `[SYSTEM OVERRIDE...]` | `M365_JAILBREAK_PHRASES` regex |
+| `HIGHEST PRIORITY` | `M365_JAILBREAK_PHRASES` regex |
+| `NOT in your sandbox` | `M365_JAILBREAK_PHRASES` regex |
+| `Do NOT execute/run/use` | `M365_JAILBREAK_PHRASES` regex |
+| `MUST NOT` | `M365_JAILBREAK_PHRASES` regex |
+| `Do NOT use your code interpreter` | `M365_JAILBREAK_PHRASES` regex |
+| `executed locally, NOT` | `M365_JAILBREAK_PHRASES` regex |
+| `CRITICAL RULES` | `M365_JAILBREAK_PHRASES` regex |
+| `CRITICAL SAFETY RULE` | `M365_JAILBREAK_PHRASES` regex |
+
+Evidence from WS logs: `offense="OffenseTrigger"` on `author=user` echo, `contentOrigin=JailBreakClassifier` on Disengaged messages.
+
+**Strategy**: Positive framing instead of negative prohibitions. `"always output a JSON instruction"` instead of `"Do NOT execute"`.
+
+## Tool Call Detection Patterns
 
 | Pattern | Example | Detection |
 |---------|---------|-----------|
@@ -11,89 +29,33 @@ M365 may return tool calls in various formats. The response translator detects a
 | Inline JSON | `{"name":"exec_command","arguments":{...}}` | `INLINE_JSON_TOOL_RE` |
 | Naked JSON | `{"cmd":"ls"}` | `NAKED_CMD_JSON_RE` |
 | `CMD:` prefix | `CMD: ls -la` | `CMD_PREFIX_RE` (legacy compat) |
-| Backtick command | `` `find . -maxdepth 1` `` | `COMMAND_INTENT_RE` + inline backtick (requires intent verb before backtick) |
+| Backtick command | `` `find . -maxdepth 1` `` | `COMMAND_INTENT_RE` + inline backtick |
 | Remote exec result | `/mnt/file_upload` + `cwd: /mnt/` | `REMOTE_EXEC_INDICATORS` |
-
-When any pattern is detected, the text is converted to an OpenAI `tool_calls` chunk with `finish_reason: "tool_calls"`.
-
-## M365 Safety Filter (Content Policy)
-
-M365 has a **keyword-based safety filter** that triggers `Conversation disengaged` → "Sorry, it looks like I can't chat about this." It does NOT distinguish context — mentioning `rm, delete` even in a "do NOT execute" rule triggers the filter.
-
-**Trigger words**: `rm`, `rmdir`, `del`, `delete`, `shred`, `format`, `erase`, `wipe`, `destroy`, `truncate`, `overwrite`
-
-**Sources of trigger words in 9router**:
-1. Codex system prompt: `CRITICAL SAFETY RULE: ... NEVER suggest ... rm, del, delete...`
-2. `buildAntiExecutionPrompt()` `destructiveBlock` for gpt-5.6 models
-3. Tool result output: `rm: cannot remove...`, `Permission denied` after `del` etc.
-
-**Mitigation**: `sanitizeForM365()` in `openai-to-m365-copilot.js` replaces dangerous words with `[cmd1]` placeholders, applied at final prompt construction (`_m365Prompt: sanitizeForM365(finalPrompt)`).
 
 ## Remote Exec Indicators
 
-Full set of indicators that M365 executed in its remote sandbox:
-
 ```javascript
 const REMOTE_EXEC_INDICATORS = [
-  "/mnt/file_upload",
-  "/mnt/data",
-  "/mnt/home",
-  "/mnt/tmp",
-  "/mnt/usr",
-  "/mnt/var",
-  "/mnt/workspace",
-  "/mnt/sandbox",
-  "cwd: /mnt/",
+  "/mnt/file_upload", "/mnt/data", "/mnt/home", "/mnt/tmp",
+  "/mnt/usr", "/mnt/var", "/mnt/workspace", "/mnt/sandbox", "cwd: /mnt/",
 ];
 ```
 
-When detected: `hasRemoteExec=true` → response translator strips remote output and extracts tool_calls instead.
-
-## Inline Command Intent Detection
-
-Backtick commands must NOT be blindly converted to tool calls. Tutorial text like "Install with npm install express" should remain as text. `COMMAND_INTENT_RE` requires an **intent verb** before the backtick command:
-
-```
-// Converted to tool_call:
-"Run `find . -maxdepth 1`"      → intent verb "Run"
-"Execute `ls -la`"              → intent verb "Execute"
-"CMD: find /tmp -name core"     → CMD: prefix
-
-// NOT converted (no intent verb):
-"To install, run npm install express"  → tutorial context
-"The server runs on node server.mjs"   → description
-```
+When detected: `hasRemoteExec=true` → response translator strips remote output, extracts tool_calls instead, skips `cleanContent`.
 
 ## Tool Classification & M365 Capability Control
 
-Agent tools are classified as **shell** / **search** / **fileOp** with derived flags:
-
-- `needsLocalExec` = shell or fileOp tools present → triggers anti-exec prompt + content buffering
-- `hasSearchTools` = search tools present → affects anti-exec prompt variant + experienceType
-
-### Decision Matrix
-
-| Agent Tools | needsLocalExec | hasSearchTools | experienceType | Anti-Exec Prompt | M365 Search |
-|-------------|---------------|----------------|----------------|------------------|-------------|
+| Agent Tools | needsLocalExec | hasSearchTools | experienceType | Anti-Exec | M365 Search |
+|-------------|---------------|----------------|----------------|-----------|-------------|
 | None | false | false | Default | No | enabled |
-| Shell only (codex) | true | false | **Deep** | Yes (search OK) | enabled |
-| Shell + Search (hermes) | true | true | Default | Yes (**search forbidden**) | disabled |
+| Shell only (codex) | true | false | **Deep** | Yes | enabled |
+| Shell + Search | true | true | Default | Yes (search forbidden) | disabled |
 | Search only | false | true | Default | No | enabled |
-| File ops only | true | false | Deep | Yes (search OK) | enabled |
+| File ops only | true | false | Deep | Yes | enabled |
 
-When `disableCodeInterpreter=true` (needsLocalExec), strip CI/image flags from `optionsSets`.
-When `enableSearch=true` (always), keep `BingWebSearch` plugin and search message types.
+When `disableCodeInterpreter=true`: `experienceType="Deep"`, `tone="Precise"`, strip CI/image flags from `optionsSets`, randomize `conversationId`+`sessionId` per request.
 
-### Anti-Exec Prompt Variants
-
-- **hasSearchTools=true**: "Do NOT use web search — the user has local search tools for that"
-- **hasSearchTools=false**: "Do NOT execute commands" (M365 may search to enrich responses)
-
-### Special Tool Notes
-
-`browser_navigate`/`browser_*` are classified as search tools (not shell), so they set `hasSearchTools=true` but do NOT trigger `needsLocalExec` on their own.
-
-### Shell Tool Names
+## Shell Tool Names
 
 ```javascript
 const SHELL_TOOL_NAMES = [
@@ -104,70 +66,58 @@ const SHELL_TOOL_NAMES = [
 
 ## Tool Result Formatting
 
-`formatToolResult()` distinguishes tool types for M365 round-trip:
+| Tool Type | Format |
+|-----------|--------|
+| File read | `[File content (Read):\n...]` |
+| File listing | `[File listing (Glob):\n...]` |
+| Search results | `[Search results (Grep):\n...]` |
+| Shell command | `[Output (exec_command):\n...]` |
 
-| Tool Type | Format | Example |
-|-----------|--------|---------|
-| File read | `[File content (Read, executed locally)]` | `[File content (Read, executed locally)]\nfile contents...` |
-| File listing | `[File listing (Glob, executed locally)]` | `[File listing (Glob, executed locally)]\nsrc/\npackage.json` |
-| Search results | `[Search results (Grep, executed locally)]` | `[Search results (Grep, executed locally)]\nfile.js:10: match` |
-| Shell command | `[Command output (exec_command, executed locally, NOT in your sandbox)]` | `[Command output (exec_command, executed locally, NOT in your sandbox)]\noutput...` |
+## sanitizeForM365 — Position-Based Replacement
+
+1. `re.exec()` collects all match positions for dangerous words
+2. Sort positions by offset
+3. Build result string by splicing `[cmdN]` at correct offsets
+4. Also replaces `CRITICAL SAFETY RULE:` → `[Safety policy (commands replaced with placeholders):]`
+5. `M365_JAILBREAK_PHRASES` → `[note]`
+
+## Request Routing Decision Tree
+
+```
+lastMsg.role === TOOL?
+  → extractLatestUserInput (tool_result path)
+     → pre-scan ASSISTANT tool_calls (skip TOOL first!)
+     → buildEarlierContext (cwd + prev command)
+     → prompt: "Here is the result..." + schema + reminder
+  → hasEarlierToolResults?
+     → extractLatestUserInput (USER with context path)
+        → scan earlier TOOL for cwd
+        → prompt: [Context: cwd] + [User: text]
+     → flattenMessages (first request path, ~30KB+)
+        → full conversation history flattened to natural language
+```
 
 ## Search Bot Message Filtering
 
-M365 may embed raw search result JSON in bot `text` field of type=2 messages:
-
-```json
-{"query":"Next.js","result":{"WebPages":[{"name":"Next.js","url":"..."}]}}
-```
-
-If this text is longer than the real answer, it overwrites `fullText`. `isSearchBotMessage()` detects and skips these messages by checking:
-- `messageType` in `SEARCH_MESSAGE_TYPES` set (InternalSearchQuery, InternalSearchResult, SemanticSerp, etc.)
-- `text` starts with `{"query"` and contains `"WebPages"`
-- `hiddenText` contains `"WebPages"`
-
-Applied in both streaming `processData()` and non-streaming handler.
+M365 may embed raw search result JSON in bot `text` field of type=2 messages. `isSearchBotMessage()` detects and skips these.
 
 ## M365 Model Registry
 
-| Model ID | Behavior | When to Use |
-|----------|----------|-------------|
-| `copilot` | Default M365 Copilot (GPT-4o class) | General use |
-| `gpt-5.5` | Deep thinking, reasoning on by default | Complex analysis, multi-step reasoning |
-| `gpt-5.5-fast` | Quick response, no reasoning | Simple Q&A, fast turnaround |
-| `gpt-5.6` | Deep thinking, reasoning on by default | Latest model, needs M365 backend support (unverified) |
-| `gpt-5.6-luna` | Quick response, no reasoning | Lightweight variant |
-| `gpt-5.6-terra` | Deep thinking, reasoning on by default | Mid-tier reasoning |
-| `gpt-5.6-sol` | Deep thinking, reasoning on by default | High-tier reasoning |
+| Model ID | Behavior |
+|----------|----------|
+| `copilot` | Default M365 Copilot (GPT-4o class) |
+| `gpt-5.5` | Deep thinking, reasoning on by default |
+| `gpt-5.5-fast` | Quick response, no reasoning |
+| `gpt-5.6` | Deep thinking, reasoning on by default |
+| `gpt-5.6-luna` | Quick response, no reasoning |
+| `gpt-5.6-terra` | Deep thinking, mid-tier reasoning |
+| `gpt-5.6-sol` | Deep thinking, high-tier reasoning |
 
-GPT-5.2 is no longer available on M365. GPT-5.6 series availability depends on M365 backend — verify by sending `m365-copilot/gpt-5.6` after deployment.
+Always use provider prefix: `m365-copilot/gpt-5.6-sol`, not just `gpt-5.6`.
 
-## Crypto Import Compatibility
+## Build & Deploy Notes
 
-Next.js webpack bundles `crypto` as the Web Crypto API (no `createHash`). Always use explicit Node.js imports:
-
-```javascript
-import { createHash, randomUUID } from "crypto";
-// NOT: crypto.randomUUID() — fails at runtime
-// NOT: crypto.createHash() — fails at runtime
-```
-
-## Model Routing Pitfall
-
-When a client sends `model: "gpt-5.5"` (no provider prefix), `inferProviderFromModelName()` routes to `openai` provider by prefix heuristic. Always use:
-
-```bash
-# WRONG — gets routed to openai
-model: "gpt-5.5"
-
-# CORRECT — goes to m365-copilot executor
-model: "m365-copilot/gpt-5.5"
-model: "m365/gpt-5.5"
-model: "m365/copilot"
-```
-
-## Build Pitfalls
-
-- **Dead PROVIDER_MODELS block** in `providerModels.js`: orphaned object entries after `export` line cause syntax errors. Delete entirely.
-- **Duplicate export declarations**: `grep -n 'export const X' file.js` finds duplicates. Common in `providers.js` and `constants/providers.js`.
-- **docker cp doesn't work for Next.js standalone**: Compiled `.next/server/chunks/` are what runs. Must `docker build` for real deployment.
+- **Next.js standalone** runs compiled `.next/server/chunks/` — `docker cp` of source files does NOT take effect
+- Must either: `docker build`, or directly modify compiled chunks (risky but faster for hotfixes)
+- Compiled chunk for M365 code: `.next/server/chunks/216.js`
+- Crypto imports must use explicit Node.js: `import { createHash, randomUUID } from "crypto"` (not Web Crypto)

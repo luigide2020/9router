@@ -24,7 +24,7 @@ M365 Copilot integration knowledge for developers working on 9router source code
 | Topic | File | Content |
 |---|---|---|
 | **Architecture** | `skills/m365-copilot/m365-copilot-architecture.md` | Core problem, dual strategy (proactive + reactive), implementation details, request flow, key files |
-| **Fix History** | `skills/m365-copilot/m365-copilot-fixes.md` | All 15 fixes with before/after, verification status, known limitations |
+| **Fix History** | `skills/m365-copilot/m365-copilot-fixes.md` | All 28 fixes with before/after, verification status, known limitations |
 | **Reference** | `skills/m365-copilot/m365-copilot-reference.md` | Detection patterns, tool classification matrix, model registry, search filtering, crypto imports, routing pitfalls |
 
 ## How to use
