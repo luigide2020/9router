@@ -24,7 +24,7 @@ const CMD_PREFIX_RE = /^CMD:\s*(.+)$/m;
 const JSON_BLOCK_RE = /```(?:json|tool)?\s*\n([\s\S]*?)```/g;
 const REMOTE_EXEC_INDICATORS = [
   /cwd:\s*\/mnt\//,
-  /\/mnt\/file_upload/,
+  /\/mnt\/(file_upload|data|home|tmp|usr|var|workspace|sandbox)/,
   /\/mnt\/[a-z_]+\s+is\s+(empty|not found)/,
   /\n\s*count:\s*\d+\s*\n/,
   /file_upload.*\n.*count:/,
@@ -105,6 +105,7 @@ function makeToolCall(name, argumentsObj) {
 function extractToolCallsFromText(text, toolMeta) {
   const calls = [];
   const seenTexts = new Set();
+  console.log(`[M365-RESP-EXTRACT] textLen=${text.length} hasToolMeta=${!!toolMeta} shellTools=${JSON.stringify(toolMeta?.shellToolNames||[])} preview=${text.slice(0, 150).replace(/\n/g, "\\n")}`);
 
   JSON_TOOL_RE.lastIndex = 0;
   let match;
@@ -112,10 +113,12 @@ function extractToolCallsFromText(text, toolMeta) {
     const raw = match[1].trim();
     if (seenTexts.has(raw)) continue;
     seenTexts.add(raw);
+    console.log(`[M365-RESP-EXTRACT] rule=JSON_TOOL_RE match_len=${raw.length} preview=${raw.slice(0,100).replace(/\n/g,"\\n")}`);
     try {
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed === "object" && parsed.name) {
         const args = parsed.arguments || parsed.input || {};
+        console.log(`[M365-RESP-EXTRACT] rule=JSON_TOOL_RE → toolCall name=${parsed.name} args_keys=${Object.keys(args).join(",")}`);
         calls.push(makeToolCall(parsed.name, args));
       }
     } catch {
@@ -126,6 +129,7 @@ function extractToolCallsFromText(text, toolMeta) {
         if (argMatch) {
           try { JSON.parse(argMatch[1]); args = argMatch[1]; } catch { args = argMatch[1]; }
         }
+        console.log(`[M365-RESP-EXTRACT] rule=JSON_TOOL_RE(fallback) → toolCall name=${nameMatch[1]}`);
         calls.push(makeToolCall(nameMatch[1], args));
       }
     }
@@ -137,10 +141,12 @@ function extractToolCallsFromText(text, toolMeta) {
     if (seenTexts.has(raw)) continue;
     if (!raw.includes('"name"')) continue;
     seenTexts.add(raw);
+    console.log(`[M365-RESP-EXTRACT] rule=JSON_BLOCK_RE match_len=${raw.length} preview=${raw.slice(0,100).replace(/\n/g,"\\n")}`);
     try {
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed === "object" && parsed.name) {
         const args = parsed.arguments || parsed.input || {};
+        console.log(`[M365-RESP-EXTRACT] rule=JSON_BLOCK_RE → toolCall name=${parsed.name}`);
         calls.push(makeToolCall(parsed.name, args));
       }
     } catch { /* skip */ }
@@ -151,10 +157,12 @@ function extractToolCallsFromText(text, toolMeta) {
     const raw = match[0];
     if (seenTexts.has(raw)) continue;
     seenTexts.add(raw);
+    console.log(`[M365-RESP-EXTRACT] rule=INLINE_JSON_TOOL_RE match_len=${raw.length} preview=${raw.slice(0,100).replace(/\n/g,"\\n")}`);
     try {
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed === "object" && parsed.name) {
         const args = parsed.arguments || parsed.input || {};
+        console.log(`[M365-RESP-EXTRACT] rule=INLINE_JSON_TOOL_RE → toolCall name=${parsed.name}`);
         calls.push(makeToolCall(parsed.name, args));
       }
     } catch { /* skip */ }
@@ -165,6 +173,7 @@ function extractToolCallsFromText(text, toolMeta) {
     const command = cmdMatch[1].trim();
     const toolName = extractShellToolName(toolMeta);
     const argName = getShellToolCommandArgName(toolMeta);
+    console.log(`[M365-RESP-EXTRACT] rule=CMD_PREFIX_RE command="${command}" toolName=${toolName} argName=${argName}`);
     calls.push(makeToolCall(toolName, { [argName]: command }));
   }
 
@@ -176,24 +185,40 @@ function extractToolCallsFromText(text, toolMeta) {
       const command = nakedMatch[2];
       const toolName = extractShellToolName(toolMeta);
       const argName = getShellToolCommandArgName(toolMeta);
+      console.log(`[M365-RESP-EXTRACT] rule=NAKED_CMD_JSON_RE argKey="${argKey}" command="${command}" toolName=${toolName}`);
       calls.push(makeToolCall(toolName, { [argName]: command }));
       break;
     }
   }
 
-  if (calls.length === 0 && isRemoteExecutionResult(text)) {
-    const toolName = extractShellToolName(toolMeta);
-    const argName = getShellToolCommandArgName(toolMeta);
-    const backtickContent = text.match(/```(?:text|bash|shell)?\s*\n([\s\S]*?)```/);
-    const command = backtickContent ? backtickContent[1].trim().split("\n")[0] : "ls";
-    calls.push(makeToolCall(toolName, { [argName]: command }));
+  if (calls.length === 0) {
+    const isRemote = isRemoteExecutionResult(text);
+    console.log(`[M365-RESP-EXTRACT] rule=REMOTE_EXEC_CHECK isRemote=${isRemote}`);
+    if (isRemote) {
+      const toolName = extractShellToolName(toolMeta);
+      const argName = getShellToolCommandArgName(toolMeta);
+      const backtickContent = text.match(/```(?:text|bash|shell)?\s*\n([\s\S]*?)```/);
+      let command = "ls";
+      if (backtickContent) {
+        const firstLine = backtickContent[1].trim().split("\n")[0];
+        if (!/^\/mnt\//.test(firstLine) && COMMON_COMMANDS_RE.test(firstLine)) {
+          command = firstLine;
+        }
+      }
+      console.log(`[M365-RESP-EXTRACT] rule=REMOTE_EXEC → toolCall name=${toolName} command="${command}"`);
+      calls.push(makeToolCall(toolName, { [argName]: command }));
+    }
   }
 
   if (calls.length === 0) {
     const inlineCmd = text.match(/`([^`]+)`/);
+    const inlineResult = inlineCmd ? `match="${inlineCmd[1]}", isCommonCmd=${COMMON_COMMANDS_RE.test(inlineCmd[1])}` : "no_match";
+    console.log(`[M365-RESP-EXTRACT] rule=INLINE_BACKTICK ${inlineResult}`);
     if (inlineCmd && COMMON_COMMANDS_RE.test(inlineCmd[1])) {
       const beforeCmd = text.slice(0, text.indexOf(inlineCmd[0]));
-      if (COMMAND_INTENT_RE.test(beforeCmd)) {
+      const hasIntent = COMMAND_INTENT_RE.test(beforeCmd);
+      console.log(`[M365-RESP-EXTRACT] rule=INLINE_BACKTICK hasIntent=${hasIntent} beforeCmd_preview=${beforeCmd.slice(-80).replace(/\n/g,"\\n")}`);
+      if (hasIntent) {
         const toolName = extractShellToolName(toolMeta);
         const argName = getShellToolCommandArgName(toolMeta);
         calls.push(makeToolCall(toolName, { [argName]: inlineCmd[1].trim() }));
@@ -201,6 +226,7 @@ function extractToolCallsFromText(text, toolMeta) {
     }
   }
 
+  console.log(`[M365-RESP-EXTRACT] total_calls=${calls.length} names=[${calls.map(tc => tc.function.name).join(",")}]`);
   return calls;
 }
 
@@ -224,12 +250,12 @@ function stripToolPatternsFromText(text) {
   return cleaned;
 }
 
-function buildToolCallResults(toolCalls, textBuffer, chunk, hasToolMeta, choice) {
+function buildToolCallResults(toolCalls, textBuffer, chunk, hasToolMeta, choice, isRemote = false) {
   const results = [];
 
   if (toolCalls.length > 0) {
     const cleanContent = stripToolPatternsFromText(textBuffer);
-    if (cleanContent) {
+    if (cleanContent && !isRemote) {
       results.push({
         id: chunk.id,
         object: "chat.completion.chunk",
@@ -290,41 +316,57 @@ function m365CopilotToOpenAIResponse(chunk, state) {
   if (!state._m365Init) {
     state._m365Init = true;
     state._m365TextBuffer = "";
+    console.log(`[M365-RESP-TRANSLATE] init hasToolMeta=${hasToolMeta} model=${state.model || "unknown"}`);
   }
 
   if (hasToolMeta && delta?.content) {
     state._m365TextBuffer += delta.content;
+    if (delta.content.length > 100 || state._m365TextBuffer.length % 5000 < delta.content.length) {
+      console.log(`[M365-RESP-TRANSLATE] buffering: delta=${delta.content.length}, total=${state._m365TextBuffer.length} preview=${delta.content.slice(0,80).replace(/\n/g,"\\n")}`);
+    }
     return [];
   }
 
   if (hasToolMeta && (choice.finish_reason === "stop" || choice.finish_reason === OPENAI_FINISH.STOP)) {
+    console.log(`[M365-RESP-TRANSLATE] finish_reason=stop, bufferLen=${state._m365TextBuffer.length}, hasToolMeta=${hasToolMeta}`);
+    const isRemoteCheck = isRemoteExecutionResult(state._m365TextBuffer);
+    console.log(`[M365-RESP-TRANSLATE] isRemote=${isRemoteCheck} bufferPreview=${state._m365TextBuffer.slice(0, 200).replace(/\n/g,"\\n")}`);
     const toolCalls = extractToolCallsFromText(state._m365TextBuffer, state._m365ToolMeta);
+    console.log(`[M365-RESP-TRANSLATE] extracted toolCalls=${toolCalls.length}, names=[${toolCalls.map(tc => tc.function.name).join(",")}]`);
+    const isRemote = isRemoteExecutionResult(state._m365TextBuffer);
     const isGpt56 = state.model && (state.model === "gpt-5.6" || state.model.toLowerCase().includes("gpt-5.6"));
 
     if (isGpt56 && toolCalls.length > 0) {
+      console.log(`[M365-RESP-TRANSLATE] gpt-5.6 destructive guardrail active`);
       const safeCalls = toolCalls.filter(tc => {
         try {
           const args = typeof tc.function.arguments === "string" ? JSON.parse(tc.function.arguments) : tc.function.arguments;
           const cmd = args?.cmd || args?.command || args?.code || args?.run || JSON.stringify(args);
-          if (isDestructiveCommand(cmd)) {
-            return false;
-          }
+          const isDestructive = isDestructiveCommand(cmd);
+          console.log(`[M365-RESP-TRANSLATE] destructive-check cmd="${cmd.slice(0,80)}" isDestructive=${isDestructive}`);
+          if (isDestructive) return false;
         } catch { /* passthrough */ }
         return true;
       });
 
       const blockedCount = toolCalls.length - safeCalls.length;
       if (blockedCount > 0) {
-        const blockedMsg = `[SAFETY: ${blockedCount} destructive command(s) blocked by gpt-5.6 guardrail. Refusing rm/del/format/kill/overwrite operations.]`;
+        const blockedNames = toolCalls.filter(tc => !safeCalls.includes(tc)).map(tc => {
+          try { const a = JSON.parse(tc.function.arguments); return `${tc.function.name}(${a?.cmd || a?.command || "?"})`; } catch { return tc.function.name; }
+        });
+        console.log(`[M365-RESP-TRANSLATE] BLOCKED ${blockedCount} destructive call(s): ${JSON.stringify(blockedNames)}`);
+        const blockedMsg = `[SAFETY: ${blockedCount} potentially harmful command(s) blocked by guardrail.]`;
         state._m365TextBuffer = state._m365TextBuffer
           ? `${state._m365TextBuffer}\n\n${blockedMsg}`
           : blockedMsg;
+      } else {
+        console.log(`[M365-RESP-TRANSLATE] all calls passed destructive guardrail`);
       }
 
-      return buildToolCallResults(safeCalls, state._m365TextBuffer, chunk, hasToolMeta, choice);
+      return buildToolCallResults(safeCalls, state._m365TextBuffer, chunk, hasToolMeta, choice, isRemote);
     }
 
-    return buildToolCallResults(toolCalls, state._m365TextBuffer, chunk, hasToolMeta, choice);
+    return buildToolCallResults(toolCalls, state._m365TextBuffer, chunk, hasToolMeta, choice, isRemote);
   }
 
   return [chunk];

@@ -120,8 +120,6 @@ function buildCopilotOptionsSets(enableReasoning = false, disableCodeInterpreter
       "flux_v3_image_gen_enable_designer_dimensions_meta_prompting_in_system_prompts",
       "flux_v3_image_gen_enable_story",
       "update_textdoc_response_after_streaming",
-      "rich_responses",
-      "pages_citations", "pages_citations_multiturn",
     ];
     if (!keepSearch) {
       ciFlags.push("search_result_progress_messages_with_search_queries");
@@ -148,7 +146,7 @@ function buildCopilotMessage(text, invocationId, conversationId, sessionId, enab
     ? [{ Id: "BingWebSearch", Source: "BuiltIn" }]
     : [];
 
-  const experienceType = (disableCodeInterpreter && !enableSearch) ? "Deep" : "Default";
+  const experienceType = disableCodeInterpreter ? "Deep" : "Default";
 
   return {
     arguments: [{
@@ -157,7 +155,7 @@ function buildCopilotMessage(text, invocationId, conversationId, sessionId, enab
       sessionId,
       optionsSets: ["enterprise_flux_handoff_outlook_compose", ...buildCopilotOptionsSets(enableReasoning, disableCodeInterpreter, enableSearch)],
       options: {},
-      tone: enableReasoning ? "Reasoning" : "Balanced",
+      tone: disableCodeInterpreter ? "Precise" : (enableReasoning ? "Reasoning" : "Balanced"),
       allowedMessageTypes,
       sliceIds: [],
       threadLevelGptId,
@@ -251,7 +249,16 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
       })));
 
       let fullText = "";
+      let botTextStreams = new Map();
       let closed = false;
+
+      const rebuildFullText = () => {
+        const parts = [];
+        for (const text of botTextStreams.values()) {
+          if (text) parts.push(text);
+        }
+        fullText = parts.join("\n");
+      };
 
       const emitContent = (text) => {
         if (!text || closed) return;
@@ -263,11 +270,12 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
 
       const close = () => {
         if (closed) return;
+        rebuildFullText();
         // When buffering for tools, emit all accumulated text as one chunk
         // BEFORE setting closed=true (emitContent checks the closed flag)
         if (bufferForTools && fullText) {
           const hasCmd = /^CMD:/m.test(fullText);
-          const hasRemoteExec = /\/mnt\//.test(fullText) && /cwd:/m.test(fullText);
+          const hasRemoteExec = /\/mnt\/(file_upload|data|home|tmp|usr|var|workspace|sandbox)/.test(fullText);
           console.log(`[M365-CLOSE] Buffering tools: textLen=${fullText.length}, needsLocalExec=${!!toolMeta?.needsLocalExec}, hasJsonTool=${fullText.includes('```json-tool')}, hasCmd=${hasCmd}, hasRemoteExec=${hasRemoteExec}`);
           console.log(`[M365-CLOSE-FULL] ${fullText.slice(0, 1000)}`);
           emitContent(fullText);
@@ -286,6 +294,7 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
 
       const sendError = (msg) => {
         if (closed) return;
+        rebuildFullText();
         if (bufferForTools && fullText) emitContent(fullText);
         controller.enqueue(encoder.encode(sseChunk({
           id: cid, object: "chat.completion.chunk", created, model, system_fingerprint: null,
@@ -303,9 +312,32 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
           const payload = data.item || data.arguments?.[0];
           if (payload?.messages) {
             for (const msg of payload.messages) {
+              const msgAuthor = msg.author || "NONE";
+              const msgType = msg.messageType || msg.type || "unknown";
+              const msgText = (msg.text || "").slice(0, 200).replace(/\n/g, "\\n");
+              const msgHidden = msg.hiddenText ? msg.hiddenText.slice(0, 200).replace(/\n/g, "\\n") : "";
+              const msgOffense = msg.offense || "none";
+              const msgTurnState = msg.turnState || "none";
+              const msgContentOrigin = msg.contentOrigin || "none";
+              console.log(`[M365-WS-T1] author=${msgAuthor} type=${msgType} textLen=${(msg.text||"").length} hiddenLen=${(msg.hiddenText||"").length} offense=${JSON.stringify(msgOffense)} turnState=${JSON.stringify(msgTurnState)} contentOrigin=${msgContentOrigin} text=${msgText}`);
+
+              if (msg.hiddenText && /Conversation disengaged|Sorry.*(?:chat|help|assist)|I can't (?:help|chat|assist)/i.test(msg.hiddenText)) {
+                console.log(`[M365-WS-DISENGAGE-T1] DETECTED in hiddenText! hiddenText=${msgHidden} author=${msgAuthor} type=${msgType}`);
+                const disengageMsg = { ...msg };
+                if (disengageMsg.text && disengageMsg.text.length > 500) disengageMsg.text = disengageMsg.text.slice(0, 500) + "...(truncated)";
+                if (disengageMsg.hiddenText && disengageMsg.hiddenText.length > 500) disengageMsg.hiddenText = disengageMsg.hiddenText.slice(0, 500) + "...(truncated)";
+                console.log(`[M365-WS-DISENGAGE-T1-FULL] ${JSON.stringify(disengageMsg)}`);
+              }
+
+              if (msg.text && /Conversation disengaged|Sorry.*(?:chat|help|assist)|I can't (?:help|chat|assist)/i.test(msg.text)) {
+                console.log(`[M365-WS-DISENGAGE-T1] DETECTED in text! text=${msgText} author=${msgAuthor} type=${msgType}`);
+                const disengageMsg = { ...msg };
+                if (disengageMsg.text && disengageMsg.text.length > 500) disengageMsg.text = disengageMsg.text.slice(0, 500) + "...(truncated)";
+                if (disengageMsg.hiddenText && disengageMsg.hiddenText.length > 500) disengageMsg.hiddenText = disengageMsg.hiddenText.slice(0, 500) + "...(truncated)";
+                console.log(`[M365-WS-DISENGAGE-T1-FULL] ${JSON.stringify(disengageMsg)}`);
+              }
+
               if (msg.author !== "bot") {
-                const msgType = msg.messageType || msg.type || "unknown";
-                console.log(`[M365-T1-NONBOT] author=${msg.author} messageType=${msgType} keys=${Object.keys(msg).join(",")} text=${(msg.text||"").slice(0,200)}`);
                 if (msgType === "InternalSearchQuery" || msgType === "InternalSearchResult" ||
                     msgType === "SemanticSerp" || msgType === "SearchQuery" ||
                     msgType === "AdsQuery" || msgType === "GenerateContentQuery") {
@@ -317,9 +349,12 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
                 continue;
               }
               if (msg.text && msg.author === "bot") {
-                const delta = msg.text.slice(fullText.length);
-                if (delta) {
-                  fullText = msg.text;
+                const msgId = msg.messageId || msg.responseIdentifier || "default";
+                if (!botTextStreams) botTextStreams = new Map();
+                const prev = botTextStreams.get(msgId) || "";
+                if (msg.text.length > prev.length) {
+                  const delta = msg.text.slice(prev.length);
+                  botTextStreams.set(msgId, msg.text);
                   if (!bufferForTools) emitContent(delta);
                 }
               }
@@ -332,20 +367,47 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
             for (const msg of payload.messages) {
               const msgKeys = Object.keys(msg || {}).join(",");
               const msgAuthor = msg?.author || "NONE";
-              const msgText = (msg?.text || "").slice(0, 100);
-              console.log(`[M365-T2] author=${msgAuthor} keys=${msgKeys} text=${msgText}`);
+              const msgType = msg?.messageType || msg?.type || "unknown";
+              const msgText = (msg?.text || "").slice(0, 200).replace(/\n/g, "\\n");
+              const msgHidden = msg?.hiddenText ? msg.hiddenText.slice(0, 200).replace(/\n/g, "\\n") : "";
+              const msgOffense = msg?.offense || "none";
+              const msgTurnState = msg?.turnState || "none";
+              const msgContentOrigin = msg?.contentOrigin || "none";
+              console.log(`[M365-WS-T2] author=${msgAuthor} type=${msgType} textLen=${(msg?.text||"").length} hiddenLen=${(msg?.hiddenText||"").length} offense=${JSON.stringify(msgOffense)} turnState=${JSON.stringify(msgTurnState)} contentOrigin=${msgContentOrigin} text=${msgText}`);
+
+              if (msg?.hiddenText && /Conversation disengaged|Sorry.*(?:chat|help|assist)|I can't (?:help|chat|assist)/i.test(msg.hiddenText)) {
+                console.log(`[M365-WS-DISENGAGE-T2] DETECTED in hiddenText! hiddenText=${msgHidden} author=${msgAuthor} type=${msgType}`);
+                const disengageMsg = { ...msg };
+                if (disengageMsg.text && disengageMsg.text.length > 500) disengageMsg.text = disengageMsg.text.slice(0, 500) + "...(truncated)";
+                if (disengageMsg.hiddenText && disengageMsg.hiddenText.length > 500) disengageMsg.hiddenText = disengageMsg.hiddenText.slice(0, 500) + "...(truncated)";
+                console.log(`[M365-WS-DISENGAGE-T2-FULL] ${JSON.stringify(disengageMsg)}`);
+              }
+
+              if (msg?.text && /Conversation disengaged|Sorry.*(?:chat|help|assist)|I can't (?:help|chat|assist)/i.test(msg.text)) {
+                console.log(`[M365-WS-DISENGAGE-T2] DETECTED in text! text=${msgText} author=${msgAuthor} type=${msgType}`);
+                const disengageMsg = { ...msg };
+                if (disengageMsg.text && disengageMsg.text.length > 500) disengageMsg.text = disengageMsg.text.slice(0, 500) + "...(truncated)";
+                if (disengageMsg.hiddenText && disengageMsg.hiddenText.length > 500) disengageMsg.hiddenText = disengageMsg.hiddenText.slice(0, 500) + "...(truncated)";
+                console.log(`[M365-WS-DISENGAGE-T2-FULL] ${JSON.stringify(disengageMsg)}`);
+              }
+
               if (isSearchBotMessage(msg)) {
                 console.log(`[M365-SEARCH-BOT] skipped search payload in T2 bot message (len=${(msg.text||"").length})`);
                 continue;
               }
-              if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
-                const delta = msg.text.slice(fullText.length);
-                fullText = msg.text;
-                if (!bufferForTools && delta) emitContent(delta);
+              if (msg.text && msg.author === "bot") {
+                const msgId = msg.messageId || msg.responseIdentifier || "default";
+                const prev = botTextStreams.get(msgId) || "";
+                if (msg.text.length > prev.length) {
+                  const delta = msg.text.slice(prev.length);
+                  botTextStreams.set(msgId, msg.text);
+                  if (!bufferForTools) emitContent(delta);
+                }
               }
             }
           }
           if (payload?.result?.value && payload.result.value !== "Success") {
+            console.log(`[M365-WS-T2] result=NOT_SUCCESS value=${payload.result.value} message=${payload.result.message || "none"}`);
             sendError(payload.result.message || payload.result.value);
             return;
           }
@@ -354,8 +416,15 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
           return;
         }
         if (data.type === 3) {
+          console.log(`[M365-WS-T3] end of conversation turn`);
           clearTimeout(responseTimer);
           close();
+        }
+        if (data.type === 6) {
+          console.log(`[M365-WS-T6] keep-alive ping received`);
+        }
+        if (data.type !== 1 && data.type !== 2 && data.type !== 3 && data.type !== 6) {
+          console.log(`[M365-WS-OTHER] type=${data.type} keys=${Object.keys(data).join(",")}`);
         }
       };
 
@@ -507,12 +576,28 @@ export class M365CopilotExecutor extends BaseExecutor {
       );
     }
 
+    const toolMeta = body._m365ToolMeta || { hasTools: false, toolNameMap: new Map(), toolCallMetaMap: new Map() };
     const userPrompt = body._m365Prompt || "";
+    console.log(`[M365-EXEC] ========== NEW REQUEST ==========`);
+    console.log(`[M365-EXEC] model=${model} stream=${stream} prompt_len=${userPrompt.length} hasToolMeta=${!!body._m365ToolMeta} needsLocalExec=${!!toolMeta?.needsLocalExec} hasSearchTools=${!!toolMeta?.hasSearchTools} shellTools=${JSON.stringify(toolMeta.shellToolNames||[])} toolCount=${toolMeta.toolNameMap?.size||0}`);
+    if (toolMeta?.needsLocalExec) {
+      console.log(`[M365-EXEC] prompt_first300=${userPrompt.slice(0, 300).replace(/\n/g, "\\n")}`);
+      console.log(`[M365-EXEC] prompt_last300=${userPrompt.slice(-300).replace(/\n/g, "\\n")}`);
+      const dangerous = /\b(rm|rmdir|del|delete|shred|format|erase|wipe|destroy|destructive|truncate|overwrite|kill|killall)\b/gi;
+      const matches = userPrompt.match(dangerous);
+      if (matches) {
+        console.log(`[M365-EXEC-DANGER] Found dangerous words AFTER sanitize: ${JSON.stringify(matches)}`);
+        const re2 = /\b(rm|rmdir|del|delete|shred|format|erase|wipe|destroy|destructive|truncate|overwrite|kill|killall)\b/gi;
+        let m2;
+        while ((m2 = re2.exec(userPrompt)) !== null) {
+          const ctx = userPrompt.slice(Math.max(0, m2.index - 30), m2.index + m2[0].length + 30).replace(/\n/g, "\\n");
+          console.log(`[M365-EXEC-DANGER-CTX] word="${m2[0]}" at=${m2.index} context=...${ctx}...`);
+        }
+      }
+    }
     if (!userPrompt.trim()) {
       return this._errorResponse("Empty query after processing", 400, "invalid_request");
     }
-
-    const toolMeta = body._m365ToolMeta || { hasTools: false, toolNameMap: new Map(), toolCallMetaMap: new Map() };
 
     const { oid, tid } = extractTokenClaims(accessToken);
 
@@ -549,12 +634,33 @@ export class M365CopilotExecutor extends BaseExecutor {
     
     // Convert to UUID format (M365 requires UUID format for conversationId)
     const conversationIdHash = createHash("sha256").update(conversationIdBase).digest("hex");
-    const conversationId = `${conversationIdHash.slice(0,8)}-${conversationIdHash.slice(8,12)}-${conversationIdHash.slice(12,16)}-${conversationIdHash.slice(16,20)}-${conversationIdHash.slice(20,32)}`;
+    let conversationId = `${conversationIdHash.slice(0,8)}-${conversationIdHash.slice(8,12)}-${conversationIdHash.slice(12,16)}-${conversationIdHash.slice(16,20)}-${conversationIdHash.slice(20,32)}`;
+    
+    // When needsLocalExec, use a fresh conversationId per request to prevent M365
+    // from inheriting CI (Code Interpreter) context from previous rounds where it
+    // may have auto-executed commands in its sandbox.
+    if (toolMeta.needsLocalExec) {
+      const nonce = randomUUID();
+      conversationId = `${nonce.slice(0,8)}-${nonce.slice(9,13)}-${nonce.slice(14,18)}-${nonce.slice(19,23)}-${nonce.slice(24,36)}`;
+      console.log(`[M365-EXEC-CID] strategy=FRESH(needsLocalExec) conversationId=${conversationId}`);
+    } else {
+      console.log(`[M365-EXEC-CID] strategy=STABLE conversationId=${conversationId}`);
+    }
     
     // Convert to UUID format for sessionId
     const sessionIdHash = createHash("sha256").update(sessionIdBase).digest("hex");
-    const sessionIdUuid = `${sessionIdHash.slice(0,8)}-${sessionIdHash.slice(8,12)}-${sessionIdHash.slice(12,16)}-${sessionIdHash.slice(16,20)}-${sessionIdHash.slice(20,32)}`;
-    const sessionIdHex = sessionIdHash.slice(0, 32);
+    let sessionIdUuid = `${sessionIdHash.slice(0,8)}-${sessionIdHash.slice(8,12)}-${sessionIdHash.slice(12,16)}-${sessionIdHash.slice(16,20)}-${sessionIdHash.slice(20,32)}`;
+    let sessionIdHex = sessionIdHash.slice(0, 32);
+    
+    // When needsLocalExec, use fresh sessionId per request to avoid CI context inheritance
+    if (toolMeta.needsLocalExec) {
+      const sn = randomUUID();
+      sessionIdUuid = sn;
+      sessionIdHex = sn.replace(/-/g, "").slice(0, 32);
+      console.log(`[M365-EXEC-SID] strategy=FRESH(needsLocalExec) sessionId=${sessionIdUuid}`);
+    } else {
+      console.log(`[M365-EXEC-SID] strategy=STABLE sessionId=${sessionIdUuid}`);
+    }
 
     const wsParams = new URLSearchParams({
       "chatsessionid": sessionIdHex,
@@ -714,6 +820,7 @@ export class M365CopilotExecutor extends BaseExecutor {
       disableCodeInterpreter: !!toolMeta.needsLocalExec,
       enableSearch: true,
     };
+    console.log(`[M365-EXEC-FLAGS] disableCodeInterpreter=${m365Flags.disableCodeInterpreter} enableSearch=${m365Flags.enableSearch} experienceType=${m365Flags.disableCodeInterpreter ? "Deep" : "Default"} tone=${m365Flags.disableCodeInterpreter ? "Precise" : (enableReasoning ? "Reasoning" : "Balanced")}`);
     const copilotMsg = buildCopilotMessage(userPrompt, 0, conversationId, sessionIdUuid, enableReasoning, modelId, m365Flags);
     log?.info?.("M365-COPILOT", `WS send: optionsSets=${JSON.stringify(copilotMsg.arguments[0].optionsSets)}, plugins=${JSON.stringify(copilotMsg.arguments[0].plugins)}, allowedMessageTypes=${JSON.stringify(copilotMsg.arguments[0].allowedMessageTypes)}`);
     ws.send(JSON.stringify(copilotMsg) + RS);

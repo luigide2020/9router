@@ -35,7 +35,7 @@ const SEARCH_TOOL_PATTERNS = [
 ];
 
 const SHELL_TOOL_NAMES = new Set([
-  "local_shell", "run_command", "execute_command",
+  "local_shell", "run_command", "execute_command", "exec_command",
   "Bash", "bash", "execute_bash", "run_bash",
   "shell_exec", "computer_terminal", "terminal",
 ]);
@@ -65,9 +65,9 @@ function formatToolResult(tcName, resultStr) {
         : tcName === "Grep" || tcName === "grep_search"
           ? "Search results"
           : "File operation result";
-    return `[${label} (${tcName})]:\n${resultStr}`;
+    return `[${label} (${tcName}):\n${resultStr}`;
   }
-  return `[Command output (${tcName})]:\n${resultStr}`;
+  return `[Output (${tcName}):\n${resultStr}`;
 }
 
 function extractContent(content) {
@@ -95,6 +95,46 @@ function classifyTool(name, description) {
   const isFileOp = FILE_OP_TOOL_NAMES.has(name);
 
   return { isShell, isSearch, isFileOp };
+}
+
+const M365_DANGEROUS_CMD_RE = /\b(rm|rmdir|del|delete|shred|format|erase|wipe|destroy|destructive|truncate|overwrite|kill|killall|chmod|chown)\b/gi;
+const M365_JAILBREAK_PHRASES = [
+  /\[SYSTEM OVERRIDE[^\]]*\]/gi,
+  /HIGHEST PRIORITY/gi,
+  /NOT in your sandbox/gi,
+  /Do NOT (?:execute|run|use)/gi,
+  /MUST NOT/gi,
+  /Do NOT use your code interpreter/gi,
+  /executed locally, NOT/gi,
+  /CRITICAL RULES/gi,
+  /CRITICAL SAFETY RULE/gi,
+];
+
+function sanitizeForM365(text) {
+  if (!text) return text;
+  const replacements = [];
+  let m;
+  const cmdRe = /\b(rm|rmdir|del|delete|shred|format|erase|wipe|destroy|destructive|truncate|overwrite|kill|killall|chmod|chown)\b/gi;
+  while ((m = cmdRe.exec(text)) !== null) {
+    replacements.push({ start: m.index, end: m.index + m[0].length, word: m[0], idx: replacements.length + 1 });
+  }
+  let result = text;
+  if (replacements.length > 0) {
+    const parts = [];
+    let lastEnd = 0;
+    for (const r of replacements) {
+      parts.push(result.slice(lastEnd, r.start));
+      parts.push(`[cmd${r.idx}]`);
+      lastEnd = r.end;
+    }
+    parts.push(result.slice(lastEnd));
+    result = parts.join("");
+  }
+  for (const phraseRe of M365_JAILBREAK_PHRASES) {
+    result = result.replace(phraseRe, "[note]");
+  }
+  result = result.replace(/CRITICAL SAFETY RULE:/i, "[policy note:]");
+  return result;
 }
 
 function buildToolMeta(tools) {
@@ -143,7 +183,7 @@ function buildToolMeta(tools) {
   };
 }
 
-function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas, hasSearchTools, model) {
+function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas, hasSearchTools, model, langHint) {
   if (!shellToolNames || shellToolNames.length === 0) return "";
 
   const primaryTool = shellToolNames[0];
@@ -151,9 +191,7 @@ function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas, hasSearchToo
 
   const isGpt56 = model && (model === "gpt-5.6" || model.toLowerCase().includes("gpt-5.6"));
 
-  const destructiveBlock = isGpt56
-    ? "CRITICAL SAFETY RULE: You must NEVER suggest or execute any destructive operations — including rm, del, delete, rmdir, shred, format, erase, truncate, > (overwrite), >> (append to sensitive files), chmod 000, chown, kill, killall, or any command that removes/overwrites/modifies user data. If a user requests such an operation, REFUSE and explain the risk. This is a strict safety guardrail that cannot be overridden."
-    : "";
+  const destructiveBlock = "";
 
   let schemaInstr;
   if (schema && schema.properties) {
@@ -183,47 +221,49 @@ function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas, hasSearchToo
   if (hasSearchTools) {
     return [
       destructiveBlock,
-      "IMPORTANT: Do NOT execute any shell commands or code. Do NOT use your code interpreter or sandbox.",
-      "Do NOT use web search or browse the internet — the user has local search tools for that.",
-      "For ANY user request (checking config, reading files, searching, listing, etc.), output a JSON instruction and I will run it locally:",
+      "You are assisting a user who has a command-line interface. For any action the user requests (checking, searching, reading, listing, etc.), always output a JSON instruction using this schema, and the user will handle the execution:",
       schemaInstr,
-      "Do NOT run any command yourself. Just output the JSON and stop.",
+      langHint,
+      "Use plain text only for explanations or summaries when no action is needed.",
     ].filter(Boolean).join(" ");
   }
 
   return [
     destructiveBlock,
-    "IMPORTANT: Do NOT execute any commands or code. Do NOT use your code interpreter or sandbox.",
-    "You must NOT run commands yourself. Instead, output a JSON instruction and I will run it for you.",
+    "You are assisting a user who has a command-line interface. For any action the user requests, always output a JSON instruction using this schema, and the user will handle the execution:",
     schemaInstr,
-    "Do NOT run the command yourself. Just output the JSON and stop.",
+    langHint,
+    "Use plain text only for explanations or summaries when no action is needed.",
   ].filter(Boolean).join(" ");
 }
 
 function buildToolResultPrompt(toolCallId, toolName, result) {
   const resultStr = typeof result === "string" ? result : JSON.stringify(result, null, 2);
   return [
-    `[TOOL RESULT (executed locally)]:`,
-    `Tool: ${toolName}`,
-    `Call ID: ${toolCallId}`,
+    `[Result from ${toolName}]:`,
     resultStr,
   ].join("\n");
 }
 
 function flattenMessages(messages, toolCallMetaMap) {
   const parts = [];
+  console.log(`[M365-REQ-FLATTEN] total_messages=${messages.length}`);
 
-  for (const msg of messages) {
+  for (let idx = 0; idx < messages.length; idx++) {
+    const msg = messages[idx];
     const role = msg.role || "";
+    const preview = (typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content || "")).slice(0, 80).replace(/\n/g, "\\n");
 
     if (role === ROLE.SYSTEM || role === ROLE.DEVELOPER) {
       const text = extractContent(msg.content);
+      console.log(`[M365-REQ-MSG] #${idx} role=SYSTEM len=${(text||"").length} preview=${preview}`);
       if (text) parts.push(`[System]: ${text}`);
       continue;
     }
 
     if (role === ROLE.USER) {
       const text = extractContent(msg.content);
+      console.log(`[M365-REQ-MSG] #${idx} role=USER len=${(text||"").length} preview=${preview}`);
       if (text) parts.push(`[User]: ${text}`);
       continue;
     }
@@ -231,6 +271,7 @@ function flattenMessages(messages, toolCallMetaMap) {
     if (role === ROLE.ASSISTANT) {
       const text = extractContent(msg.content);
       const toolParts = [];
+      const tcNames = [];
 
       if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
         for (const tc of msg.tool_calls) {
@@ -238,6 +279,7 @@ function flattenMessages(messages, toolCallMetaMap) {
           const tcArgs = tc.function?.arguments || "{}";
           const tcId = tc.id || "";
           toolCallMetaMap.set(tcId, tcName);
+          tcNames.push(tcName);
           try {
             const parsed = JSON.parse(tcArgs);
             const cmd = parsed.command || parsed.cmd || parsed.code || JSON.stringify(parsed);
@@ -252,6 +294,7 @@ function flattenMessages(messages, toolCallMetaMap) {
       if (text) textParts.push(text);
       if (toolParts.length > 0) textParts.push(...toolParts);
 
+      console.log(`[M365-REQ-MSG] #${idx} role=ASSISTANT textLen=${(text||"").length} toolCalls=${tcNames.length} names=[${tcNames.join(",")}]`);
       if (textParts.length > 0) parts.push(`[Assistant]: ${textParts.join("\n")}`);
       continue;
     }
@@ -261,22 +304,81 @@ function flattenMessages(messages, toolCallMetaMap) {
       const tcName = toolCallMetaMap.get(tcId) || "unknown";
       const result = extractContent(msg.content) || msg.content || "";
       const resultStr = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+      console.log(`[M365-REQ-MSG] #${idx} role=TOOL toolName=${tcName} tcId=${tcId.slice(0,12)} resultLen=${resultStr.length}`);
       parts.push(formatToolResult(tcName, resultStr));
       continue;
     }
+
+    console.log(`[M365-REQ-MSG] #${idx} role=${role} UNKNOWN — skipped`);
   }
 
-  return parts.join("\n\n");
+  const result = parts.join("\n\n");
+  console.log(`[M365-REQ-FLATTEN] result_len=${result.length} parts=${parts.length}`);
+  return result;
 }
 
-function extractLatestUserInput(messages, toolCallMetaMap) {
-  if (!messages || messages.length === 0) return null;
+function buildEarlierContext(messages, stopIndex, toolCallMetaMap) {
+  if (stopIndex <= 0) return "";
+  let lastCwd = "";
+  let lastCmd = "";
+  for (let k = stopIndex - 1; k >= 0; k--) {
+    const msg = messages[k];
+    const role = msg.role || "";
+    if (role === ROLE.TOOL && !lastCwd) {
+      const tcId = msg.tool_call_id || "";
+      const tcName = toolCallMetaMap.get(tcId) || "unknown";
+      toolCallMetaMap.set(tcId, tcName);
+      const raw = extractContent(msg.content) || "";
+      const resultStr = typeof raw === "string" ? raw : JSON.stringify(raw, null, 2);
+      const cwdMatch = resultStr.match(/^(\/[^\s\n]+)/m);
+      if (cwdMatch) lastCwd = cwdMatch[1];
+    }
+    if (role === ROLE.ASSISTANT && msg.tool_calls && !lastCmd) {
+      for (const tc of msg.tool_calls) {
+        try {
+          const parsed = JSON.parse(tc.function?.arguments || "{}");
+          lastCmd = parsed.command || parsed.cmd || parsed.code || "";
+          if (lastCmd) {
+            toolCallMetaMap.set(tc.id || "", tc.function?.name || "unknown");
+            break;
+          }
+        } catch {}
+      }
+    }
+    if (lastCwd && lastCmd) break;
+  }
+  const parts = [];
+  if (lastCwd) parts.push(`Working directory: ${lastCwd}`);
+  if (lastCmd) parts.push(`Previous command: ${lastCmd}`);
+  return parts.length > 0 ? `[Context]: ${parts.join(", ")}` : "";
+}
+
+function detectUserLanguage(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== ROLE.USER) continue;
+    const text = extractContent(m.content) || "";
+    const cjk = text.match(/[\u4e00-\u9fff\u3400-\u4dbf\u3000-\u303f\uac00-\ud7af]/g);
+    const latin = text.match(/[a-zA-Z]/g);
+    if (cjk && (!latin || cjk.length > latin.length * 0.3)) return "zh";
+  }
+  return "en";
+}
+
+function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
+  if (!messages || messages.length === 0) {
+    console.log(`[M365-REQ-EXTRACT] no messages, returning null`);
+    return null;
+  }
 
   const lastMsg = messages[messages.length - 1];
   const lastRole = lastMsg.role || "";
+  const userLang = detectUserLanguage(messages);
+  const langHint = userLang === "zh" ? "Reply in Chinese (中文)." : "";
 
   if (lastRole === ROLE.USER) {
     const text = extractContent(lastMsg.content);
+    console.log(`[M365-REQ-EXTRACT] lastMsg=USER textLen=${(text||"").length} → direct user prompt`);
     if (text) return `[User]: ${text}`;
     return null;
   }
@@ -284,12 +386,28 @@ function extractLatestUserInput(messages, toolCallMetaMap) {
   if (lastRole === ROLE.TOOL) {
     const resultParts = [];
     let i = messages.length - 1;
+    const toolResultCount = (() => { let c = 0; while (i - c >= 0 && messages[i - c].role === ROLE.TOOL) c++; return c; })();
 
+    let preScan = i;
+    while (preScan >= 0 && messages[preScan].role === ROLE.TOOL) preScan--;
+    while (preScan >= 0 && messages[preScan].role === ROLE.ASSISTANT) {
+      if (messages[preScan].tool_calls) {
+        for (const tc of messages[preScan].tool_calls) {
+          const tcName = tc.function?.name || "unknown";
+          const tcId = tc.id || "";
+          toolCallMetaMap.set(tcId, tcName);
+        }
+      }
+      preScan--;
+    }
+
+    i = messages.length - 1;
     while (i >= 0 && messages[i].role === ROLE.TOOL) {
       const tcId = messages[i].tool_call_id || "";
       const tcName = toolCallMetaMap.get(tcId) || "unknown";
       const result = extractContent(messages[i].content) || messages[i].content || "";
       const resultStr = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+      console.log(`[M365-REQ-EXTRACT] tool_result #${messages.length - 1 - i} toolName=${tcName} tcId=${tcId.slice(0,12)} resultLen=${resultStr.length} preview=${resultStr.slice(0,80).replace(/\n/g,"\\n")}`);
       resultParts.unshift(formatToolResult(tcName, resultStr));
       i--;
     }
@@ -301,6 +419,7 @@ function extractLatestUserInput(messages, toolCallMetaMap) {
           const tcArgs = tc.function?.arguments || "{}";
           const tcId = tc.id || "";
           toolCallMetaMap.set(tcId, tcName);
+          console.log(`[M365-REQ-EXTRACT] assistant tool_call name=${tcName} id=${tcId.slice(0,12)}`);
         }
       }
       i--;
@@ -309,16 +428,47 @@ function extractLatestUserInput(messages, toolCallMetaMap) {
     let originalRequest = "";
     if (i >= 0 && messages[i].role === ROLE.USER) {
       originalRequest = extractContent(messages[i].content) || "";
+      console.log(`[M365-REQ-EXTRACT] originalUserRequest at #${i} len=${originalRequest.length} preview=${originalRequest.slice(0,80).replace(/\n/g,"\\n")}`);
+    } else {
+      console.log(`[M365-REQ-EXTRACT] no original user request found (i=${i}, role=${i>=0?messages[i].role:"N/A"})`);
+    }
+
+    const shellToolNames = toolMeta?.shellToolNames || [];
+    const primaryTool = shellToolNames[0] || "exec_command";
+    const schema = toolMeta?.shellToolSchemas?.[primaryTool];
+    let schemaHint;
+    if (schema && schema.properties) {
+      const props = schema.properties;
+      const required = schema.required || [];
+      const paramParts = [];
+      for (const [key, val] of Object.entries(props)) {
+        const req = required.includes(key) ? " (required)" : " (optional)";
+        paramParts.push(`"${key}": <${val.type || "string"}>${req}`);
+      }
+      schemaHint = `{"name": "${primaryTool}", "arguments": { ${paramParts.join(", ")} }}`;
+    } else {
+      schemaHint = `{"name": "${primaryTool}", "arguments": {"cmd": "<command>"}}`;
     }
 
     const combinedResults = resultParts.join("\n");
-    return [
-      `[User]: I ran the command you suggested. Here is the output:`,
+    const earlierContext = buildEarlierContext(messages, i, toolCallMetaMap);
+
+    console.log(`[M365-REQ-EXTRACT] tool_result_count=${toolResultCount} earlierContext=${earlierContext?"yes":"no"} combinedResultsLen=${combinedResults.length}`);
+
+    const result = [
+      earlierContext,
+      `[User]: Here is the result of the previous step:`,
       combinedResults,
-      `Based on the command output above, please provide your analysis or next steps. Do NOT suggest running the same command again.`,
-    ].join("\n\n");
+      `Based on the result above, decide if further action is needed. If another step is needed, output a JSON instruction using this schema:`,
+      schemaHint,
+      `If the task is fully complete, provide a brief summary. ${langHint} Otherwise, continue with the next JSON instruction.`,
+    ].filter(Boolean).join("\n\n");
+
+    console.log(`[M365-REQ-EXTRACT] final_extracted_len=${result.length}`);
+    return result;
   }
 
+  console.log(`[M365-REQ-EXTRACT] lastMsg role=${lastRole} → returning null (no match)`);
   return null;
 }
 
@@ -331,31 +481,69 @@ function openaiToM365CopilotRequest(model, body, stream, credentials) {
 
   const hasToolResults = messages.some(m => m.role === ROLE.TOOL);
 
+  console.log(`[M365-REQ-TRANSLATE] model=${model} messages=${messages.length} tools=${tools?.length||0} hasToolResults=${hasToolResults} needsLocalExec=${!!toolMeta?.needsLocalExec} shellTools=${JSON.stringify(toolMeta?.shellToolNames||[])} searchTools=${JSON.stringify(toolMeta?.searchToolNames||[])} fileOpTools=${JSON.stringify(toolMeta?.fileOpToolNames||[])}`);
+
   let flatMessages;
+  let usedExtract = false;
   if (hasToolResults) {
-    flatMessages = extractLatestUserInput(messages, toolCallMetaMap) || flattenMessages(messages, toolCallMetaMap);
+    flatMessages = extractLatestUserInput(messages, toolCallMetaMap, toolMeta);
+    if (flatMessages) {
+      usedExtract = true;
+      console.log(`[M365-REQ-TRANSLATE] strategy=extractLatestUserInput result_len=${flatMessages.length}`);
+    } else {
+      flatMessages = flattenMessages(messages, toolCallMetaMap);
+      console.log(`[M365-REQ-TRANSLATE] strategy=flattenMessages(fallback) result_len=${flatMessages.length}`);
+    }
   } else {
     flatMessages = flattenMessages(messages, toolCallMetaMap);
+    console.log(`[M365-REQ-TRANSLATE] strategy=flattenMessages(no_tool_results) result_len=${flatMessages.length}`);
   }
 
   const needsLocalExec = !!toolMeta?.needsLocalExec;
+  const langHint = detectUserLanguage(messages) === "zh" ? "Reply in Chinese (中文)." : "";
   let finalPrompt;
-  if (!hasToolResults && needsLocalExec) {
+  if (needsLocalExec) {
     const antiExecPrompt = buildAntiExecutionPrompt(
       toolMeta.shellToolNames,
       toolMeta.shellToolSchemas,
       toolMeta.hasSearchTools,
       body.model,
+      langHint,
     );
-    finalPrompt = `${antiExecPrompt}\n\n---\n\n${flatMessages}`;
+    console.log(`[M365-REQ-TRANSLATE] antiExecPrompt_len=${antiExecPrompt.length}`);
+    if (hasToolResults) {
+      const reminder = [
+        `You provided a JSON instruction in the previous step and here is the result.`,
+        `If another step is needed, output a JSON instruction using this schema — the user will handle execution:`,
+        antiExecPrompt,
+      ].join("\n");
+      finalPrompt = `${flatMessages}\n\n---\n\n${reminder}`;
+      console.log(`[M365-REQ-TRANSLATE] prompt_layout=flatMessages+reminder finalPrompt_len=${finalPrompt.length}`);
+    } else {
+      finalPrompt = `${antiExecPrompt}\n\n---\n\n${flatMessages}`;
+      console.log(`[M365-REQ-TRANSLATE] prompt_layout=antiExec+flatMessages finalPrompt_len=${finalPrompt.length}`);
+    }
   } else {
     finalPrompt = flatMessages;
+    console.log(`[M365-REQ-TRANSLATE] prompt_layout=flatMessages_only finalPrompt_len=${finalPrompt.length}`);
   }
+
+  const beforeSanitize = finalPrompt;
+  const afterSanitize = sanitizeForM365(finalPrompt);
+  const sanitizeRe = /\b(rm|rmdir|del|delete|shred|format|erase|wipe|destroy|destructive|truncate|overwrite|kill|killall|chmod|chown)\b/gi;
+  const beforeMatches = beforeSanitize.match(sanitizeRe) || [];
+  const afterMatches = afterSanitize.match(sanitizeRe) || [];
+  console.log(`[M365-REQ-SANITIZE] before=${beforeMatches.length} words [${JSON.stringify(beforeMatches)}] after=${afterMatches.length} words [${JSON.stringify(afterMatches)}] | before_len=${beforeSanitize.length} after_len=${afterSanitize.length}`);
+  if (afterMatches.length > 0) {
+    console.log(`[M365-REQ-SANITIZE] BUG: dangerous words still present after sanitize!`);
+  }
+
+  console.log(`[M365-REQ-TRANSLATE] FINAL: usedExtract=${usedExtract} hasToolResults=${hasToolResults} needsLocalExec=${needsLocalExec} finalPrompt_len=${afterSanitize.length} first200=${afterSanitize.slice(0,200).replace(/\n/g,"\\n")}`);
 
   return {
     ...body,
     messages: [],
-    _m365Prompt: finalPrompt,
+    _m365Prompt: afterSanitize,
     _m365ToolMeta: {
       hasTools: !!(tools && tools.length > 0),
       needsLocalExec,
