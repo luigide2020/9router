@@ -88,4 +88,11 @@ graphify-out/*
 
 # M365 browser profile temp files
 scripts/m365/.browser_profile/
+# Local-only working dirs (notes, vendored repos, scripts, skills)
+.claude/
+.docs/
+.repo/
+.script/
+.codegraph/
+.PR/
 .next-analyze/*
