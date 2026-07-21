@@ -48,12 +48,12 @@ When detected: `hasRemoteExec=true` → response translator strips remote output
 | Agent Tools | needsLocalExec | hasSearchTools | experienceType | Anti-Exec | M365 Search |
 |-------------|---------------|----------------|----------------|-----------|-------------|
 | None | false | false | Default | No | enabled |
-| Shell only (codex) | true | false | **Deep** | Yes | enabled |
+| Shell only (codex) | true | false | Default | Yes | enabled |
 | Shell + Search | true | true | Default | Yes (search forbidden) | disabled |
 | Search only | false | true | Default | No | enabled |
 | File ops only | true | false | Deep | Yes | enabled |
 
-When `disableCodeInterpreter=true`: `experienceType="Deep"`, `tone="Precise"`, strip CI/image flags from `optionsSets`, randomize `conversationId`+`sessionId` per request.
+When `disableCodeInterpreter=true` (now always false): previously used Deep+Precise. Current config: always `Default` experienceType + `Reasoning`/`Balanced` tone.
 
 ## Shell Tool Names
 
@@ -73,13 +73,27 @@ const SHELL_TOOL_NAMES = [
 | Search results | `[Search results (Grep):\n...]` |
 | Shell command | `[Output (exec_command):\n...]` |
 
-## sanitizeForM365 — Position-Based Replacement
+## sanitizeForM365 — Segment-Based Replacement
 
-1. `re.exec()` collects all match positions for dangerous words
-2. Sort positions by offset
-3. Build result string by splicing `[cmdN]` at correct offsets
-4. Also replaces `CRITICAL SAFETY RULE:` → `[Safety policy (commands replaced with placeholders):]`
-5. `M365_JAILBREAK_PHRASES` → `[note]`
+1. Split prompt into segments based on `SANITIZE_SKIP_PREFIXES` (`[Output (`, `[Result from `, `[File content (`, etc.)
+2. Content after skip prefixes is preserved as-is (sanitize=false) until `SANITIZE_RESUME_MARKERS` (`[System]:`, `[User]:`, `[Assistant]:`, `---`)
+3. In sanitize=true segments: `re.exec()` collects all match positions for dangerous words, builds result by splicing `[cmdN]` at correct offsets
+4. Also replaces `M365_JAILBREAK_PHRASES` → `[note]`
+5. File content, package names, command output inside output blocks are never corrupted
+
+## Tool Result Truncation
+
+- `M365_MAX_TOOL_RESULT_LEN = 8000` characters
+- `truncateToolResult()` truncates at line boundary, appends `... [N more characters omitted]`
+- Applied in: `extractLatestUserInput()` TOOL branch, `flattenMessages()` TOOL role, `buildToolResultPrompt()`
+
+## Destructive Guardrail (gpt-5.6)
+
+- `DESTRUCTIVE_COMMAND_PATTERNS` use **line-anchored** regex with `^` + `m` flag
+- Only matches commands at **line start** (not embedded in file content, `perl -e` scripts, etc.)
+- `/\bformat\b/i` → `/^\s*format\s+\/dev\//im` — only matches disk formatting, not package names
+- `isDestructiveCommand()` checks each line independently (splits by `\n`, skips comments)
+- When blocked: tool_call is removed, `[SAFETY: N potentially harmful command(s) blocked]` appended
 
 ## Request Routing Decision Tree
 

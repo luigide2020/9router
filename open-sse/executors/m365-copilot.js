@@ -146,7 +146,7 @@ function buildCopilotMessage(text, invocationId, conversationId, sessionId, enab
     ? [{ Id: "BingWebSearch", Source: "BuiltIn" }]
     : [];
 
-  const experienceType = disableCodeInterpreter ? "Deep" : "Default";
+  const experienceType = "Default";
 
   return {
     arguments: [{
@@ -155,7 +155,7 @@ function buildCopilotMessage(text, invocationId, conversationId, sessionId, enab
       sessionId,
       optionsSets: ["enterprise_flux_handoff_outlook_compose", ...buildCopilotOptionsSets(enableReasoning, disableCodeInterpreter, enableSearch)],
       options: {},
-      tone: disableCodeInterpreter ? "Precise" : (enableReasoning ? "Reasoning" : "Balanced"),
+      tone: enableReasoning ? "Reasoning" : "Balanced",
       allowedMessageTypes,
       sliceIds: [],
       threadLevelGptId,
@@ -817,10 +817,10 @@ export class M365CopilotExecutor extends BaseExecutor {
     // "copilot" (auto) means let M365 decide the model
     const modelId = model === "copilot" ? null : model;
     const m365Flags = {
-      disableCodeInterpreter: !!toolMeta.needsLocalExec,
+      disableCodeInterpreter: false,
       enableSearch: true,
     };
-    console.log(`[M365-EXEC-FLAGS] disableCodeInterpreter=${m365Flags.disableCodeInterpreter} enableSearch=${m365Flags.enableSearch} experienceType=${m365Flags.disableCodeInterpreter ? "Deep" : "Default"} tone=${m365Flags.disableCodeInterpreter ? "Precise" : (enableReasoning ? "Reasoning" : "Balanced")}`);
+    console.log(`[M365-EXEC-FLAGS] disableCodeInterpreter=${m365Flags.disableCodeInterpreter} enableSearch=${m365Flags.enableSearch} experienceType=Default tone=${enableReasoning ? "Reasoning" : "Balanced"}`);
     const copilotMsg = buildCopilotMessage(userPrompt, 0, conversationId, sessionIdUuid, enableReasoning, modelId, m365Flags);
     log?.info?.("M365-COPILOT", `WS send: optionsSets=${JSON.stringify(copilotMsg.arguments[0].optionsSets)}, plugins=${JSON.stringify(copilotMsg.arguments[0].plugins)}, allowedMessageTypes=${JSON.stringify(copilotMsg.arguments[0].allowedMessageTypes)}`);
     ws.send(JSON.stringify(copilotMsg) + RS);

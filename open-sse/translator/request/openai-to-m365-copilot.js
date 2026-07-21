@@ -110,25 +110,75 @@ const M365_JAILBREAK_PHRASES = [
   /CRITICAL SAFETY RULE/gi,
 ];
 
+const SANITIZE_SKIP_PREFIXES = [
+  "[Output (",
+  "[Result from ",
+  "[File content (",
+  "[File listing (",
+  "[Search results (",
+  "[File operation result (",
+];
+
+const SANITIZE_RESUME_MARKERS = ["[System]:", "[User]:", "[Assistant]:", "---\n"];
+
 function sanitizeForM365(text) {
   if (!text) return text;
-  const replacements = [];
-  let m;
-  const cmdRe = /\b(rm|rmdir|del|delete|shred|format|erase|wipe|destroy|destructive|truncate|overwrite|kill|killall|chmod|chown)\b/gi;
-  while ((m = cmdRe.exec(text)) !== null) {
-    replacements.push({ start: m.index, end: m.index + m[0].length, word: m[0], idx: replacements.length + 1 });
-  }
-  let result = text;
-  if (replacements.length > 0) {
-    const parts = [];
-    let lastEnd = 0;
-    for (const r of replacements) {
-      parts.push(result.slice(lastEnd, r.start));
-      parts.push(`[cmd${r.idx}]`);
-      lastEnd = r.end;
+  const segments = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    let skipStart = -1;
+    let skipPrefix = "";
+    for (const prefix of SANITIZE_SKIP_PREFIXES) {
+      const idx = remaining.indexOf(prefix);
+      if (idx !== -1 && (skipStart === -1 || idx < skipStart)) {
+        skipStart = idx;
+        skipPrefix = prefix;
+      }
     }
-    parts.push(result.slice(lastEnd));
-    result = parts.join("");
+    if (skipStart === -1) {
+      segments.push({ text: remaining, sanitize: true });
+      break;
+    }
+    if (skipStart > 0) {
+      segments.push({ text: remaining.slice(0, skipStart), sanitize: true });
+    }
+    const afterPrefix = remaining.slice(skipStart);
+    let resumeAt = afterPrefix.length;
+    for (const marker of SANITIZE_RESUME_MARKERS) {
+      const mIdx = afterPrefix.indexOf(marker, skipPrefix.length);
+      if (mIdx !== -1 && mIdx < resumeAt) resumeAt = mIdx;
+    }
+    segments.push({ text: afterPrefix.slice(0, resumeAt), sanitize: false });
+    remaining = afterPrefix.slice(resumeAt);
+  }
+
+  let result = "";
+  let cmdIdx = 0;
+  for (const seg of segments) {
+    if (!seg.sanitize) {
+      result += seg.text;
+      continue;
+    }
+    const replacements = [];
+    let m;
+    const cmdRe = /\b(rm|rmdir|del|delete|shred|format|erase|wipe|destroy|destructive|truncate|overwrite|kill|killall|chmod|chown)\b/gi;
+    while ((m = cmdRe.exec(seg.text)) !== null) {
+      cmdIdx++;
+      replacements.push({ start: m.index, end: m.index + m[0].length, idx: cmdIdx });
+    }
+    if (replacements.length > 0) {
+      const parts = [];
+      let lastEnd = 0;
+      for (const r of replacements) {
+        parts.push(seg.text.slice(lastEnd, r.start));
+        parts.push(`[cmd${r.idx}]`);
+        lastEnd = r.end;
+      }
+      parts.push(seg.text.slice(lastEnd));
+      result += parts.join("");
+    } else {
+      result += seg.text;
+    }
   }
   for (const phraseRe of M365_JAILBREAK_PHRASES) {
     result = result.replace(phraseRe, "[note]");
@@ -237,11 +287,23 @@ function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas, hasSearchToo
   ].filter(Boolean).join(" ");
 }
 
+const M365_MAX_TOOL_RESULT_LEN = 8000;
+
+function truncateToolResult(resultStr, maxLen = M365_MAX_TOOL_RESULT_LEN) {
+  if (!resultStr || resultStr.length <= maxLen) return resultStr;
+  const head = resultStr.slice(0, maxLen);
+  const omitted = resultStr.length - maxLen;
+  const lastNl = head.lastIndexOf("\n");
+  const cutPoint = lastNl > maxLen * 0.5 ? lastNl + 1 : maxLen;
+  return resultStr.slice(0, cutPoint) + `\n... [${omitted + (resultStr.length - cutPoint)} more characters omitted]`;
+}
+
 function buildToolResultPrompt(toolCallId, toolName, result) {
   const resultStr = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+  const truncated = truncateToolResult(resultStr);
   return [
     `[Result from ${toolName}]:`,
-    resultStr,
+    truncated,
   ].join("\n");
 }
 
@@ -303,7 +365,7 @@ function flattenMessages(messages, toolCallMetaMap) {
       const tcId = msg.tool_call_id || "";
       const tcName = toolCallMetaMap.get(tcId) || "unknown";
       const result = extractContent(msg.content) || msg.content || "";
-      const resultStr = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+      const resultStr = truncateToolResult(typeof result === "string" ? result : JSON.stringify(result, null, 2));
       console.log(`[M365-REQ-MSG] #${idx} role=TOOL toolName=${tcName} tcId=${tcId.slice(0,12)} resultLen=${resultStr.length}`);
       parts.push(formatToolResult(tcName, resultStr));
       continue;
@@ -330,7 +392,7 @@ function buildEarlierContext(messages, stopIndex, toolCallMetaMap) {
       toolCallMetaMap.set(tcId, tcName);
       const raw = extractContent(msg.content) || "";
       const resultStr = typeof raw === "string" ? raw : JSON.stringify(raw, null, 2);
-      const cwdMatch = resultStr.match(/^(\/[^\s\n]+)/m);
+      const cwdMatch = resultStr.match(/^\/[^\s\n]+\/[^\s\n]+/m);
       if (cwdMatch) lastCwd = cwdMatch[1];
     }
     if (role === ROLE.ASSISTANT && msg.tool_calls && !lastCmd) {
@@ -359,9 +421,12 @@ function detectUserLanguage(messages) {
     if (m.role !== ROLE.USER) continue;
     const text = extractContent(m.content) || "";
     const cjk = text.match(/[\u4e00-\u9fff\u3400-\u4dbf\u3000-\u303f\uac00-\ud7af]/g);
-    const latin = text.match(/[a-zA-Z]/g);
-    if (cjk && (!latin || cjk.length > latin.length * 0.3)) return "zh";
+    if (cjk && cjk.length >= 1) {
+      console.log(`[M365-REQ-LANG] detected=zh at msg#${i} cjk=${cjk.length} preview=${text.slice(0,60).replace(/\n/g,"\\n")}`);
+      return "zh";
+    }
   }
+  console.log(`[M365-REQ-LANG] detected=en (no CJK found in USER messages)`);
   return "en";
 }
 
@@ -383,11 +448,11 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
     const hasEarlierToolResults = messages.slice(0, -1).some(m => m.role === ROLE.TOOL);
     if (hasEarlierToolResults) {
       const earlierContext = buildEarlierContext(messages, messages.length - 1, toolCallMetaMap);
-      const result = [earlierContext, `[User]: ${text}`].filter(Boolean).join("\n\n");
+      const result = [earlierContext, `[User]: ${text}`, langHint || ""].filter(Boolean).join("\n\n");
       console.log(`[M365-REQ-EXTRACT] USER with earlier context: earlierCtx=${!!earlierContext} result_len=${result.length}`);
       return result;
     }
-    return `[User]: ${text}`;
+    return langHint ? `[User]: ${text}\n\n${langHint}` : `[User]: ${text}`;
   }
 
   if (lastRole === ROLE.TOOL) {
@@ -413,7 +478,7 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
       const tcId = messages[i].tool_call_id || "";
       const tcName = toolCallMetaMap.get(tcId) || "unknown";
       const result = extractContent(messages[i].content) || messages[i].content || "";
-      const resultStr = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+      const resultStr = truncateToolResult(typeof result === "string" ? result : JSON.stringify(result, null, 2));
       console.log(`[M365-REQ-EXTRACT] tool_result #${messages.length - 1 - i} toolName=${tcName} tcId=${tcId.slice(0,12)} resultLen=${resultStr.length} preview=${resultStr.slice(0,80).replace(/\n/g,"\\n")}`);
       resultParts.unshift(formatToolResult(tcName, resultStr));
       i--;
@@ -468,7 +533,8 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
       combinedResults,
       `Analyze the output above. If the user asked to see file content, include the relevant content in your response. If another step is needed, output a JSON instruction using this schema:`,
       schemaHint,
-      `If the task is fully complete, provide a brief summary including any key content the user asked to see. ${langHint} Otherwise, continue with the next JSON instruction.`,
+      `If the task is fully complete, provide a brief summary including any key content the user asked to see. Otherwise, continue with the next JSON instruction.`,
+      langHint || "",
     ].filter(Boolean).join("\n\n");
 
     console.log(`[M365-REQ-EXTRACT] final_extracted_len=${result.length}`);
@@ -521,11 +587,13 @@ function openaiToM365CopilotRequest(model, body, stream, credentials) {
     );
     console.log(`[M365-REQ-TRANSLATE] antiExecPrompt_len=${antiExecPrompt.length}`);
     if (hasToolResults) {
+      const langFooter = langHint ? `\n${langHint}` : "";
       const reminder = [
         `You provided a JSON instruction in the previous step and here is the result.`,
         `If another step is needed, output a JSON instruction using this schema — the user will handle execution:`,
         antiExecPrompt,
-      ].join("\n");
+        langFooter,
+      ].filter(Boolean).join("\n");
       finalPrompt = `${flatMessages}\n\n---\n\n${reminder}`;
       console.log(`[M365-REQ-TRANSLATE] prompt_layout=flatMessages+reminder finalPrompt_len=${finalPrompt.length}`);
     } else {

@@ -38,26 +38,31 @@ const COMMON_COMMANDS_RE = /\b(ls|pwd|cat|find|grep|head|tail|wc|echo|mkdir|rm|c
 const COMMAND_INTENT_RE = /\b(run|execute|try|type|enter|issue|invoke)\s+(this\s+)?(command|the\s+following|it|now)|^CMD:/im;
 
 const DESTRUCTIVE_COMMAND_PATTERNS = [
-  /\brm\s+(-[rRfF]+\s+|--recursive|--force)\s*\S/i,
-  /\brm\s+\S.*\S\s*$/m,
-  /\brmdir\b/i,
-  /\bdel\b\s+/i,
-  /\bshred\b/i,
-  /\bformat\b/i,
-  /\berase\b/i,
-  /\btruncate\b\s+-s/i,
-  /\bchmod\s+(0+[0-7]*|000|777)\b/i,
-  /\bkill\s+(-9\s+)?\d+/,
-  /\bkillall\b/i,
-  /\bdd\s+if=.*of=\/dev\//i,
-  /\bmv\s+.*\s+\/dev\/null/i,
-  /\b>\s*\/dev\//,
+  /^\s*rm\s+(-[rRfF]+\s+|--recursive|--force)\s*\S/im,
+  /^\s*rm\s+\S.*\S\s*$/im,
+  /^\s*rmdir\b/im,
+  /^\s*del\b\s+/im,
+  /^\s*shred\b/im,
+  /^\s*format\s+\/dev\//im,
+  /^\s*erase\b/im,
+  /^\s*truncate\s+-s/im,
+  /^\s*chmod\s+(0+[0-7]*|000|777)\b/im,
+  /^\s*kill\s+(-9\s+)?\d+/im,
+  /^\s*killall\b/im,
+  /^\s*dd\s+if=.*of=\/dev\//im,
+  /^\s*mv\s+.*\s+\/dev\/null/im,
+  /^\s*.{0,20}>\s*\/dev\/(sd[a-z]|hd[a-z]|nvme|loop|ram|md|dm-|sdx)/im,
 ];
 
 function isDestructiveCommand(cmd) {
   const c = cmd.trim();
   if (!c) return false;
-  return DESTRUCTIVE_COMMAND_PATTERNS.some(p => p.test(c));
+  const lines = c.split(/\n/);
+  const commandLines = lines.filter(line => {
+    const trimmed = line.trim();
+    return trimmed && !trimmed.startsWith("#");
+  });
+  return commandLines.some(line => DESTRUCTIVE_COMMAND_PATTERNS.some(p => p.test(line)));
 }
 
 function isRemoteExecutionResult(text) {
@@ -165,7 +170,49 @@ function extractToolCallsFromText(text, toolMeta) {
         console.log(`[M365-RESP-EXTRACT] rule=INLINE_JSON_TOOL_RE → toolCall name=${parsed.name}`);
         calls.push(makeToolCall(parsed.name, args));
       }
-    } catch { /* skip */ }
+    } catch {
+      const nameMatch = raw.match(/"name"\s*:\s*"([^"]+)"/);
+      if (nameMatch) {
+        const argMatch = raw.match(/"arguments"\s*:\s*(\{[\s\S]*)/);
+        let args = "{}";
+        if (argMatch) {
+          let argStr = argMatch[1].replace(/\}\s*$/, "");
+          try { const p = JSON.parse(argStr); args = argStr; } catch { args = argStr; }
+        }
+        console.log(`[M365-RESP-EXTRACT] rule=INLINE_JSON_TOOL_RE(fallback) → toolCall name=${nameMatch[1]}`);
+        calls.push(makeToolCall(nameMatch[1], args));
+      }
+    }
+  }
+
+  if (calls.length === 0) {
+    const truncMatch = text.match(/\{[\s\n]*"name"\s*:\s*"([^"]+)"[\s\n]*,\s*[\s\n]*"arguments"\s*:\s*\{([\s\S]*)/);
+    if (truncMatch) {
+      const tName = truncMatch[1];
+      const rawArgs = truncMatch[2];
+      console.log(`[M365-RESP-EXTRACT] rule=TRUNCATED_JSON_TOOL name=${tName} argsLen=${rawArgs.length} preview=${rawArgs.slice(0,80).replace(/\n/g,"\\n")}`);
+      const cmdMatch2 = rawArgs.match(/"cmd"\s*:\s*"([\s\S]*)/);
+      const commandMatch = rawArgs.match(/"command"\s*:\s*"([\s\S]*)/);
+      if (cmdMatch2 || commandMatch) {
+        const cmdKey = cmdMatch2 ? "cmd" : "command";
+        let cmdVal = (cmdMatch2 || commandMatch)[1];
+        cmdVal = cmdVal.replace(/"\s*,?\s*$/, "").replace(/\}\s*$/, "");
+        const toolName = extractShellToolName(toolMeta);
+        const argName = getShellToolCommandArgName(toolMeta);
+        const finalName = tName || toolName;
+        const finalArgName = cmdKey === "cmd" ? argName : cmdKey;
+        console.log(`[M365-RESP-EXTRACT] rule=TRUNCATED_JSON_TOOL → toolCall name=${finalName} ${finalArgName}_len=${cmdVal.length}`);
+        calls.push(makeToolCall(finalName, { [finalArgName]: cmdVal }));
+      } else {
+        let tArgs = rawArgs.replace(/\}\s*$/, "");
+        try {
+          const parsed = JSON.parse(`{${tArgs}}`);
+          calls.push(makeToolCall(tName, parsed));
+        } catch {
+          calls.push(makeToolCall(tName, tArgs));
+        }
+      }
+    }
   }
 
   const cmdMatch = text.match(CMD_PREFIX_RE);

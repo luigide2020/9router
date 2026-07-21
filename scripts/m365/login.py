@@ -113,8 +113,53 @@ def do_login(page, email, password):
     
     print(f"[LOGIN] 当前 URL: {page.url}")
     print("[LOGIN] 输入邮箱...")
-    page.fill('input[type="email"], input[name="loginfmt"], input[name="login"], input', email)
-    page.click('input[type="submit"], button[type="submit"], input[type="submit"]')
+    # Try each selector individually; skip checkboxes/toggles to avoid matching switches
+    email_selectors = [
+        'input[type="email"]',
+        'input[name="loginfmt"]',
+        'input[name="login"]',
+        'input:not([type="checkbox"]):not([type="radio"]):not([type="hidden"])',
+    ]
+    email_box = None
+    for sel in email_selectors:
+        elems = page.locator(sel).all()
+        for el in elems:
+            tag = el.evaluate("e => e.tagName.toLowerCase()")
+            typ = el.evaluate("e => e.type || e.getAttribute('type') || ''")
+            role = el.evaluate("e => e.getAttribute('role') || ''")
+            if typ in ("checkbox", "radio", "hidden", "submit", "button") or role in ("switch", "checkbox"):
+                continue
+            try:
+                el.fill(email)
+                email_box = el
+                print(f"[LOGIN] ✅ 已填入邮箱 (selector={sel})")
+                break
+            except Exception:
+                continue
+        if email_box is not None:
+            break
+    if email_box is None:
+        raise RuntimeError("无法找到邮箱输入框")
+
+    # Click submit — prefer the button associated with the email field
+    submit_selectors = [
+        'input[type="submit"]',
+        'button[type="submit"]',
+        'text=Next',
+        'text=登录',
+        'text=Sign in',
+    ]
+    clicked = False
+    for sel in submit_selectors:
+        try:
+            page.locator(sel).first.click(timeout=5000)
+            clicked = True
+            print(f"[LOGIN] ✅ 已点击提交 (selector={sel})")
+            break
+        except Exception:
+            continue
+    if not clicked:
+        page.keyboard.press("Enter")
     print("[LOGIN] 等待密码框...")
     page.wait_for_selector('input[type="password"]', timeout=15000)
     page.fill('input[type="password"]', password)

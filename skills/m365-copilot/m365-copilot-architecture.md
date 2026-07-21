@@ -25,9 +25,11 @@ M365 may return tool calls in various formats. The response translator detects a
 
 When any pattern is detected, the text is converted to an OpenAI `tool_calls` chunk with `finish_reason: "tool_calls"`.
 
-### C) Sanitize — Remove Dangerous Words Before Sending
+### C) Sanitize — Remove Dangerous Words Before Sending (Command-Only, Skip Output)
 
-`sanitizeForM365()` uses **position-based replacement** to neutralize dangerous command words (`rm`, `delete`, `shred`, etc.) and JailBreak phrases (`[SYSTEM OVERRIDE]`, `HIGHEST PRIORITY`, `NOT in your sandbox`, etc.) before sending to M365. Applied at final prompt construction as a single sanitize point.
+`sanitizeForM365()` uses **segment-based replacement**: it skips content inside output blocks (`[Output (`, `[Result from `, `[File content (` etc.) and only sanitizes instruction/label text. Dangerous words in file content, package names, and command output are preserved as-is.
+
+Inside sanitized segments: position-based replacement replaces `rm`, `delete`, `format`, `kill`, `chmod` etc. with `[cmdN]` placeholders. Also replaces JailBreak phrases (`[SYSTEM OVERRIDE]`, `HIGHEST PRIORITY` etc.) with `[note]`.
 
 ## Critical Implementation Details
 
@@ -37,8 +39,8 @@ Two paths for translating messages:
 
 | Condition | Strategy | Prompt Layout | Size |
 |-----------|----------|---------------|------|
-| Last msg = TOOL | `extractLatestUserInput` | flatMessages + "previous step" reminder | ~5KB |
-| Last msg = USER + earlier TOOL | `extractLatestUserInput` | antiExec + flatMessages (with cwd context) | ~2KB |
+| Last msg = TOOL | `extractLatestUserInput` | flatMessages + "previous step" reminder + langHint | ~10KB |
+| Last msg = USER + earlier TOOL | `extractLatestUserInput` | antiExec + flatMessages (with cwd context + langHint) | ~2KB |
 | Last msg = USER, no TOOL history | `flattenMessages` | antiExec + flatMessages | ~30KB+ |
 | No tools needed | `flattenMessages` | flatMessages only | varies |
 
@@ -63,7 +65,11 @@ while (preScan >= 0 && messages[preScan].role === ROLE.ASSISTANT) {      // Find
 
 ### 3. Language Following
 
-`detectUserLanguage()` scans user messages for CJK character ratio. When detected, adds `"Reply in Chinese (中文)."` or `"Reply in the same language as the user message."` to prompts.
+`detectUserLanguage()` scans user messages for any CJK character (threshold: `>=1` CJK char). When detected, adds `"Reply in Chinese (中文)."` as a **standalone line** at the end of prompts — in all three routing paths (TOOL, USER, reminder). This ensures M365 follows the user's language consistently.
+
+### 4. Tool Result Truncation
+
+Large tool results (e.g., full file contents) are truncated to `M365_MAX_TOOL_RESULT_LEN=8000` characters before sending to M365. Truncation happens at line boundaries and appends `[N more characters omitted]`. This prevents M365 from stalling on large prompts or entering agentic loops processing huge outputs.
 
 ### 4. Schema-Aware Argument Names
 
@@ -104,8 +110,8 @@ Agent → OpenAI format request → 9router
   → m365-copilot.js (WebSocket executor)
     → bufferForTools=true buffers all text
     → hasRemoteExec detects remote sandbox execution
-    → Randomizes conversationId/sessionId when needsLocalExec
-    → Deep experienceType + Precise tone when disableCodeInterpreter
+     → Randomizes conversationId/sessionId when needsLocalExec
+     → Default experienceType + Reasoning/Balanced tone
   → m365-copilot-to-openai.js (response translation)
     → extractToolCallsFromText() detects tool_call patterns
     → buildToolCallResults() generates OpenAI format

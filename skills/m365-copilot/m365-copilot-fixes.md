@@ -116,6 +116,87 @@ Added `M365_JAILBREAK_PHRASES` array catching: `[SYSTEM OVERRIDE...]`, `HIGHEST 
 
 ---
 
+## Fix29: Destructive Guardrail — Line-Anchored Patterns
+
+**File**: `m365-copilot-to-openai.js`
+
+**Root cause**: `DESTRUCTIVE_COMMAND_PATTERNS` used unanchored regex (`/\bformat\b/i`) that matched keywords anywhere in the command text, including file content embedded in arguments (e.g., `java.time.format.DateTimeFormatter` in a `perl -e` script). This caused legitimate commands to be BLOCKED by the gpt-5.6 destructive guardrail.
+
+**Fix**:
+1. All patterns changed to **line-anchored** with `^` prefix + `m` multiline flag (e.g., `/^\s*format\s+\/dev\//im`)
+2. `/\bformat\b/i` → `/^\s*format\s+\/dev\//im` — only matches disk formatting (`format /dev/...`), not package names
+3. `isDestructiveCommand()` changed to **per-line checking**: splits multi-line scripts, filters comments, checks each line independently
+4. This ensures embedded file content (in `perl -e`, `sed`, `python -c` arguments) is never matched — only actual command lines at line start
+
+**Before**: `cmd="set -euo pipefail\nfile=...\nperl -e 's/java.time.format.DateTimeFormatter/...'"` → `isDestructive=true` (BLOCKED)
+**After**: Same command → `isDestructive=false` (passed) ✅
+
+---
+
+## Fix30: sanitizeForM365 — Skip Output Content Blocks
+
+**File**: `openai-to-m365-copilot.js`
+
+**Root cause**: `sanitizeForM365()` did blanket keyword replacement across the entire prompt text, including file content and command output in `[Output (exec_command):]` blocks. Words like `format`, `kill`, `chmod`, `rm` in file/package names (e.g., `java.time.format.DateTimeFormatter`, `String.format()`) were replaced with `[cmdN]`, corrupting the content M365 sees and causing incorrect responses.
+
+**Fix**:
+1. Added `SANITIZE_SKIP_PREFIXES` (`[Output (`, `[Result from `, `[File content (`, etc.)
+2. Added `SANITIZE_RESUME_MARKERS` (`[System]:`, `[User]:`, `[Assistant]:`, `---`)
+3. `sanitizeForM365()` now **segments** the prompt: content between a skip prefix and the next resume marker is preserved as-is (sanitize=false); only instruction/label text is sanitized
+4. Previous Fix19 (position-based replacement) had a bug where only the prefix line was skipped, while subsequent content lines were still sanitized. Fix30 correctly skips the **entire output block** until the next structural marker.
+
+**Before**: `java.time.format.DateTimeFormatter => 3` → `java.time.[cmd1].DateTimeFormatter => 3` (corrupted)
+**After**: `java.time.format.DateTimeFormatter => 3` preserved ✅
+
+---
+
+## Fix31: Truncate Large Tool Results for M365
+
+**File**: `openai-to-m365-copilot.js`
+
+**Root cause**: When reading large files (e.g., 40KB Java source), the full tool_result content was sent to M365 as-is (`combinedResultsLen=40235`). This caused:
+- M365 processing very slowly (each request 15-20+ seconds)
+- M365 generating repeated sub-commands to process different parts of the file (agentic loop spiraling)
+- Total task time exceeding 8 minutes
+
+**Fix**:
+1. Added `M365_MAX_TOOL_RESULT_LEN = 8000` constant
+2. `truncateToolResult()` function: truncates at line boundary (not mid-line), appends `... [N more characters omitted]`
+3. Applied in three locations: `extractLatestUserInput()` TOOL branch, `flattenMessages()` TOOL role, and `buildToolResultPrompt()`
+4. M365 sees enough content to understand the result, but not so much that it loops or stalls
+
+**Before**: `resultLen=40211` → `finalPrompt_len=42458` → M365 loops for 8+ min
+**After**: `resultLen=8000` (truncated) → `finalPrompt_len=~10KB` → fast response ✅
+
+---
+
+## Fix32: M365 Executor — Disable Code Interpreter Mode
+
+**File**: `m365-copilot.js`
+
+**Change**: `disableCodeInterpreter` is now always `false`; `experienceType` is always `"Default"`; `tone` is `"Reasoning"` or `"Balanced"` (no more `"Deep"`/`"Precise"`). The previous Deep+Precise mode was causing M365 to be less responsive and more likely to refuse commands. The Default experience type with Reasoning tone produces better results for agentic tool-calling workflows.
+
+---
+
+## Fix33: Language Detection & Hint Reinforcement
+
+**File**: `openai-to-m365-copilot.js`
+
+**Root cause**: M365 responded in English even when user wrote in Chinese. Two issues:
+1. `detectUserLanguage()` required `cjk.length > latin.length * 0.3` — too strict for mixed messages like `看下/Users/liujie/...` (2 CJK chars vs many Latin). Always detected as `en`.
+2. `langHint` was buried inside English prompt text and easily ignored by M365.
+
+**Fix**:
+1. `detectUserLanguage()` threshold relaxed: `cjk.length >= 1` — any CJK character in USER messages triggers `"zh"`
+2. Added diagnostic logging: `[M365-REQ-LANG] detected=zh/en`
+3. `langHint` placed as **standalone line** at prompt end in all three paths:
+   - TOOL branch (`extractLatestUserInput`): separate line instead of inline in English sentence
+   - USER branch: appended as `\n\nReply in Chinese (中文).`
+   - `reminder` (tool_result rounds): added `langFooter` as separate line after `antiExecPrompt`
+4. Also added `langHint` to USER branch in `extractLatestUserInput` (was missing entirely before)
+
+---
+
 ## Verification Status
 
 | Scenario | Status |
@@ -125,10 +206,13 @@ Added `M365_JAILBREAK_PHRASES` array catching: `[SYSTEM OVERRIDE...]`, `HIGHEST 
 | Multi-stream fullText dedup | Verified |
 | JailBreak classifier bypass | Verified (Fix19-21) |
 | `tcName=exec_command` (not unknown) | Verified (Fix24) |
-| Chinese language following | Verified (Fix25) |
+| Chinese language following | Verified (Fix25, Fix33) |
 | New USER message in agentic loop | Verified (Fix27) |
 | File content in summary | Verified (Fix28) |
 | No remote execution on tool_result rounds | Verified (Deep+Precise+random CID) |
+| Large file content not mis-sanitized | Verified (Fix30) |
+| Destructive guardrail no false positives | Verified (Fix29) |
+| Large file output truncated for M365 | Verified (Fix31) |
 
 ## Known Limitations
 
