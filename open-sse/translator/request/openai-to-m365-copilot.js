@@ -288,6 +288,7 @@ function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas, hasSearchToo
 }
 
 const M365_MAX_TOOL_RESULT_LEN = 8000;
+const M365_MAX_FILE_CONTENT_LEN = 4000;
 
 function truncateToolResult(resultStr, maxLen = M365_MAX_TOOL_RESULT_LEN) {
   if (!resultStr || resultStr.length <= maxLen) return resultStr;
@@ -296,6 +297,10 @@ function truncateToolResult(resultStr, maxLen = M365_MAX_TOOL_RESULT_LEN) {
   const lastNl = head.lastIndexOf("\n");
   const cutPoint = lastNl > maxLen * 0.5 ? lastNl + 1 : maxLen;
   return resultStr.slice(0, cutPoint) + `\n... [${omitted + (resultStr.length - cutPoint)} more characters omitted]`;
+}
+
+function truncateFileContent(resultStr) {
+  return truncateToolResult(resultStr, M365_MAX_FILE_CONTENT_LEN);
 }
 
 function buildToolResultPrompt(toolCallId, toolName, result) {
@@ -365,9 +370,11 @@ function flattenMessages(messages, toolCallMetaMap) {
       const tcId = msg.tool_call_id || "";
       const tcName = toolCallMetaMap.get(tcId) || "unknown";
       const result = extractContent(msg.content) || msg.content || "";
-      const resultStr = truncateToolResult(typeof result === "string" ? result : JSON.stringify(result, null, 2));
-      console.log(`[M365-REQ-MSG] #${idx} role=TOOL toolName=${tcName} tcId=${tcId.slice(0,12)} resultLen=${resultStr.length}`);
-      parts.push(formatToolResult(tcName, resultStr));
+      const resultStr = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+      const kind = classifyToolName(tcName);
+      const truncated = kind === "fileOp" ? truncateFileContent(resultStr) : truncateToolResult(resultStr);
+      console.log(`[M365-REQ-MSG] #${idx} role=TOOL toolName=${tcName} tcId=${tcId.slice(0,12)} resultLen=${truncated.length}`);
+      parts.push(formatToolResult(tcName, truncated));
       continue;
     }
 
@@ -379,40 +386,80 @@ function flattenMessages(messages, toolCallMetaMap) {
   return result;
 }
 
+function extractFilePathsFromCmd(cmd) {
+  const paths = [];
+  const fileRe = /['"]?((?:\.?\/)?(?:src|lib|test|pkg|cmd|internal|app|config|public|scripts|docs|build|dist)\S*\.(?:java|py|js|ts|jsx|tsx|go|rs|rb|php|c|cpp|h|cs|swift|kt|scala|sh|yaml|yml|json|toml|xml|html|css|md|txt|properties|conf|cfg|ini|env|sql))['"]?/gi;
+  let m;
+  while ((m = fileRe.exec(cmd)) !== null) {
+    paths.push(m[1].replace(/['"]/g, ""));
+  }
+  const sedCatRe = /(?:sed|cat|head|tail|less|more)\s+(?:-[a-zA-Z]+\s+)*['"]?((?:\.?\/)?\S+\.\w+)['"]?/gi;
+  while ((m = sedCatRe.exec(cmd)) !== null) {
+    const p = m[1].replace(/['"]/g, "").replace(/\|.*$/, "").trim();
+    if (p && !paths.includes(p) && /\.\w{1,10}$/.test(p)) paths.push(p);
+  }
+  const grepRe = /(?:grep|rg|ag|ack)\s+.*?\s+['"]?((?:\.?\/)?\S+)['"]?/gi;
+  while ((m = grepRe.exec(cmd)) !== null) {
+    const p = m[1].replace(/['"]/g, "").replace(/\|.*$/, "").trim();
+    if (p && /\.\w{1,10}$/.test(p) && !paths.includes(p)) paths.push(p);
+  }
+  return paths;
+}
+
 function buildEarlierContext(messages, stopIndex, toolCallMetaMap) {
   if (stopIndex <= 0) return "";
-  let lastCwd = "";
-  let lastCmd = "";
-  for (let k = stopIndex - 1; k >= 0; k--) {
+  const prevCmds = [];
+  const filesInContext = new Set();
+  for (let k = 0; k < stopIndex; k++) {
     const msg = messages[k];
     const role = msg.role || "";
-    if (role === ROLE.TOOL && !lastCwd) {
-      const tcId = msg.tool_call_id || "";
-      const tcName = toolCallMetaMap.get(tcId) || "unknown";
-      toolCallMetaMap.set(tcId, tcName);
-      const raw = extractContent(msg.content) || "";
-      const resultStr = typeof raw === "string" ? raw : JSON.stringify(raw, null, 2);
-      const cwdMatch = resultStr.match(/^\/[^\s\n]+\/[^\s\n]+/m);
-      if (cwdMatch) lastCwd = cwdMatch[1];
-    }
-    if (role === ROLE.ASSISTANT && msg.tool_calls && !lastCmd) {
+    if (role === ROLE.ASSISTANT && msg.tool_calls) {
       for (const tc of msg.tool_calls) {
+        const tcName = tc.function?.name || "unknown";
+        const tcId = tc.id || "";
+        toolCallMetaMap.set(tcId, tcName);
         try {
           const parsed = JSON.parse(tc.function?.arguments || "{}");
-          lastCmd = parsed.command || parsed.cmd || parsed.code || "";
-          if (lastCmd) {
-            toolCallMetaMap.set(tc.id || "", tc.function?.name || "unknown");
-            break;
+          const cmd = parsed.command || parsed.cmd || parsed.code || "";
+          if (cmd) {
+            prevCmds.push(cmd);
+            const fps = extractFilePathsFromCmd(cmd);
+            for (const fp of fps) filesInContext.add(fp);
           }
         } catch {}
       }
     }
-    if (lastCwd && lastCmd) break;
+    if (role === ROLE.TOOL) {
+      const tcId = msg.tool_call_id || "";
+      if (!toolCallMetaMap.has(tcId)) toolCallMetaMap.set(tcId, "unknown");
+    }
   }
   const parts = [];
-  if (lastCwd) parts.push(`Working directory: ${lastCwd}`);
+  const lastCmd = prevCmds.length > 0 ? prevCmds[prevCmds.length - 1] : "";
   if (lastCmd) parts.push(`Previous command: ${lastCmd}`);
-  return parts.length > 0 ? `[Context]: ${parts.join(", ")}` : "";
+  if (prevCmds.length > 1) {
+    parts.push(`Commands executed so far: ${prevCmds.length}`);
+  }
+  if (filesInContext.size > 0) {
+    const fileList = [...filesInContext].slice(0, 20).join(", ");
+    parts.push(`Files already read (content available in context, do NOT re-read): ${fileList}`);
+  }
+  const searchPatterns = new Set();
+  for (const c of prevCmds) {
+    const quotedMatches = c.match(/['"]([^'"]+)['"]/g);
+    if (quotedMatches) {
+      for (const qm of quotedMatches) {
+        const inner = qm.slice(1, -1);
+        if (/^(accessKey|bucket|endpoint|config|secret|password|private|import|class|def |function |public )/i.test(inner)) {
+          searchPatterns.add(inner.slice(0, 60));
+        }
+      }
+    }
+  }
+  if (searchPatterns.size > 0) {
+    parts.push(`Search patterns already queried: ${[...searchPatterns].slice(0, 10).join(", ")}. Do NOT repeat the same search.`);
+  }
+  return parts.length > 0 ? `[Context]: ${parts.join(". ")}` : "";
 }
 
 function detectUserLanguage(messages) {
@@ -478,9 +525,11 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
       const tcId = messages[i].tool_call_id || "";
       const tcName = toolCallMetaMap.get(tcId) || "unknown";
       const result = extractContent(messages[i].content) || messages[i].content || "";
-      const resultStr = truncateToolResult(typeof result === "string" ? result : JSON.stringify(result, null, 2));
-      console.log(`[M365-REQ-EXTRACT] tool_result #${messages.length - 1 - i} toolName=${tcName} tcId=${tcId.slice(0,12)} resultLen=${resultStr.length} preview=${resultStr.slice(0,80).replace(/\n/g,"\\n")}`);
-      resultParts.unshift(formatToolResult(tcName, resultStr));
+      const resultStr = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+      const kind = classifyToolName(tcName);
+      const truncated = kind === "fileOp" ? truncateFileContent(resultStr) : truncateToolResult(resultStr);
+      console.log(`[M365-REQ-EXTRACT] tool_result #${messages.length - 1 - i} toolName=${tcName} tcId=${tcId.slice(0,12)} resultLen=${truncated.length} preview=${truncated.slice(0,80).replace(/\n/g,"\\n")}`);
+      resultParts.unshift(formatToolResult(tcName, truncated));
       i--;
     }
 
@@ -527,12 +576,16 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
 
     console.log(`[M365-REQ-EXTRACT] tool_result_count=${toolResultCount} earlierContext=${earlierContext?"yes":"no"} combinedResultsLen=${combinedResults.length}`);
 
+    const noReReadHint = earlierContext.includes("Files already read")
+      ? "Do NOT re-read files listed as 'already read' above — their content is already available. Use a different command or proceed to the next step."
+      : "";
     const result = [
       earlierContext,
       `[User]: Here is the result of the previous step:`,
       combinedResults,
       `Analyze the output above. If the user asked to see file content, include the relevant content in your response. If another step is needed, output a JSON instruction using this schema:`,
       schemaHint,
+      noReReadHint,
       `If the task is fully complete, provide a brief summary including any key content the user asked to see. Otherwise, continue with the next JSON instruction.`,
       langHint || "",
     ].filter(Boolean).join("\n\n");
