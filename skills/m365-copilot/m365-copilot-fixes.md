@@ -197,6 +197,77 @@ Added `M365_JAILBREAK_PHRASES` array catching: `[SYSTEM OVERRIDE...]`, `HIGHEST 
 
 ---
 
+## Fix34: Break M365 File-Reading Loops — Request-Side Context + Response-Side Loop Guard
+
+**Files**: `openai-to-m365-copilot.js`, `m365-copilot-to-openai.js`
+
+**Root cause**: M365 Copilot uses **fresh conversationId/sessionId** per request (when `needsLocalExec=true`), so it has no memory of previous rounds. M365 ignored text-based "do NOT re-read" hints — `sed -n '1,240p' AbstractAlgorithm.java` was executed **702 times**, `for f in V1Algorithm.java...` **578 times**.
+
+**Fix** (multi-layer defense):
+
+### Layer 1: Request-side — `buildEarlierContext()` full history scan
+- Scans **ALL** prior messages (not just last 2) to extract:
+  - All previously executed commands → `Commands executed so far: N`
+  - File paths from commands → `Files already read (content available in context, do NOT re-read): file1, file2, ...`
+  - Search patterns from grep commands → `Search patterns already queried: ... Do NOT repeat`
+  - File-reading count warning → `WARNING: You have already read N files...`
+- `extractFilePathsFromCmd()` — extracts file paths from command strings (sed/cat/grep targets)
+- `isFileReadingCmd()` / `getFileReadingTarget()` — classifies file-reading commands
+- `buildEarlierContext()` returns `{ text, filesReadCount, lastReadFile }` object
+
+### Layer 2: Request-side — `forceSummarize` (≥15 commands)
+- When `totalCommands >= 15`, prompt is rewritten to: "This is the FINAL step. Do NOT output any more JSON instructions. Instead, provide a comprehensive summary."
+- This is a stronger structural hint than "do NOT re-read" text
+
+### Layer 3: Response-side — **Loop Guard** (the critical fix)
+- `extractHistoricalToolCallSignatures(messages)` — extracts `name::cmd` signature for every ASSISTANT tool_call in history
+- Signatures stored in `_m365ToolMeta.historicalToolCallSignatures` (Set), passed to response translator
+- `computeToolCallSignature(tc)` — generates same `name::cmd` signature for each tool_call M365 returns
+- **Exact match detection**: if `historicalSigs.has(sig)` → tool_call is a duplicate
+- **Rules**:
+  - Same tool + same arguments → **BLOCKED** (duplicate)
+  - Same tool + different arguments → **ALLOWED**
+  - Different tool → **ALLOWED**
+- **Actions**:
+  - ALL calls duplicates → return text summary instead (no tool_calls sent to Codex)
+  - SOME calls duplicates → filter out duplicates, pass unique ones only
+  - NO duplicates → pass all through
+- Logs: `[M365-RESP-TRANSLATE] DUPLICATE tool_call blocked: <cmd>`, `BLOCKED N duplicate tool_call(s)`
+
+**Before**: `sed -n '1,240p' AbstractAlgorithm.java` ×702, M365 ignores all text hints
+**After**: Duplicate tool_call blocked at response side, Codex never re-executes the same command ✅
+
+---
+
+## Fix35: Shorter Tool Result Truncation
+
+**File**: `openai-to-m365-copilot.js`
+
+**Root cause**: File content truncated at 8000 chars was still too large — inflated prompts, slowed M365, encouraged re-reading.
+
+**Fix**:
+1. `M365_MAX_FILE_CONTENT_LEN = 3000` (file content from Read/view_file)
+2. `M365_MAX_SHELL_OUTPUT_LEN = 6000` (exec_command/Bash output)
+3. `M365_MAX_TOOL_RESULT_LEN = 8000` (general, unchanged)
+4. `truncateFileContent()` — new function using 3000-char limit
+5. Truncation now uses `classifyToolName()`: fileOp→3000, shell→6000, other→8000
+
+---
+
+## Fix36: Extract Historical Tool Call Signatures
+
+**File**: `openai-to-m365-copilot.js`
+
+Added `extractHistoricalToolCallSignatures(messages)` which scans all ASSISTANT messages for tool_calls and builds a Set of `toolName::commandString` signatures. Stored in `_m365ToolMeta.historicalToolCallSignatures` for use by response-side loop guard (Fix34 Layer 3).
+
+---
+
+## Workflow Rule: Verify Before Push
+
+**Rule**: After implementing fixes, do NOT `git commit` or `git push` automatically. Wait for the user to verify the changes (docker build, deploy, test) before committing and pushing. Only push after explicit user confirmation.
+
+---
+
 ## Verification Status
 
 | Scenario | Status |
@@ -213,6 +284,11 @@ Added `M365_JAILBREAK_PHRASES` array catching: `[SYSTEM OVERRIDE...]`, `HIGHEST 
 | Large file content not mis-sanitized | Verified (Fix30) |
 | Destructive guardrail no false positives | Verified (Fix29) |
 | Large file output truncated for M365 | Verified (Fix31) |
+| Default experienceType + Reasoning tone | Verified (Fix32) |
+| buildEarlierContext full history scan | Verified (Fix34) — `filesReadCount=6, totalCommands=15` in logs |
+| Shorter file content truncation (3000/6000) | Verified (Fix35) |
+| forceSummarize at ≥15 commands | Verified (Fix36) — M365 returned text summary, 0 tool_calls |
+| Response-side loop guard (duplicate blocking) | Verified (Fix34 Layer 3) — no duplicates in tested session; mechanism active |
 
 ## Known Limitations
 
@@ -221,3 +297,5 @@ Added `M365_JAILBREAK_PHRASES` array catching: `[SYSTEM OVERRIDE...]`, `HIGHEST 
 3. **Duplicate T2 messages** — M365 sends two type:2+type:3 pairs; `botTextStreams` dedup handles text but logs double.
 4. **M365 may give pure text instead of JSON tool_call** when it judges task complete — this is correct behavior, agent should handle `finish_reason=stop`.
 5. **docker cp doesn't work for Next.js standalone** — must modify compiled chunks in `.next/server/chunks/216.js` or `docker build`.
+6. **Text-based hints ("do NOT re-read") are unreliable** — M365 ignores them. Structural defenses (loop guard, forceSummarize) are the primary defense.
+7. **Loop guard uses `name::cmd` signature** — if M365 reformulates the same command with different wording, it won't be caught. This is by design (same tool + different args = allowed).

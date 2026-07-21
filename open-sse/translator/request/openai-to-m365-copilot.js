@@ -288,7 +288,8 @@ function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas, hasSearchToo
 }
 
 const M365_MAX_TOOL_RESULT_LEN = 8000;
-const M365_MAX_FILE_CONTENT_LEN = 4000;
+const M365_MAX_FILE_CONTENT_LEN = 3000;
+const M365_MAX_SHELL_OUTPUT_LEN = 6000;
 
 function truncateToolResult(resultStr, maxLen = M365_MAX_TOOL_RESULT_LEN) {
   if (!resultStr || resultStr.length <= maxLen) return resultStr;
@@ -372,7 +373,14 @@ function flattenMessages(messages, toolCallMetaMap) {
       const result = extractContent(msg.content) || msg.content || "";
       const resultStr = typeof result === "string" ? result : JSON.stringify(result, null, 2);
       const kind = classifyToolName(tcName);
-      const truncated = kind === "fileOp" ? truncateFileContent(resultStr) : truncateToolResult(resultStr);
+      let truncated;
+      if (kind === "fileOp") {
+        truncated = truncateFileContent(resultStr);
+      } else if (tcName === "exec_command" || tcName === "Bash") {
+        truncated = truncateToolResult(resultStr, M365_MAX_SHELL_OUTPUT_LEN);
+      } else {
+        truncated = truncateToolResult(resultStr);
+      }
       console.log(`[M365-REQ-MSG] #${idx} role=TOOL toolName=${tcName} tcId=${tcId.slice(0,12)} resultLen=${truncated.length}`);
       parts.push(formatToolResult(tcName, truncated));
       continue;
@@ -388,28 +396,38 @@ function flattenMessages(messages, toolCallMetaMap) {
 
 function extractFilePathsFromCmd(cmd) {
   const paths = [];
-  const fileRe = /['"]?((?:\.?\/)?(?:src|lib|test|pkg|cmd|internal|app|config|public|scripts|docs|build|dist)\S*\.(?:java|py|js|ts|jsx|tsx|go|rs|rb|php|c|cpp|h|cs|swift|kt|scala|sh|yaml|yml|json|toml|xml|html|css|md|txt|properties|conf|cfg|ini|env|sql))['"]?/gi;
+  const seen = new Set();
+  const fileExtRe = /\.(?:java|py|js|ts|jsx|tsx|go|rs|rb|php|c|cpp|h|cs|swift|kt|scala|sh|yaml|yml|json|toml|xml|html|css|md|txt|properties|conf|cfg|ini|env|sql|gradle|makefile|dockerfile|lock)\b/i;
+  const pathRe = /['"]?((?:\.?\/)?(?:\w[\w.-]*\/)+\w[\w.-]*\.\w{1,10})['"]?/g;
   let m;
-  while ((m = fileRe.exec(cmd)) !== null) {
-    paths.push(m[1].replace(/['"]/g, ""));
-  }
-  const sedCatRe = /(?:sed|cat|head|tail|less|more)\s+(?:-[a-zA-Z]+\s+)*['"]?((?:\.?\/)?\S+\.\w+)['"]?/gi;
-  while ((m = sedCatRe.exec(cmd)) !== null) {
-    const p = m[1].replace(/['"]/g, "").replace(/\|.*$/, "").trim();
-    if (p && !paths.includes(p) && /\.\w{1,10}$/.test(p)) paths.push(p);
-  }
-  const grepRe = /(?:grep|rg|ag|ack)\s+.*?\s+['"]?((?:\.?\/)?\S+)['"]?/gi;
-  while ((m = grepRe.exec(cmd)) !== null) {
-    const p = m[1].replace(/['"]/g, "").replace(/\|.*$/, "").trim();
-    if (p && /\.\w{1,10}$/.test(p) && !paths.includes(p)) paths.push(p);
+  while ((m = pathRe.exec(cmd)) !== null) {
+    const p = m[1].replace(/['"]/g, "");
+    if (fileExtRe.test(p) && !seen.has(p)) {
+      seen.add(p);
+      paths.push(p);
+    }
   }
   return paths;
 }
 
+function isFileReadingCmd(cmd) {
+  if (!cmd) return false;
+  const c = cmd.trim().toLowerCase();
+  return /^\s*(sed\s+-n|cat\s|head\s|tail\s|less\s|more\s)/.test(c) ||
+         /^\s*(cat|head|tail|less|more)\s/.test(c);
+}
+
+function getFileReadingTarget(cmd) {
+  const paths = extractFilePathsFromCmd(cmd);
+  return paths.length > 0 ? paths[0] : null;
+}
+
 function buildEarlierContext(messages, stopIndex, toolCallMetaMap) {
-  if (stopIndex <= 0) return "";
+  if (stopIndex <= 0) return { text: "", filesReadCount: 0, lastReadFile: "" };
   const prevCmds = [];
   const filesInContext = new Set();
+  let filesReadCount = 0;
+  let lastReadFile = "";
   for (let k = 0; k < stopIndex; k++) {
     const msg = messages[k];
     const role = msg.role || "";
@@ -425,6 +443,11 @@ function buildEarlierContext(messages, stopIndex, toolCallMetaMap) {
             prevCmds.push(cmd);
             const fps = extractFilePathsFromCmd(cmd);
             for (const fp of fps) filesInContext.add(fp);
+            if (isFileReadingCmd(cmd)) {
+              filesReadCount++;
+              const target = getFileReadingTarget(cmd);
+              if (target) lastReadFile = target;
+            }
           }
         } catch {}
       }
@@ -436,7 +459,7 @@ function buildEarlierContext(messages, stopIndex, toolCallMetaMap) {
   }
   const parts = [];
   const lastCmd = prevCmds.length > 0 ? prevCmds[prevCmds.length - 1] : "";
-  if (lastCmd) parts.push(`Previous command: ${lastCmd}`);
+  if (lastCmd) parts.push(`Previous command: ${lastCmd.slice(0, 200)}`);
   if (prevCmds.length > 1) {
     parts.push(`Commands executed so far: ${prevCmds.length}`);
   }
@@ -459,7 +482,11 @@ function buildEarlierContext(messages, stopIndex, toolCallMetaMap) {
   if (searchPatterns.size > 0) {
     parts.push(`Search patterns already queried: ${[...searchPatterns].slice(0, 10).join(", ")}. Do NOT repeat the same search.`);
   }
-  return parts.length > 0 ? `[Context]: ${parts.join(". ")}` : "";
+  if (filesReadCount >= 3) {
+    parts.push(`WARNING: You have already read ${filesReadCount} files. If you are about to read a file you have already read, STOP and summarize what you know instead.`);
+  }
+  const text = parts.length > 0 ? `[Context]: ${parts.join(". ")}` : "";
+  return { text, filesReadCount, lastReadFile };
 }
 
 function detectUserLanguage(messages) {
@@ -494,9 +521,9 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
     if (!text) return null;
     const hasEarlierToolResults = messages.slice(0, -1).some(m => m.role === ROLE.TOOL);
     if (hasEarlierToolResults) {
-      const earlierContext = buildEarlierContext(messages, messages.length - 1, toolCallMetaMap);
-      const result = [earlierContext, `[User]: ${text}`, langHint || ""].filter(Boolean).join("\n\n");
-      console.log(`[M365-REQ-EXTRACT] USER with earlier context: earlierCtx=${!!earlierContext} result_len=${result.length}`);
+      const ctx = buildEarlierContext(messages, messages.length - 1, toolCallMetaMap);
+      const result = [ctx.text, `[User]: ${text}`, langHint || ""].filter(Boolean).join("\n\n");
+      console.log(`[M365-REQ-EXTRACT] USER with earlier context: earlierCtx=${!!ctx.text} result_len=${result.length}`);
       return result;
     }
     return langHint ? `[User]: ${text}\n\n${langHint}` : `[User]: ${text}`;
@@ -527,7 +554,14 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
       const result = extractContent(messages[i].content) || messages[i].content || "";
       const resultStr = typeof result === "string" ? result : JSON.stringify(result, null, 2);
       const kind = classifyToolName(tcName);
-      const truncated = kind === "fileOp" ? truncateFileContent(resultStr) : truncateToolResult(resultStr);
+      let truncated;
+      if (kind === "fileOp") {
+        truncated = truncateFileContent(resultStr);
+      } else if (tcName === "exec_command" || tcName === "Bash") {
+        truncated = truncateToolResult(resultStr, M365_MAX_SHELL_OUTPUT_LEN);
+      } else {
+        truncated = truncateToolResult(resultStr);
+      }
       console.log(`[M365-REQ-EXTRACT] tool_result #${messages.length - 1 - i} toolName=${tcName} tcId=${tcId.slice(0,12)} resultLen=${truncated.length} preview=${truncated.slice(0,80).replace(/\n/g,"\\n")}`);
       resultParts.unshift(formatToolResult(tcName, truncated));
       i--;
@@ -572,23 +606,35 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
     }
 
     const combinedResults = resultParts.join("\n");
-    const earlierContext = buildEarlierContext(messages, i, toolCallMetaMap);
+    const ctx = buildEarlierContext(messages, i, toolCallMetaMap);
+    const totalCommands = ctx.filesReadCount > 0 ? (ctx.text.match(/Commands executed so far: (\d+)/)?.[1] || "0") : "0";
+    const totalCmdNum = parseInt(totalCommands, 10);
 
-    console.log(`[M365-REQ-EXTRACT] tool_result_count=${toolResultCount} earlierContext=${earlierContext?"yes":"no"} combinedResultsLen=${combinedResults.length}`);
+    console.log(`[M365-REQ-EXTRACT] tool_result_count=${toolResultCount} earlierContext=${!!ctx.text} combinedResultsLen=${combinedResults.length} filesReadCount=${ctx.filesReadCount} totalCommands=${totalCmdNum} lastReadFile=${ctx.lastReadFile}`);
 
-    const noReReadHint = earlierContext.includes("Files already read")
-      ? "Do NOT re-read files listed as 'already read' above — their content is already available. Use a different command or proceed to the next step."
-      : "";
-    const result = [
-      earlierContext,
-      `[User]: Here is the result of the previous step:`,
-      combinedResults,
-      `Analyze the output above. If the user asked to see file content, include the relevant content in your response. If another step is needed, output a JSON instruction using this schema:`,
-      schemaHint,
-      noReReadHint,
-      `If the task is fully complete, provide a brief summary including any key content the user asked to see. Otherwise, continue with the next JSON instruction.`,
-      langHint || "",
-    ].filter(Boolean).join("\n\n");
+    const forceSummarize = totalCmdNum >= 15;
+    const result = forceSummarize
+      ? [
+          ctx.text,
+          `[User]: Here is the result of the previous step:`,
+          combinedResults,
+          `You have executed ${totalCmdNum} commands so far. This is the FINAL step. Do NOT output any more JSON instructions. Instead, provide a comprehensive summary of everything you found, including all key content the user asked to see.`,
+          langHint || "",
+        ].filter(Boolean).join("\n\n")
+      : [
+          ctx.text,
+          `[User]: Here is the result of the previous step:`,
+          combinedResults,
+          `Analyze the output above. If the user asked to see file content, include the relevant content in your response. If another step is needed, output a JSON instruction using this schema:`,
+          schemaHint,
+          ctx.filesReadCount >= 5
+            ? `IMPORTANT: You have already read ${ctx.filesReadCount} files. Do NOT re-read any file already listed above. Use a different approach or summarize what you know.`
+            : ctx.text.includes("Files already read")
+              ? "Do NOT re-read files listed as 'already read' above. Use a different command or proceed to the next step."
+              : "",
+          `If the task is fully complete, provide a brief summary including any key content the user asked to see. Otherwise, continue with the next JSON instruction.`,
+          langHint || "",
+        ].filter(Boolean).join("\n\n");
 
     console.log(`[M365-REQ-EXTRACT] final_extracted_len=${result.length}`);
     return result;
@@ -598,12 +644,36 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
   return null;
 }
 
+function extractHistoricalToolCallSignatures(messages) {
+  const signatures = new Set();
+  for (const msg of messages) {
+    if (msg.role !== ROLE.ASSISTANT || !msg.tool_calls) continue;
+    for (const tc of msg.tool_calls) {
+      const name = tc.function?.name || "";
+      const args = tc.function?.arguments || "";
+      try {
+        const parsed = typeof args === "string" ? JSON.parse(args) : args;
+        const cmd = parsed.command || parsed.cmd || parsed.code || parsed.run || "";
+        if (cmd) {
+          signatures.add(`${name}::${cmd}`);
+        } else {
+          signatures.add(`${name}::${JSON.stringify(parsed)}`);
+        }
+      } catch {
+        signatures.add(`${name}::${args}`);
+      }
+    }
+  }
+  return signatures;
+}
+
 function openaiToM365CopilotRequest(model, body, stream, credentials) {
   const tools = body.tools;
   const messages = body.messages || [];
 
   const toolCallMetaMap = new Map();
   const toolMeta = buildToolMeta(tools);
+  const historicalToolCallSignatures = extractHistoricalToolCallSignatures(messages);
 
   const lastMsgRole = messages.length > 0 ? messages[messages.length - 1].role : "";
   const hasToolResults = lastMsgRole === ROLE.TOOL;
@@ -684,6 +754,7 @@ function openaiToM365CopilotRequest(model, body, stream, credentials) {
       shellToolSchemas: toolMeta?.shellToolSchemas || {},
       searchToolNames: toolMeta?.searchToolNames || [],
       fileOpToolNames: toolMeta?.fileOpToolNames || [],
+      historicalToolCallSignatures,
     },
     stream,
   };

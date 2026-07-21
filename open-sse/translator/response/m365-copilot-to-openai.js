@@ -353,6 +353,19 @@ function buildToolCallResults(toolCalls, textBuffer, chunk, hasToolMeta, choice,
   return results;
 }
 
+function computeToolCallSignature(tc) {
+  const name = tc.function?.name || "";
+  const args = tc.function?.arguments || "";
+  try {
+    const parsed = typeof args === "string" ? JSON.parse(args) : args;
+    const cmd = parsed.command || parsed.cmd || parsed.code || parsed.run || "";
+    if (cmd) return `${name}::${cmd}`;
+    return `${name}::${JSON.stringify(parsed)}`;
+  } catch {
+    return `${name}::${args}`;
+  }
+}
+
 function m365CopilotToOpenAIResponse(chunk, state) {
   if (!chunk || !chunk.choices || !chunk.choices[0]) return [chunk];
 
@@ -410,7 +423,67 @@ function m365CopilotToOpenAIResponse(chunk, state) {
         console.log(`[M365-RESP-TRANSLATE] all calls passed destructive guardrail`);
       }
 
+      const historicalSigs = state._m365ToolMeta?.historicalToolCallSignatures;
+      if (historicalSigs && historicalSigs.size > 0) {
+        const uniqueCalls = safeCalls.filter(tc => {
+          const sig = computeToolCallSignature(tc);
+          const isDuplicate = historicalSigs.has(sig);
+          if (isDuplicate) {
+            const cmd = sig.split("::").slice(1).join("::").slice(0, 80);
+            console.log(`[M365-RESP-TRANSLATE] DUPLICATE tool_call blocked: ${cmd}`);
+          }
+          return !isDuplicate;
+        });
+        const dupCount = safeCalls.length - uniqueCalls.length;
+        if (dupCount > 0) {
+          console.log(`[M365-RESP-TRANSLATE] BLOCKED ${dupCount} duplicate tool_call(s), passing ${uniqueCalls.length} unique call(s)`);
+          if (uniqueCalls.length === 0) {
+            console.log(`[M365-RESP-TRANSLATE] ALL calls were duplicates — returning text summary instead`);
+            const dupMsg = `The previous command was already executed with the same arguments. Based on the results already available, here is a summary of the findings so far. No further action is needed — please provide the user with a comprehensive answer.`;
+            state._m365TextBuffer = state._m365TextBuffer
+              ? `${state._m365TextBuffer}\n\n${dupMsg}`
+              : dupMsg;
+            return buildToolCallResults([], state._m365TextBuffer, chunk, hasToolMeta, choice, isRemote);
+          }
+          const dupMsg = `[LOOP-GUARD: ${dupCount} duplicate command(s) skipped — already executed earlier.]`;
+          state._m365TextBuffer = state._m365TextBuffer
+            ? `${state._m365TextBuffer}\n\n${dupMsg}`
+            : dupMsg;
+          return buildToolCallResults(uniqueCalls, state._m365TextBuffer, chunk, hasToolMeta, choice, isRemote);
+        }
+      }
+
       return buildToolCallResults(safeCalls, state._m365TextBuffer, chunk, hasToolMeta, choice, isRemote);
+    }
+
+    const historicalSigs2 = state._m365ToolMeta?.historicalToolCallSignatures;
+    if (historicalSigs2 && historicalSigs2.size > 0 && toolCalls.length > 0) {
+      const uniqueCalls = toolCalls.filter(tc => {
+        const sig = computeToolCallSignature(tc);
+        const isDuplicate = historicalSigs2.has(sig);
+        if (isDuplicate) {
+          const cmd = sig.split("::").slice(1).join("::").slice(0, 80);
+          console.log(`[M365-RESP-TRANSLATE] DUPLICATE tool_call blocked: ${cmd}`);
+        }
+        return !isDuplicate;
+      });
+      const dupCount = toolCalls.length - uniqueCalls.length;
+      if (dupCount > 0) {
+        console.log(`[M365-RESP-TRANSLATE] BLOCKED ${dupCount} duplicate tool_call(s), passing ${uniqueCalls.length} unique call(s)`);
+        if (uniqueCalls.length === 0) {
+          console.log(`[M365-RESP-TRANSLATE] ALL calls were duplicates — returning text summary instead`);
+          const dupMsg = `The previous command was already executed with the same arguments. Based on the results already available, here is a summary of the findings so far. No further action is needed — please provide the user with a comprehensive answer.`;
+          state._m365TextBuffer = state._m365TextBuffer
+            ? `${state._m365TextBuffer}\n\n${dupMsg}`
+            : dupMsg;
+          return buildToolCallResults([], state._m365TextBuffer, chunk, hasToolMeta, choice, isRemote);
+        }
+        const dupMsg = `[LOOP-GUARD: ${dupCount} duplicate command(s) skipped — already executed earlier.]`;
+        state._m365TextBuffer = state._m365TextBuffer
+          ? `${state._m365TextBuffer}\n\n${dupMsg}`
+          : dupMsg;
+        return buildToolCallResults(uniqueCalls, state._m365TextBuffer, chunk, hasToolMeta, choice, isRemote);
+      }
     }
 
     return buildToolCallResults(toolCalls, state._m365TextBuffer, chunk, hasToolMeta, choice, isRemote);
