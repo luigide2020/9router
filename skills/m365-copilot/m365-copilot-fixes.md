@@ -262,6 +262,37 @@ Added `extractHistoricalToolCallSignatures(messages)` which scans all ASSISTANT 
 
 ---
 
+## Fix38: Scope Constraint — Prevent M365 from Expanding Task Scope
+
+**File**: `openai-to-m365-copilot.js`
+
+**Root cause**: When user asks to "read one file", M365 reads that file plus all its dependencies, related files, and follow-up files — expanding from 1 command to 9+ commands. Example: user asked to view `FeedbackStreaming.scala`, M365 also read `AppConfig.scala`, `RedisHelper.scala`, `RedisSink.scala`, `ctrFeedbackStreaming.scala`, `ColdFeedbackStatic.scala`, `ColdFeedbackStreaming.scala`, `cvrFeedbackStreaming.scala`, `FeedbackTaobaoStreaming.scala`.
+
+**Fix**: Added scope constraint in 3 prompt paths:
+1. `buildAntiExecutionPrompt()` — "Do ONLY what the user explicitly asks. Do NOT expand scope — if the user asks to read one file, read only that file; do NOT read related files, dependencies, or follow-up files unless the user asks."
+2. `extractLatestUserInput()` TOOL branch — "do NOT expand scope or read additional files unless asked"
+3. Reminder path — same constraint
+
+**Before**: "Read FeedbackStreaming.scala" → 9 commands, 8 unrelated files read
+**After**: "Read DynamicBidStatic.scala" → 2 commands (file + truncated tail), no scope expansion ✅
+
+---
+
+## Fix39 (Known Issue): sanitizeForM365 Corrupts Code Content
+
+**Status**: NOT YET FIXED — documented for awareness
+
+**Root cause**: `sanitizeForM365()` replaces dangerous words (`format`, `kill`, `delete`, `rm`, etc.) with `[cmdN]` placeholders in instruction text. But these words also appear in code content (e.g., `java.time.format.DateTimeFormatter`, `String.format()`, `kill -0 $PID` in health checks). The skip logic only protects `[Output (...)]` and `[File content (...)]` blocks. Code in USER messages, ASSISTANT text, and `[System]` blocks is NOT protected.
+
+**Impact**: M365 sees `java.time.[cmd1].DateTimeFormatter` and "corrects" it to `java.time.format.DateTimeFormatter`, or suggests fixes for code that was already correct.
+
+**Potential fix directions**:
+1. Only sanitize words at **command position** (line start, after `;` or `&&`, in verb position)
+2. Skip code blocks (text between triple-backticks, indented blocks)
+3. Build a standalone Agent that controls the full pipeline — no need for sanitize at all (dangerous command check only on the `cmd` field of tool_calls)
+
+---
+
 ## Workflow Rule: Verify Before Push
 
 **Rule**: After implementing fixes, do NOT `git commit` or `git push` automatically. Wait for the user to verify the changes (docker build, deploy, test) before committing and pushing. Only push after explicit user confirmation.
@@ -289,6 +320,7 @@ Added `extractHistoricalToolCallSignatures(messages)` which scans all ASSISTANT 
 | Shorter file content truncation (3000/6000) | Verified (Fix35) |
 | forceSummarize at ≥15 commands | Verified (Fix36) — M365 returned text summary, 0 tool_calls |
 | Response-side loop guard (duplicate blocking) | Verified (Fix34 Layer 3) — no duplicates in tested session; mechanism active |
+| Scope constraint (Fix38) | Verified — "read one file" → only that file read, no expansion |
 
 ## Known Limitations
 
@@ -299,3 +331,5 @@ Added `extractHistoricalToolCallSignatures(messages)` which scans all ASSISTANT 
 5. **docker cp doesn't work for Next.js standalone** — must modify compiled chunks in `.next/server/chunks/216.js` or `docker build`.
 6. **Text-based hints ("do NOT re-read") are unreliable** — M365 ignores them. Structural defenses (loop guard, forceSummarize) are the primary defense.
 7. **Loop guard uses `name::cmd` signature** — if M365 reformulates the same command with different wording, it won't be caught. This is by design (same tool + different args = allowed).
+8. **sanitizeForM365 corrupts code content** — `format`/`kill`/`delete` in code identifiers get replaced with `[cmdN]`, causing M365 to suggest "fixes" for already-correct code. See Fix39 for details and potential solutions.
+9. **M365 502 errors** — M365 Copilot upstream can return 502 Bad Gateway intermittently, requiring client retries. Observed 5 consecutive 502s before success.
