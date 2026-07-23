@@ -84,7 +84,6 @@ Pre-translate hooks that compress `tool_result` content in-place to cut tokens. 
 
 ## Conventions & gotchas
 
-- **Do NOT `git commit` or `git push` until the user explicitly confirms verification is complete.** Implement changes, let the user test (e.g. docker build + deploy), then commit/push only after approval.
 - Plain JavaScript (ESM), no TypeScript. `@/*` path alias → `src/*` (`jsconfig.json`).
 - `custom-server.js` wraps the Next standalone server to derive client IP from the TCP socket and strip attacker-controlled `X-Forwarded-For` — trusting forwarding headers only from a loopback reverse proxy. Preserve this when touching request/IP/rate-limit code.
 - Security-sensitive env: `JWT_SECRET` (session cookie), `INITIAL_PASSWORD` (default `123456` — must override), `API_KEY_SECRET`, `MACHINE_ID_SALT`. Full env contract in `.env.example` and ARCHITECTURE.md's env matrix.

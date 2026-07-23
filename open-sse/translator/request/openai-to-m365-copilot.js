@@ -268,11 +268,14 @@ function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas, hasSearchToo
     ].join("\n");
   }
 
+  const scopeConstraint = "Do ONLY what the user explicitly asks. Do NOT expand scope — if the user asks to read one file, read only that file; do NOT read related files, dependencies, or follow-up files unless the user asks.";
+
   if (hasSearchTools) {
     return [
       destructiveBlock,
       "You are assisting a user who has a command-line interface. For any action the user requests (checking, searching, reading, listing, etc.), always output a JSON instruction using this schema, and the user will handle the execution:",
       schemaInstr,
+      scopeConstraint,
       langHint,
       "Use plain text only for explanations or summaries when no action is needed.",
     ].filter(Boolean).join(" ");
@@ -282,6 +285,7 @@ function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas, hasSearchToo
     destructiveBlock,
     "You are assisting a user who has a command-line interface. For any action the user requests, always output a JSON instruction using this schema, and the user will handle the execution:",
     schemaInstr,
+    scopeConstraint,
     langHint,
     "Use plain text only for explanations or summaries when no action is needed.",
   ].filter(Boolean).join(" ");
@@ -625,7 +629,7 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
           ctx.text,
           `[User]: Here is the result of the previous step:`,
           combinedResults,
-          `Analyze the output above. If the user asked to see file content, include the relevant content in your response. If another step is needed, output a JSON instruction using this schema:`,
+          `Analyze the output above. If the user asked to see file content, include the relevant content in your response. Do ONLY what the user explicitly asks — do NOT expand scope or read additional files unless asked. If another step is needed, output a JSON instruction using this schema:`,
           schemaHint,
           ctx.filesReadCount >= 5
             ? `IMPORTANT: You have already read ${ctx.filesReadCount} files. Do NOT re-read any file already listed above. Use a different approach or summarize what you know.`
@@ -713,6 +717,7 @@ function openaiToM365CopilotRequest(model, body, stream, credentials) {
       const langFooter = langHint ? `\n${langHint}` : "";
       const reminder = [
         `You provided a JSON instruction in the previous step and here is the result.`,
+        `Do ONLY what the user explicitly asks — do NOT expand scope or read additional files unless the user asks.`,
         `If another step is needed, output a JSON instruction using this schema — the user will handle execution:`,
         antiExecPrompt,
         langFooter,
