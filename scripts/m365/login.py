@@ -341,6 +341,24 @@ def main():
         page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(2000)
 
+        # Check if page actually loaded (network failure detection)
+        current_url = page.url
+        if current_url.startswith("about:blank") or "error" in current_url.lower() or "unreachable" in current_url.lower():
+            print(f"[ERROR] 页面未正常加载，当前URL: {current_url}")
+            print("[INFO] 可能是网络不可达，关闭浏览器退出")
+            ctx.close()
+            sys.exit(1)
+
+        # Verify page content is M365 (not a browser error page)
+        try:
+            page_title = page.title()
+            if not page_title or "error" in page_title.lower() or "unreachable" in page_title.lower():
+                print(f"[ERROR] 页面标题异常: {page_title}")
+                ctx.close()
+                sys.exit(1)
+        except Exception:
+            pass
+
         if not args.sniff_only:
             if is_logged_in(page):
                 print("[LOGIN] ✅ 已有登录态")
@@ -354,9 +372,13 @@ def main():
                 break
             print(f"\n========== 第 {i}/{args.attempts} 轮：reload → 等聊天框 → 点历史 → 敲字 → 等 WS ==========")
             try:
-                page.reload(wait_until="domcontentloaded")
+                page.reload(wait_until="domcontentloaded", timeout=60000)
             except Exception as e:
                 print(f"[WARN] reload 失败: {e}")
+                if "net::" in str(e).lower() or "timeout" in str(e).lower() or "err_" in str(e).lower():
+                    print(f"[ERROR] 网络不可达，终止重试")
+                    break
+                continue
             try:
                 page.wait_for_selector(
                     'div[contenteditable="true"], textarea, [role="textbox"]',
@@ -364,6 +386,14 @@ def main():
                 )
                 print("[INFO] ✅ 聊天框已出现")
             except PwTimeout:
+                # Check if page is a network error
+                try:
+                    body_text = page.locator("body").inner_text(timeout=3000)
+                    if any(kw in body_text.lower() for kw in ["err_internet", "net::", "can't reach", "refused", "timed out"]):
+                        print(f"[ERROR] 网络错误页面，终止重试: {body_text[:100]}")
+                        break
+                except Exception:
+                    pass
                 print(f"[WARN] 聊天框30s未出现，当前URL: {page.url}")
                 continue
             click_history_and_type(page)
