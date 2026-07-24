@@ -170,7 +170,16 @@ def do_login(page, email, password):
     except PwTimeout:
         pass
     # Wait for chat page to load (login success)
-    page.wait_for_url("**m365.cloud.microsoft/**", timeout=30000)
+    for _ in range(6):
+        if 'm365.cloud.microsoft' in page.url:
+            break
+        try:
+            page.wait_for_url("**m365.cloud.microsoft/**", timeout=10000)
+            break
+        except PwTimeout:
+            page.wait_for_timeout(2000)
+    else:
+        print(f"[LOGIN] ⚠️ wait_for_url 超时，当前URL: {page.url}")
     print("[LOGIN] ✅ 登录成功")
 
 
@@ -267,7 +276,32 @@ def main():
         ws.on("framesent", scan)
         ws.on("framereceived", scan)
 
-    def type_one_char(page):
+    def click_history_and_type(page):
+        history_selectors = [
+            'nav a[href^="/chat/"]:not([href="/chat/all"]):not([href="/chat/"])',
+            'a[href^="/chat/"]:not([href="/chat/all"]):not([href="/chat/"])',
+            '[role="listbox"] [role="option"]',
+            'nav button[aria-label*="聊天"]',
+            'nav button[aria-label*="Chat"]',
+        ]
+        for sel in history_selectors:
+            try:
+                items = page.locator(sel).all()
+                if len(items) == 0:
+                    continue
+                idx = min(1, len(items) - 1)
+                items[idx].click(timeout=5000, force=True)
+                print(f"[INFO] ✅ 点击了第 {idx+1} 个历史聊天 (selector={sel}, total={len(items)})")
+                page.wait_for_timeout(3000)
+                break
+            except Exception as e:
+                print(f"[INFO] selector={sel} 失败: {e}")
+                continue
+        else:
+            print("[INFO] 没找到历史聊天，尝试直接输入")
+
+        import random, string
+        word = ''.join(random.choices(string.ascii_lowercase, k=5))
         for sel in ['div[contenteditable="true"]', 'textarea', '[role="textbox"]']:
             try:
                 box = page.locator(sel).last
@@ -277,8 +311,8 @@ def main():
                     box.press("Delete")
                 except Exception:
                     pass
-                box.type("h", delay=120)
-                print(f"[INFO] ✅ 已在 {sel} 输入一个字符")
+                box.type(word, delay=120)
+                print(f"[INFO] ✅ 已在 {sel} 输入: {word}")
                 return True
             except Exception:
                 continue
@@ -288,12 +322,21 @@ def main():
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             USER_DATA_DIR, headless=args.headless,
-            args=["--disable-blink-features=AutomationControlled"])
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=AutomationControlled",
+            ],
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+        )
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
-        # ★★★ 核心修正：websocket 监听挂在 page 上，不是 ctx ★★★
         page.on("websocket", on_ws)
-        ctx.on("page", lambda pg: pg.on("websocket", on_ws))  # 新标签页也覆盖
+        ctx.on("page", lambda pg: pg.on("websocket", on_ws))
+
+        try:
+            page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        except Exception:
+            pass
 
         page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(2000)
@@ -309,13 +352,21 @@ def main():
         for i in range(1, args.attempts + 1):
             if target["token"]:
                 break
-            print(f"\n========== 第 {i}/{args.attempts} 轮：reload → 敲字 → 等 WS ==========")
+            print(f"\n========== 第 {i}/{args.attempts} 轮：reload → 等聊天框 → 点历史 → 敲字 → 等 WS ==========")
             try:
                 page.reload(wait_until="domcontentloaded")
             except Exception as e:
                 print(f"[WARN] reload 失败: {e}")
-            page.wait_for_timeout(4000)
-            type_one_char(page)
+            try:
+                page.wait_for_selector(
+                    'div[contenteditable="true"], textarea, [role="textbox"]',
+                    timeout=30000,
+                )
+                print("[INFO] ✅ 聊天框已出现")
+            except PwTimeout:
+                print(f"[WARN] 聊天框30s未出现，当前URL: {page.url}")
+                continue
+            click_history_and_type(page)
             deadline = time.time() + args.wait
             while target["token"] is None and time.time() < deadline:
                 page.wait_for_timeout(1000)

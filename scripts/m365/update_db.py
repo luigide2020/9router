@@ -65,6 +65,12 @@ def main():
     data_obj = {"apiKey": token, "testStatus": "active"}
     if exp := iso_from_ts(claims.get("exp")):
         data_obj["expiresAt"] = exp
+    clear_error_fields = {
+        "lastError": None,
+        "lastErrorAt": None,
+        "errorCode": None,
+        "backoffLevel": None,
+    }
 
     try:
         with sqlite3.connect(str(db_path), timeout=10) as conn:
@@ -77,6 +83,9 @@ def main():
                 row_id, raw_data = row
                 existing = json.loads(raw_data) if raw_data else {}
                 existing.update(data_obj)
+                existing.update(clear_error_fields)
+                for key in [k for k in existing if k.startswith("modelLock_")]:
+                    del existing[key]
                 conn.execute(
                     "UPDATE providerConnections SET data = ?, updatedAt = ?, isActive = 1 WHERE id = ?",
                     (json.dumps(existing), now, row_id),
