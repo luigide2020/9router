@@ -426,13 +426,13 @@ function getFileReadingTarget(cmd) {
   return paths.length > 0 ? paths[0] : null;
 }
 
-function buildEarlierContext(messages, stopIndex, toolCallMetaMap) {
-  if (stopIndex <= 0) return { text: "", filesReadCount: 0, lastReadFile: "" };
+function buildEarlierContext(messages, stopIndex, toolCallMetaMap, startScanIdx = 0) {
+  if (stopIndex <= 0) return { text: "", textWithoutPrevCmd: "", filesReadCount: 0, lastReadFile: "" };
   const prevCmds = [];
   const filesInContext = new Set();
   let filesReadCount = 0;
   let lastReadFile = "";
-  for (let k = 0; k < stopIndex; k++) {
+  for (let k = startScanIdx; k < stopIndex; k++) {
     const msg = messages[k];
     const role = msg.role || "";
     if (role === ROLE.ASSISTANT && msg.tool_calls) {
@@ -490,7 +490,11 @@ function buildEarlierContext(messages, stopIndex, toolCallMetaMap) {
     parts.push(`WARNING: You have already read ${filesReadCount} files. If you are about to read a file you have already read, STOP and summarize what you know instead.`);
   }
   const text = parts.length > 0 ? `[Context]: ${parts.join(". ")}` : "";
-  return { text, filesReadCount, lastReadFile };
+  const partsWithoutPrevCmd = parts.filter(p => !p.startsWith("Previous command:"));
+  const textWithoutPrevCmd = partsWithoutPrevCmd.length > 0
+    ? `[Context]: ${partsWithoutPrevCmd.join(". ")}`
+    : "";
+  return { text, textWithoutPrevCmd, filesReadCount, lastReadFile };
 }
 
 function detectUserLanguage(messages) {
@@ -523,13 +527,6 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
     const text = extractContent(lastMsg.content);
     console.log(`[M365-REQ-EXTRACT] lastMsg=USER textLen=${(text||"").length} → direct user prompt`);
     if (!text) return null;
-    const hasEarlierToolResults = messages.slice(0, -1).some(m => m.role === ROLE.TOOL);
-    if (hasEarlierToolResults) {
-      const ctx = buildEarlierContext(messages, messages.length - 1, toolCallMetaMap);
-      const result = [ctx.text, `[User]: ${text}`, langHint || ""].filter(Boolean).join("\n\n");
-      console.log(`[M365-REQ-EXTRACT] USER with earlier context: earlierCtx=${!!ctx.text} result_len=${result.length}`);
-      return result;
-    }
     return langHint ? `[User]: ${text}\n\n${langHint}` : `[User]: ${text}`;
   }
 
@@ -610,30 +607,34 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
     }
 
     const combinedResults = resultParts.join("\n");
-    const ctx = buildEarlierContext(messages, i, toolCallMetaMap);
-    const totalCommands = ctx.filesReadCount > 0 ? (ctx.text.match(/Commands executed so far: (\d+)/)?.[1] || "0") : "0";
+    const ctx = buildEarlierContext(messages, preScan + 1, toolCallMetaMap, i);
+    const totalCommands = ctx.text.match(/Commands executed so far: (\d+)/)?.[1] || "0";
     const totalCmdNum = parseInt(totalCommands, 10);
 
-    console.log(`[M365-REQ-EXTRACT] tool_result_count=${toolResultCount} earlierContext=${!!ctx.text} combinedResultsLen=${combinedResults.length} filesReadCount=${ctx.filesReadCount} totalCommands=${totalCmdNum} lastReadFile=${ctx.lastReadFile}`);
+    const userIntentTag = originalRequest ? `[User's question]: ${originalRequest}\n` : "";
+
+    console.log(`[M365-REQ-EXTRACT] tool_result_count=${toolResultCount} earlierContext=${!!ctx.textWithoutPrevCmd} combinedResultsLen=${combinedResults.length} filesReadCount=${ctx.filesReadCount} totalCommands=${totalCmdNum} lastReadFile=${ctx.lastReadFile}`);
 
     const forceSummarize = totalCmdNum >= 15;
     const result = forceSummarize
       ? [
-          ctx.text,
+          ctx.textWithoutPrevCmd,
+          userIntentTag,
           `[User]: Here is the result of the previous step:`,
           combinedResults,
           `You have executed ${totalCmdNum} commands so far. This is the FINAL step. Do NOT output any more JSON instructions. Instead, provide a comprehensive summary of everything you found, including all key content the user asked to see.`,
           langHint || "",
         ].filter(Boolean).join("\n\n")
       : [
-          ctx.text,
+          ctx.textWithoutPrevCmd,
+          userIntentTag,
           `[User]: Here is the result of the previous step:`,
           combinedResults,
-          `Analyze the output above. If the user asked to see file content, include the relevant content in your response. Do ONLY what the user explicitly asks — do NOT expand scope or read additional files unless asked. If another step is needed, output a JSON instruction using this schema:`,
+          `Analyze the output above in light of the user's question. If the user asked to see file content, include the relevant content in your response. Do ONLY what the user explicitly asks — do NOT expand scope or read additional files unless asked. If another step is needed, output a JSON instruction using this schema:`,
           schemaHint,
           ctx.filesReadCount >= 5
             ? `IMPORTANT: You have already read ${ctx.filesReadCount} files. Do NOT re-read any file already listed above. Use a different approach or summarize what you know.`
-            : ctx.text.includes("Files already read")
+            : ctx.textWithoutPrevCmd.includes("Files already read")
               ? "Do NOT re-read files listed as 'already read' above. Use a different command or proceed to the next step."
               : "",
           `If the task is fully complete, provide a brief summary including any key content the user asked to see. Otherwise, continue with the next JSON instruction.`,
@@ -650,7 +651,16 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
 
 function extractHistoricalToolCallSignatures(messages) {
   const signatures = new Set();
-  for (const msg of messages) {
+  let lastUserIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === ROLE.USER) {
+      lastUserIdx = i;
+      break;
+    }
+  }
+  const startIdx = lastUserIdx >= 0 ? lastUserIdx : 0;
+  for (let i = startIdx; i < messages.length; i++) {
+    const msg = messages[i];
     if (msg.role !== ROLE.ASSISTANT || !msg.tool_calls) continue;
     for (const tc of msg.tool_calls) {
       const name = tc.function?.name || "";
