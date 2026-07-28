@@ -340,13 +340,14 @@ function buildToolCallResults(toolCalls, textBuffer, chunk, hasToolMeta, choice,
   }
 
   if (textBuffer) {
+    const cleaned = stripToolPatternsFromText(textBuffer);
     results.push({
       id: chunk.id,
       object: "chat.completion.chunk",
       created: chunk.created,
       model: chunk.model,
       system_fingerprint: null,
-      choices: [{ index: 0, delta: { content: textBuffer }, finish_reason: null, logprobs: null }],
+      choices: [{ index: 0, delta: { content: cleaned || textBuffer }, finish_reason: null, logprobs: null }],
     });
   }
   results.push(chunk);

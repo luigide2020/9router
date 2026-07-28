@@ -360,6 +360,10 @@ def main():
             pass
 
         if not args.sniff_only:
+            try:
+                page.wait_for_url("**/chat**", timeout=15000)
+            except PwTimeout:
+                pass
             if is_logged_in(page):
                 print("[LOGIN] ✅ 已有登录态")
             else:

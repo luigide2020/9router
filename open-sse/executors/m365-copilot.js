@@ -636,13 +636,12 @@ export class M365CopilotExecutor extends BaseExecutor {
     const conversationIdHash = createHash("sha256").update(conversationIdBase).digest("hex");
     let conversationId = `${conversationIdHash.slice(0,8)}-${conversationIdHash.slice(8,12)}-${conversationIdHash.slice(12,16)}-${conversationIdHash.slice(16,20)}-${conversationIdHash.slice(20,32)}`;
     
-    // When needsLocalExec, use a fresh conversationId per request to prevent M365
-    // from inheriting CI (Code Interpreter) context from previous rounds where it
-    // may have auto-executed commands in its sandbox.
+    // Use STABLE conversationId to give M365 conversation memory, so it
+    // remembers previous commands/results and does not repeat them.
+    // Previously used FRESH to prevent CI context inheritance, but now
+    // disableCodeInterpreter=true removes CI flags, making FRESH unnecessary.
     if (toolMeta.needsLocalExec) {
-      const nonce = randomUUID();
-      conversationId = `${nonce.slice(0,8)}-${nonce.slice(9,13)}-${nonce.slice(14,18)}-${nonce.slice(19,23)}-${nonce.slice(24,36)}`;
-      console.log(`[M365-EXEC-CID] strategy=FRESH(needsLocalExec) conversationId=${conversationId}`);
+      console.log(`[M365-EXEC-CID] strategy=STABLE(disableCodeInterpreter=true) conversationId=${conversationId}`);
     } else {
       console.log(`[M365-EXEC-CID] strategy=STABLE conversationId=${conversationId}`);
     }
@@ -652,12 +651,9 @@ export class M365CopilotExecutor extends BaseExecutor {
     let sessionIdUuid = `${sessionIdHash.slice(0,8)}-${sessionIdHash.slice(8,12)}-${sessionIdHash.slice(12,16)}-${sessionIdHash.slice(16,20)}-${sessionIdHash.slice(20,32)}`;
     let sessionIdHex = sessionIdHash.slice(0, 32);
     
-    // When needsLocalExec, use fresh sessionId per request to avoid CI context inheritance
+    // Use STABLE sessionId aligned with STABLE conversationId strategy.
     if (toolMeta.needsLocalExec) {
-      const sn = randomUUID();
-      sessionIdUuid = sn;
-      sessionIdHex = sn.replace(/-/g, "").slice(0, 32);
-      console.log(`[M365-EXEC-SID] strategy=FRESH(needsLocalExec) sessionId=${sessionIdUuid}`);
+      console.log(`[M365-EXEC-SID] strategy=STABLE(disableCodeInterpreter=true) sessionId=${sessionIdUuid}`);
     } else {
       console.log(`[M365-EXEC-SID] strategy=STABLE sessionId=${sessionIdUuid}`);
     }
@@ -817,7 +813,7 @@ export class M365CopilotExecutor extends BaseExecutor {
     // "copilot" (auto) means let M365 decide the model
     const modelId = model === "copilot" ? null : model;
     const m365Flags = {
-      disableCodeInterpreter: false,
+      disableCodeInterpreter: !!toolMeta?.needsLocalExec,
       enableSearch: true,
     };
     console.log(`[M365-EXEC-FLAGS] disableCodeInterpreter=${m365Flags.disableCodeInterpreter} enableSearch=${m365Flags.enableSearch} experienceType=Default tone=${enableReasoning ? "Reasoning" : "Balanced"}`);
