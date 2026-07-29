@@ -813,7 +813,7 @@ export class M365CopilotExecutor extends BaseExecutor {
     // "copilot" (auto) means let M365 decide the model
     const modelId = model === "copilot" ? null : model;
     const m365Flags = {
-      disableCodeInterpreter: !!toolMeta?.needsLocalExec,
+      disableCodeInterpreter: false,
       enableSearch: true,
     };
     console.log(`[M365-EXEC-FLAGS] disableCodeInterpreter=${m365Flags.disableCodeInterpreter} enableSearch=${m365Flags.enableSearch} experienceType=Default tone=${enableReasoning ? "Reasoning" : "Balanced"}`);
