@@ -37,33 +37,6 @@ const COMMON_COMMANDS_RE = /\b(ls|pwd|cat|find|grep|head|tail|wc|echo|mkdir|rm|c
 
 const COMMAND_INTENT_RE = /\b(run|execute|try|type|enter|issue|invoke)\s+(this\s+)?(command|the\s+following|it|now)|^CMD:/im;
 
-const DESTRUCTIVE_COMMAND_PATTERNS = [
-  /^\s*rm\s+(-[rRfF]+\s+|--recursive|--force)\s*\S/im,
-  /^\s*rm\s+\S.*\S\s*$/im,
-  /^\s*rmdir\b/im,
-  /^\s*del\b\s+/im,
-  /^\s*shred\b/im,
-  /^\s*format\s+\/dev\//im,
-  /^\s*erase\b/im,
-  /^\s*truncate\s+-s/im,
-  /^\s*chmod\s+(0+[0-7]*|000|777)\b/im,
-  /^\s*kill\s+(-9\s+)?\d+/im,
-  /^\s*killall\b/im,
-  /^\s*dd\s+if=.*of=\/dev\//im,
-  /^\s*mv\s+.*\s+\/dev\/null/im,
-  /^\s*.{0,20}>\s*\/dev\/(sd[a-z]|hd[a-z]|nvme|loop|ram|md|dm-|sdx)/im,
-];
-
-function isDestructiveCommand(cmd) {
-  const c = cmd.trim();
-  if (!c) return false;
-  const lines = c.split(/\n/);
-  const commandLines = lines.filter(line => {
-    const trimmed = line.trim();
-    return trimmed && !trimmed.startsWith("#");
-  });
-  return commandLines.some(line => DESTRUCTIVE_COMMAND_PATTERNS.some(p => p.test(line)));
-}
 
 function isRemoteExecutionResult(text) {
   return REMOTE_EXEC_INDICATORS.some(re => re.test(text));
@@ -395,95 +368,70 @@ function m365CopilotToOpenAIResponse(chunk, state) {
     const toolCalls = extractToolCallsFromText(state._m365TextBuffer, state._m365ToolMeta);
     console.log(`[M365-RESP-TRANSLATE] extracted toolCalls=${toolCalls.length}, names=[${toolCalls.map(tc => tc.function.name).join(",")}]`);
     const isRemote = isRemoteExecutionResult(state._m365TextBuffer);
-    const isGpt56 = state.model && (state.model === "gpt-5.6" || state.model.toLowerCase().includes("gpt-5.6"));
 
-    if (isGpt56 && toolCalls.length > 0) {
-      console.log(`[M365-RESP-TRANSLATE] gpt-5.6 destructive guardrail active`);
-      const safeCalls = toolCalls.filter(tc => {
-        try {
-          const args = typeof tc.function.arguments === "string" ? JSON.parse(tc.function.arguments) : tc.function.arguments;
-          const cmd = args?.cmd || args?.command || args?.code || args?.run || JSON.stringify(args);
-          const isDestructive = isDestructiveCommand(cmd);
-          console.log(`[M365-RESP-TRANSLATE] destructive-check cmd="${cmd.slice(0,80)}" isDestructive=${isDestructive}`);
-          if (isDestructive) return false;
-        } catch { /* passthrough */ }
+    const historicalCounts = state._m365ToolMeta?.historicalToolCallCounts;
+    const LOOP_THRESHOLD = 5;
+    if (toolCalls.length > 1 || (historicalCounts && historicalCounts.size > 0 && toolCalls.length > 0)) {
+      const seen = new Set();
+      const dedupedCalls = toolCalls.filter(tc => {
+        const sig = computeToolCallSignature(tc);
+        if (seen.has(sig)) {
+          const cmd = sig.split("::").slice(1).join("::").slice(0, 80);
+          console.log(`[M365-RESP-TRANSLATE] INTRA-TURN duplicate blocked: ${cmd}`);
+          return false;
+        }
+        seen.add(sig);
         return true;
       });
-
-      const blockedCount = toolCalls.length - safeCalls.length;
-      if (blockedCount > 0) {
-        const blockedNames = toolCalls.filter(tc => !safeCalls.includes(tc)).map(tc => {
-          try { const a = JSON.parse(tc.function.arguments); return `${tc.function.name}(${a?.cmd || a?.command || "?"})`; } catch { return tc.function.name; }
-        });
-        console.log(`[M365-RESP-TRANSLATE] BLOCKED ${blockedCount} destructive call(s): ${JSON.stringify(blockedNames)}`);
-        const blockedMsg = `[SAFETY: ${blockedCount} potentially harmful command(s) blocked by guardrail.]`;
-        state._m365TextBuffer = state._m365TextBuffer
-          ? `${state._m365TextBuffer}\n\n${blockedMsg}`
-          : blockedMsg;
-      } else {
-        console.log(`[M365-RESP-TRANSLATE] all calls passed destructive guardrail`);
-      }
-
-      const historicalSigs = state._m365ToolMeta?.historicalToolCallSignatures;
-      if (historicalSigs && historicalSigs.size > 0) {
-        const uniqueCalls = safeCalls.filter(tc => {
-          const sig = computeToolCallSignature(tc);
-          const isDuplicate = historicalSigs.has(sig);
-          if (isDuplicate) {
-            const cmd = sig.split("::").slice(1).join("::").slice(0, 80);
-            console.log(`[M365-RESP-TRANSLATE] DUPLICATE tool_call blocked: ${cmd}`);
-          }
-          return !isDuplicate;
-        });
-        const dupCount = safeCalls.length - uniqueCalls.length;
-        if (dupCount > 0) {
-          console.log(`[M365-RESP-TRANSLATE] BLOCKED ${dupCount} duplicate tool_call(s), passing ${uniqueCalls.length} unique call(s)`);
-          if (uniqueCalls.length === 0) {
-            console.log(`[M365-RESP-TRANSLATE] ALL calls were duplicates — returning text summary instead`);
-            const dupMsg = `The previous command was already executed with the same arguments. Based on the results already available, here is a summary of the findings so far. No further action is needed — please provide the user with a comprehensive answer.`;
-            state._m365TextBuffer = state._m365TextBuffer
-              ? `${state._m365TextBuffer}\n\n${dupMsg}`
-              : dupMsg;
-            return buildToolCallResults([], state._m365TextBuffer, chunk, hasToolMeta, choice, isRemote);
-          }
-          const dupMsg = `[LOOP-GUARD: ${dupCount} duplicate command(s) skipped — already executed earlier.]`;
-          state._m365TextBuffer = state._m365TextBuffer
-            ? `${state._m365TextBuffer}\n\n${dupMsg}`
-            : dupMsg;
-          return buildToolCallResults(uniqueCalls, state._m365TextBuffer, chunk, hasToolMeta, choice, isRemote);
-        }
-      }
-
-      return buildToolCallResults(safeCalls, state._m365TextBuffer, chunk, hasToolMeta, choice, isRemote);
-    }
-
-    const historicalSigs2 = state._m365ToolMeta?.historicalToolCallSignatures;
-    if (historicalSigs2 && historicalSigs2.size > 0 && toolCalls.length > 0) {
-      const uniqueCalls = toolCalls.filter(tc => {
-        const sig = computeToolCallSignature(tc);
-        const isDuplicate = historicalSigs2.has(sig);
-        if (isDuplicate) {
-          const cmd = sig.split("::").slice(1).join("::").slice(0, 80);
-          console.log(`[M365-RESP-TRANSLATE] DUPLICATE tool_call blocked: ${cmd}`);
-        }
-        return !isDuplicate;
-      });
-      const dupCount = toolCalls.length - uniqueCalls.length;
-      if (dupCount > 0) {
-        console.log(`[M365-RESP-TRANSLATE] BLOCKED ${dupCount} duplicate tool_call(s), passing ${uniqueCalls.length} unique call(s)`);
-        if (uniqueCalls.length === 0) {
-          console.log(`[M365-RESP-TRANSLATE] ALL calls were duplicates — returning text summary instead`);
-          const dupMsg = `The previous command was already executed with the same arguments. Based on the results already available, here is a summary of the findings so far. No further action is needed — please provide the user with a comprehensive answer.`;
-          state._m365TextBuffer = state._m365TextBuffer
-            ? `${state._m365TextBuffer}\n\n${dupMsg}`
-            : dupMsg;
-          return buildToolCallResults([], state._m365TextBuffer, chunk, hasToolMeta, choice, isRemote);
-        }
-        const dupMsg = `[LOOP-GUARD: ${dupCount} duplicate command(s) skipped — already executed earlier.]`;
+      const intraDupCount = toolCalls.length - dedupedCalls.length;
+      if (intraDupCount > 0) {
+        console.log(`[M365-RESP-TRANSLATE] BLOCKED ${intraDupCount} intra-turn duplicate(s), passing ${dedupedCalls.length} unique call(s)`);
+        const dupMsg = `[LOOP-GUARD: ${intraDupCount} duplicate command(s) skipped within this response.]`;
         state._m365TextBuffer = state._m365TextBuffer
           ? `${state._m365TextBuffer}\n\n${dupMsg}`
           : dupMsg;
-        return buildToolCallResults(uniqueCalls, state._m365TextBuffer, chunk, hasToolMeta, choice, isRemote);
+      }
+
+      if (historicalCounts && historicalCounts.size > 0) {
+        const loopingCalls = [];
+        const okCalls = [];
+        for (const tc of dedupedCalls) {
+          const sig = computeToolCallSignature(tc);
+          const histCount = historicalCounts.get(sig) || 0;
+          if (histCount >= LOOP_THRESHOLD) {
+            loopingCalls.push(tc);
+          } else {
+            okCalls.push(tc);
+          }
+        }
+
+        if (loopingCalls.length > 0) {
+          const loopNames = loopingCalls.map(tc => {
+            const sig = computeToolCallSignature(tc);
+            const histCount = historicalCounts.get(sig) || 0;
+            return `${sig.split("::").slice(1).join("::").slice(0, 60)}(x${histCount})`;
+          });
+          console.log(`[M365-RESP-TRANSLATE] LOOP DETECTED: ${loopingCalls.length} call(s) executed >=${LOOP_THRESHOLD} times historically: ${JSON.stringify(loopNames)} — blocking these`);
+          const loopMsg = `[LOOP-GUARD: ${loopingCalls.length} command(s) blocked — already executed ${LOOP_THRESHOLD}+ times: ${loopNames.join("; ")}]`;
+          state._m365TextBuffer = state._m365TextBuffer
+            ? `${state._m365TextBuffer}\n\n${loopMsg}`
+            : loopMsg;
+        }
+
+        if (okCalls.length === 0 && dedupedCalls.length > 0) {
+          console.log(`[M365-RESP-TRANSLATE] ALL calls are looping (>=${LOOP_THRESHOLD}x) — returning summary instead`);
+          const summaryMsg = `All commands have already been executed ${LOOP_THRESHOLD}+ times. Preventing infinite loop — providing summary instead.`;
+          state._m365TextBuffer = state._m365TextBuffer
+            ? `${state._m365TextBuffer}\n\n${summaryMsg}`
+            : summaryMsg;
+          return buildToolCallResults([], state._m365TextBuffer, chunk, hasToolMeta, choice, isRemote);
+        }
+
+        return buildToolCallResults(okCalls.length > 0 ? okCalls : dedupedCalls, state._m365TextBuffer, chunk, hasToolMeta, choice, isRemote);
+      }
+
+      if (intraDupCount > 0) {
+        return buildToolCallResults(dedupedCalls, state._m365TextBuffer, chunk, hasToolMeta, choice, isRemote);
       }
     }
 

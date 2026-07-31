@@ -81,19 +81,50 @@ const SHELL_TOOL_NAMES = [
 4. Also replaces `M365_JAILBREAK_PHRASES` → `[note]`
 5. File content, package names, command output inside output blocks are never corrupted
 
-## Tool Result Truncation
+## Loop Guard (Response-Side)
+
+**Fix43 rewrite** — count-based historical detection replaces the old Set-based exact-match detection.
+
+### Intra-turn dedup
+- Within a single M365 response, identical `name::cmd` signatures are deduped
+- Only active when `toolCalls.length > 1`
+
+### Cross-turn count-based detection
+- `buildHistoricalToolCallCounts(messages)` → `Map<signature, count>` (replaces old `extractHistoricalToolCallSignatures` Set)
+- Stored in `_m365ToolMeta.historicalToolCallCounts`
+- `LOOP_THRESHOLD = 5`: commands executed ≥5 times in history → **BLOCKED** (true loop)
+- Commands executed <5 times → **ALLOWED** (normal re-execution: read→modify→read)
+- Same tool + different arguments → **ALLOWED** (different files/different context)
+- When all calls are looping (≥5x): return text summary instead of tool_calls
+
+### apply_patch failure detection (Fix44)
+- `patchFailCount` tracked during tool_result scanning
+- Matches: `apply_patch` + (`verification failed` or `Failed to find expected lines`)
+- `patchFailCount >= 3` → triggers `forceSummarize` with message: "do NOT use apply_patch again, provide manual code changes"
+- Coexists with `totalCommands >= 15` forceSummarize condition
+
+## WS Connect Retry (Fix45)
+
+- M365 executor retries WS connection up to 2 additional times (3 total, 3s delay) for transient errors
+- Transient errors: TLS/socket/ECONNRESET/ECONNREFUSED/ETIMEDOUT (regex match on error message)
+- Non-transient errors (HTTP 4xx) fail immediately without retry
+- `ERROR_RULES` now includes 502/503/504 status rules + TLS/socket text rules, all with 5s cooldown (was 30s default)
+
+## conversationId Strategy (Fix46)
+
+- Per-conversation isolation: conversationId includes `sha256(firstUserMessage[:120])[:16]`
+- Same conversation across turns → same first USER message → same conversationId (STABLE)
+- Different conversation → different first USER message → different conversationId (context isolation)
+- sessionId aligned with conversationId (same hash included)
+- Prevents cross-topic context pollution in M365 server-side conversation history
 
 - `M365_MAX_TOOL_RESULT_LEN = 8000` characters
 - `truncateToolResult()` truncates at line boundary, appends `... [N more characters omitted]`
 - Applied in: `extractLatestUserInput()` TOOL branch, `flattenMessages()` TOOL role, `buildToolResultPrompt()`
 
-## Destructive Guardrail (gpt-5.6)
+## Destructive Guardrail
 
-- `DESTRUCTIVE_COMMAND_PATTERNS` use **line-anchored** regex with `^` + `m` flag
-- Only matches commands at **line start** (not embedded in file content, `perl -e` scripts, etc.)
-- `/\bformat\b/i` → `/^\s*format\s+\/dev\//im` — only matches disk formatting, not package names
-- `isDestructiveCommand()` checks each line independently (splits by `\n`, skips comments)
-- When blocked: tool_call is removed, `[SAFETY: N potentially harmful command(s) blocked]` appended
+**REMOVED in Fix42**. The gpt-5.6-specific destructive guardrail (`DESTRUCTIVE_COMMAND_PATTERNS` + `isDestructiveCommand()`) was removed due to high false-positive rate blocking legitimate code modification commands. Request-side `sanitizeForM365()` provides equivalent protection by removing dangerous words from the prompt before M365 sees them.
 
 ## Request Routing Decision Tree
 

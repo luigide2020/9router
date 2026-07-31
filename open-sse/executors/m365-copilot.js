@@ -616,19 +616,36 @@ export class M365CopilotExecutor extends BaseExecutor {
     // Use session manager for stable conversation/session IDs (enables multi-turn tool calling)
     const connectionId = credentials?.connectionId || credentials?.email || `${oid}@${tid}`;
     
+    // Derive a per-conversation discriminator from the first USER message.
+    // Same conversation = same first USER message = same conversationId (multi-turn STABLE).
+    // Different conversation = different first USER message = different conversationId (context isolation).
+    const messages = body?.messages || [];
+    let firstUserFingerprint = "";
+    for (const m of messages) {
+      if (m.role === "user") {
+        const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content || "");
+        firstUserFingerprint = text.slice(0, 120);
+        break;
+      }
+    }
+    
     // Generate stable conversationId for multi-turn dialogue
     const conversationIdBase = resolveSessionId({
       headers: credentials?.rawHeaders,
       body,
-      connectionId,
+      connectionId: firstUserFingerprint
+        ? `${connectionId}:conv:${createHash("sha256").update(firstUserFingerprint).digest("hex").slice(0, 16)}`
+        : connectionId,
       scope: "m365-copilot"
     });
     
-    // Generate stable sessionId
+    // Generate stable sessionId aligned with conversationId
     const sessionIdBase = resolveSessionId({
       headers: credentials?.rawHeaders,
       body,
-      connectionId: `${connectionId}:session`,
+      connectionId: firstUserFingerprint
+        ? `${connectionId}:conv:${createHash("sha256").update(firstUserFingerprint).digest("hex").slice(0, 16)}:session`
+        : `${connectionId}:session`,
       scope: "m365-copilot-session"
     });
     
@@ -687,57 +704,81 @@ export class M365CopilotExecutor extends BaseExecutor {
     }
     log?.info?.("M365-COPILOT", `Connecting WebSocket: oid=${oid.slice(0, 8)}..., tid=${tid.slice(0, 8)}..., model=${model}, prompt_len=${userPrompt.length}`);
 
-    // Open WebSocket connection
+    // Open WebSocket connection (with retry for transient TLS/network errors)
     const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+    const WS_CONNECT_RETRIES = 2;
+    const WS_CONNECT_RETRY_DELAY_MS = 3000;
     let ws;
+    let lastConnectError = null;
 
-    try {
-      const wsHeaders = {
-        "User-Agent": M365_USER_AGENT,
-        "Origin": "https://m365.cloud.microsoft",
-        "Sec-Fetch-Dest": "websocket",
-        "Sec-Fetch-Mode": "websocket",
-        "Sec-Fetch-Site": "cross-site",
-      };
-      const wsOpts = { headers: wsHeaders };
-
-      if (proxyUrl) {
-        log?.info?.("M365-COPILOT", `Using HTTP proxy: ${proxyUrl}`);
-        wsOpts.agent = new HttpsProxyAgent(proxyUrl);
+    for (let attempt = 0; attempt <= WS_CONNECT_RETRIES; attempt++) {
+      if (attempt > 0) {
+        log?.warn?.("M365-COPILOT", `WS connect retry ${attempt}/${WS_CONNECT_RETRIES} after ${WS_CONNECT_RETRY_DELAY_MS / 1000}s`);
+        await new Promise(r => setTimeout(r, WS_CONNECT_RETRY_DELAY_MS));
       }
 
-      ws = new WsClient(wsUrl, [], wsOpts);
-    } catch (err) {
-      log?.error?.("M365-COPILOT", `WebSocket connect failed: ${err.message}`);
-      return this._errorResponse(`M365 Copilot connection failed: ${err.message}`, 502, "upstream_error");
+      try {
+        const wsHeaders = {
+          "User-Agent": M365_USER_AGENT,
+          "Origin": "https://m365.cloud.microsoft",
+          "Sec-Fetch-Dest": "websocket",
+          "Sec-Fetch-Mode": "websocket",
+          "Sec-Fetch-Site": "cross-site",
+        };
+        const wsOpts = { headers: wsHeaders };
+
+        if (proxyUrl) {
+          if (attempt === 0) log?.info?.("M365-COPILOT", `Using HTTP proxy: ${proxyUrl}`);
+          wsOpts.agent = new HttpsProxyAgent(proxyUrl);
+        }
+
+        ws = new WsClient(wsUrl, [], wsOpts);
+      } catch (err) {
+        lastConnectError = err.message;
+        log?.error?.("M365-COPILOT", `WebSocket construct failed (attempt ${attempt + 1}): ${err.message}`);
+        continue;
+      }
+
+      // Wait for WebSocket open
+      const connectError = await new Promise((resolvePromise) => {
+        const timer = setTimeout(() => {
+          try { ws.close(); } catch {}
+          resolvePromise("WebSocket connection timed out");
+        }, WS_CONNECT_TIMEOUT_MS);
+        ws.on("open", () => { clearTimeout(timer); resolvePromise(null); });
+        ws.on("unexpected-response", (req, res) => {
+          clearTimeout(timer);
+          const hdrs = {};
+          for (const [k, v] of Object.entries(res.headers || {})) {
+            if (k.startsWith('x-')) hdrs[k] = v;
+          }
+          let body = '';
+          res.on('data', (c) => { body += c; });
+          res.on('end', () => resolvePromise(`HTTP ${res.statusCode}: ${JSON.stringify(hdrs)}, body=${body.slice(0, 200)}`));
+        });
+        ws.on("error", (err) => {
+          clearTimeout(timer);
+          resolvePromise(`WebSocket error: ${err.message || err}`);
+        });
+      });
+
+      if (!connectError) {
+        lastConnectError = null;
+        break;
+      }
+
+      lastConnectError = connectError;
+      const isTransient = /tls|socket disconnected|network socket|ECONNRESET|ECONNREFUSED|ETIMEDOUT/i.test(connectError);
+      log?.error?.("M365-COPILOT", `WebSocket connect failed (attempt ${attempt + 1}): ${connectError} (transient=${isTransient})`);
+
+      if (!isTransient) break;
+
+      try { ws.close(); } catch {}
     }
 
-    // Wait for WebSocket open
-    const connectError = await new Promise((resolvePromise) => {
-      const timer = setTimeout(() => {
-        try { ws.close(); } catch {}
-        resolvePromise("WebSocket connection timed out");
-      }, WS_CONNECT_TIMEOUT_MS);
-      ws.on("open", () => { clearTimeout(timer); resolvePromise(null); });
-      ws.on("unexpected-response", (req, res) => {
-        clearTimeout(timer);
-        const hdrs = {};
-        for (const [k, v] of Object.entries(res.headers || {})) {
-          if (k.startsWith('x-')) hdrs[k] = v;
-        }
-        let body = '';
-        res.on('data', (c) => { body += c; });
-        res.on('end', () => resolvePromise(`HTTP ${res.statusCode}: ${JSON.stringify(hdrs)}, body=${body.slice(0, 200)}`));
-      });
-      ws.on("error", (err) => {
-        clearTimeout(timer);
-        resolvePromise(`WebSocket error: ${err.message || err}`);
-      });
-    });
-
-    if (connectError) {
-      log?.error?.("M365-COPILOT", `WebSocket connect failed: ${connectError}`);
-      return this._errorResponse(`M365 Copilot connection failed: ${connectError}`, 502, "upstream_error");
+    if (lastConnectError) {
+      log?.error?.("M365-COPILOT", `WebSocket connect failed after ${WS_CONNECT_RETRIES + 1} attempts: ${lastConnectError}`);
+      return this._errorResponse(`M365 Copilot connection failed: ${lastConnectError}`, 502, "upstream_error");
     }
 
     log?.info?.("M365-COPILOT", `WS readyState=${ws.readyState}, sending SignalR handshake`);

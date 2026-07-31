@@ -293,6 +293,71 @@ Added `extractHistoricalToolCallSignatures(messages)` which scans all ASSISTANT 
 
 ---
 
+## Fix42: Remove gpt-5.6 Destructive Guardrail
+
+**File**: `m365-copilot-to-openai.js`
+
+**Root cause**: The gpt-5.6-specific destructive guardrail (`DESTRUCTIVE_COMMAND_PATTERNS` + `isDestructiveCommand()`) was only active for `isGpt56` models and had high false-positive rate — legitimate code modification commands (`sed -i`, `cat >`, `tee`, `chmod`, etc.) were blocked, showing `[SAFETY: N potentially harmful command(s) blocked by guardrail.]`. User asking M365 to "modify code" would see commands blocked repeatedly.
+
+**Why removal is safe**:
+1. Request-side `sanitizeForM365()` already removes dangerous words from the prompt → M365 won't output truly destructive commands
+2. Security policy should not be model-specific (only gpt-5.6 had this check)
+3. The guardrail was causing more harm (blocking legitimate work) than good (catching actual destructive commands that sanitizeForM365 already prevents)
+
+**Change**: Removed `DESTRUCTIVE_COMMAND_PATTERNS`, `isDestructiveCommand()`, and the entire `isGpt56` guardrail block from response translator.
+
+---
+
+## Fix43: Loop Guard Rewrite — Count-Based Historical Detection + Intra-Turn Dedup
+
+**Files**: `openai-to-m365-copilot.js`, `m365-copilot-to-openai.js`
+
+**Root cause**: The original Fix34 loop guard used a **Set** of historical signatures — any command that appeared once in history was blocked as a duplicate. This caused false positives:
+- M365 reads a file → modifies it → reads it again to confirm changes = normal workflow, but blocked as "duplicate"
+- `cat file.py` executed once in history, then M365 outputs `cat file.py` again = blocked with "The previous command was already executed with the same arguments"
+- The all-duplicates fallback returned a dead-end message preventing any further progress
+
+**Fix** (two-layer, count-based):
+
+### Layer 1: Intra-turn dedup (response-side)
+- Within a single M365 response, if two tool_calls have identical `name::cmd` signatures, the duplicate is blocked
+- Only applies when `toolCalls.length > 1` (single-command responses are never deduped)
+
+### Layer 2: Cross-turn count-based loop detection (response-side)
+- `buildHistoricalToolCallCounts(messages)` — replaces old `extractHistoricalToolCallSignatures()` (Set → Map counting occurrences)
+- Each signature maps to its historical execution count
+- **Threshold**: `LOOP_THRESHOLD = 5` — a command is only blocked if it has been executed ≥5 times historically
+- Same tool + same arguments ≥5x → **BLOCKED** (true loop)
+- Same tool + same arguments <5x → **ALLOWED** (normal re-execution like read→modify→read)
+- Same tool + different arguments → **ALLOWED** (different files/different context)
+- Different tool → **ALLOWED**
+
+**Actions**:
+- All calls ≥5x → return text summary (prevents infinite loop, same as original Fix34)
+- Some calls ≥5x, some <5x → block only the looping calls, pass the rest
+- All calls <5x → pass all through
+
+**Before**: `cat file.py` ×1 in history → blocked ("already executed with the same arguments")
+**After**: `cat file.py` ×1-4 in history → allowed; `sed -n '1,240p' AbstractAlgorithm.java` ×702 → blocked at ≥5 ✅
+
+---
+
+## Fix44: apply_patch Failure Detection + forceSummarize
+
+**File**: `openai-to-m365-copilot.js`
+
+**Root cause**: M365 uses `apply_patch` (Codex CLI's built-in patching command) to modify files. When the patch content doesn't match the actual file (e.g., `sanitizeForM365()` corrupted the content, or Codex sandbox file differs from local), `apply_patch` fails with "verification failed: Failed to find expected lines". M365 keeps retrying with similar (but slightly different) patches — 24 consecutive failures observed. Since each patch has a different signature (different content), the loop guard in Fix43 cannot detect this pattern.
+
+**Fix**: Added `patchFailCount` tracking in tool_result scanning:
+1. During `extractLatestUserInput()` TOOL branch, count tool_results containing `apply_patch` + `verification failed` or `Failed to find expected lines`
+2. When `patchFailCount >= 3`, trigger `forceSummarize` (same mechanism as ≥15 commands)
+3. Force summary message tells M365: "apply_patch has failed N times — do NOT use apply_patch again. Instead, provide the user with the exact code changes they should make manually (show old lines and new lines)."
+
+**Before**: `apply_patch` ×24 failures, M365 keeps retrying indefinitely
+**After**: After 3 failures, M365 is forced to output manual code changes instead of retrying apply_patch ✅
+
+---
+
 ## Workflow Rule: Verify Before Push
 
 **Rule**: After implementing fixes, do NOT `git commit` or `git push` automatically. Wait for the user to verify the changes (docker build, deploy, test) before committing and pushing. Only push after explicit user confirmation.
@@ -313,14 +378,48 @@ Added `extractHistoricalToolCallSignatures(messages)` which scans all ASSISTANT 
 | File content in summary | Verified (Fix28) |
 | No remote execution on tool_result rounds | Verified (Deep+Precise+random CID) |
 | Large file content not mis-sanitized | Verified (Fix30) |
-| Destructive guardrail no false positives | Verified (Fix29) |
 | Large file output truncated for M365 | Verified (Fix31) |
 | Default experienceType + Reasoning tone | Verified (Fix32) |
 | buildEarlierContext full history scan | Verified (Fix34) — `filesReadCount=6, totalCommands=15` in logs |
 | Shorter file content truncation (3000/6000) | Verified (Fix35) |
 | forceSummarize at ≥15 commands | Verified (Fix36) — M365 returned text summary, 0 tool_calls |
-| Response-side loop guard (duplicate blocking) | Verified (Fix34 Layer 3) — no duplicates in tested session; mechanism active |
 | Scope constraint (Fix38) | Verified — "read one file" → only that file read, no expansion |
+| Destructive guardrail removed (Fix42) | Pending verification — need to confirm no truly destructive commands leak through |
+| Count-based loop guard ≥5x (Fix43) | Pending verification — need to confirm read→modify→read works, and 702x loops are blocked |
+| apply_patch failure forceSummarize (Fix44) | Pending verification — need to confirm M365 switches to manual code changes after 3 failures |
+| WS connect retry + 502 short cooldown (Fix45) | Pending verification — TLS failures should auto-retry, lockout only 5s |
+| Per-conversation conversationId (Fix46) | Pending verification — different chats should get different M365 context |
+
+## Fix45: WS Connect Retry + 502 Short Cooldown
+
+**Files**: `m365-copilot.js`, `errorConfig.js`
+
+**Root cause**: TLS handshake failures (`Client network socket disconnected before secure TLS connection was established`) caused M365 executor to immediately return 502. With no retry, `markAccountUnavailable` locked the account for 30s (default `TRANSIENT_COOLDOWN_MS`). Client retries during lockout immediately hit 502 again, cascading for 20-30 seconds.
+
+**Fix**:
+1. M365 executor now retries WS connection up to 2 additional times (3 total attempts, 3s delay between retries) for transient errors (TLS/socket/ECONNRESET/ECONNREFUSED/ETIMEDOUT). Non-transient errors (HTTP 401/403) fail immediately without retry.
+2. `ERROR_RULES` now includes 502/503/504 status rules with `COOLDOWN.short` (5s instead of 30s default), plus text rules for `tls connection`, `socket disconnected`, `network socket` — also 5s.
+3. Effect: TLS blip → executor retries internally → success without any lockout. Even if all retries fail, lockout is only 5s.
+
+---
+
+## Fix46: Per-Conversation conversationId — Context Isolation
+
+**File**: `m365-copilot.js`
+
+**Root cause**: All conversations from the same user shared a single `conversationId` (derived from `connectionId`/email). M365 server maintains conversation history by conversationId, so previous topics' context (e.g., V38NewAlgorithm discussion) polluted new topics (getCvrFeedbackPartialResult question). User observed "new chat window works fine" because M365's server-side history was the only differentiator, but even new windows got the same conversationId.
+
+**Fix**: conversationId now includes a hash of the **first USER message** (first 120 chars):
+- Same conversation across tool_call turns: first USER message unchanged → same conversationId → STABLE (multi-turn memory preserved)
+- Different conversation: first USER message differs → different conversationId → context isolation (no cross-topic pollution)
+
+```
+old: conversationIdBase = resolveSessionId({ connectionId: email, ... })
+new: conversationIdBase = resolveSessionId({ connectionId: email + ":conv:" + sha256(firstUserMsg[:120])[:16], ... })
+```
+
+**Before**: All chats → same conversationId → M365 mixes contexts from different topics
+**After**: Each chat → unique conversationId → M365 only sees current topic's history ✅
 
 ## Known Limitations
 
@@ -330,6 +429,9 @@ Added `extractHistoricalToolCallSignatures(messages)` which scans all ASSISTANT 
 4. **M365 may give pure text instead of JSON tool_call** when it judges task complete — this is correct behavior, agent should handle `finish_reason=stop`.
 5. **docker cp doesn't work for Next.js standalone** — must modify compiled chunks in `.next/server/chunks/216.js` or `docker build`.
 6. **Text-based hints ("do NOT re-read") are unreliable** — M365 ignores them. Structural defenses (loop guard, forceSummarize) are the primary defense.
-7. **Loop guard uses `name::cmd` signature** — if M365 reformulates the same command with different wording, it won't be caught. This is by design (same tool + different args = allowed).
+7. **Loop guard uses `name::cmd` signature** — if M365 reformulates the same command with different wording, it won't be caught. This is by design (same tool + different args = allowed). Count-based detection (Fix43) raises the bar to ≥5 identical executions before blocking.
 8. **sanitizeForM365 corrupts code content** — `format`/`kill`/`delete` in code identifiers get replaced with `[cmdN]`, causing M365 to suggest "fixes" for already-correct code. See Fix39 for details and potential solutions.
-9. **M365 502 errors** — M365 Copilot upstream can return 502 Bad Gateway intermittently, requiring client retries. Observed 5 consecutive 502s before success.
+9. **M365 502 errors** — M365 Copilot upstream can return 502 Bad Gateway intermittently. Fix45 adds WS connect retry (3 attempts) and 5s cooldown for 502/503/504, reducing lockout from 30s to 5s.
+10. **`apply_patch` failures may recur** — Fix44 forces M365 to output manual code changes after 3 failures, but the root cause (patch content not matching actual file, possibly due to sanitizeForM365 corruption or Codex sandbox file differences) is not fixed. See Fix39.
+11. **STABLE conversationId memory unverified** — `isStartOfSession: true` + `invocationId: 0` sent every request may prevent M365 from using conversation memory. If STABLE doesn't work, count-based loop guard (Fix43, threshold=5) is the safety net. Fix46 isolates contexts per conversation to prevent cross-topic pollution regardless of whether M365 actually uses the memory.
+12. **conversationId based on first USER message** — If the same user sends identical first messages in separate chats (rare), they'll share a conversationId. This is acceptable: identical questions can share context.

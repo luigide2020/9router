@@ -66,6 +66,9 @@ export const ERROR_RULES = [
   { text: "quota exceeded",           backoff: true },
   { text: "capacity",                 backoff: true },
   { text: "overloaded",               backoff: true },
+  { text: "tls connection",           cooldownMs: COOLDOWN.short },
+  { text: "socket disconnected",      cooldownMs: COOLDOWN.short },
+  { text: "network socket",           cooldownMs: COOLDOWN.short },
 
   // --- Status-based rules (fallback when text doesn't match) ---
   { status: 401, cooldownMs: COOLDOWN.long },
@@ -73,6 +76,9 @@ export const ERROR_RULES = [
   { status: 403, cooldownMs: COOLDOWN.long },
   { status: 404, cooldownMs: COOLDOWN.long },
   { status: 429, backoff: true },
+  { status: 502, cooldownMs: COOLDOWN.short },
+  { status: 503, cooldownMs: COOLDOWN.short },
+  { status: 504, cooldownMs: COOLDOWN.short },
 ];
 
 // Backward compat: COOLDOWN_MS object (used by index.js re-export)

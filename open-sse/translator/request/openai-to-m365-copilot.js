@@ -549,11 +549,15 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
     }
 
     i = messages.length - 1;
+    let patchFailCount = 0;
     while (i >= 0 && messages[i].role === ROLE.TOOL) {
       const tcId = messages[i].tool_call_id || "";
       const tcName = toolCallMetaMap.get(tcId) || "unknown";
       const result = extractContent(messages[i].content) || messages[i].content || "";
       const resultStr = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+      if (resultStr.includes("apply_patch") && (resultStr.includes("verification failed") || resultStr.includes("Failed to find expected lines"))) {
+        patchFailCount++;
+      }
       const kind = classifyToolName(tcName);
       let truncated;
       if (kind === "fileOp") {
@@ -613,16 +617,19 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
 
     const userIntentTag = originalRequest ? `[User's question]: ${originalRequest}\n` : "";
 
-    console.log(`[M365-REQ-EXTRACT] tool_result_count=${toolResultCount} earlierContext=${!!ctx.textWithoutPrevCmd} combinedResultsLen=${combinedResults.length} filesReadCount=${ctx.filesReadCount} totalCommands=${totalCmdNum} lastReadFile=${ctx.lastReadFile}`);
+    console.log(`[M365-REQ-EXTRACT] tool_result_count=${toolResultCount} earlierContext=${!!ctx.textWithoutPrevCmd} combinedResultsLen=${combinedResults.length} filesReadCount=${ctx.filesReadCount} totalCommands=${totalCmdNum} lastReadFile=${ctx.lastReadFile} patchFailCount=${patchFailCount}`);
 
-    const forceSummarize = totalCmdNum >= 15;
+    const forceSummarize = totalCmdNum >= 15 || patchFailCount >= 3;
+    const forceSummaryReason = patchFailCount >= 3
+      ? `apply_patch has failed ${patchFailCount} times — the file content does not match what you expect. Do NOT use apply_patch again. Instead, provide the user with the exact code changes they should make manually (show the old lines and new lines).`
+      : `You have executed ${totalCmdNum} commands so far. This is the FINAL step. Do NOT output any more JSON instructions. Instead, provide a comprehensive summary of everything you found, including all key content the user asked to see.`;
     const result = forceSummarize
       ? [
           ctx.textWithoutPrevCmd,
           userIntentTag,
           `[User]: Here is the result of the previous step:`,
           combinedResults,
-          `You have executed ${totalCmdNum} commands so far. This is the FINAL step. Do NOT output any more JSON instructions. Instead, provide a comprehensive summary of everything you found, including all key content the user asked to see.`,
+          forceSummaryReason,
           langHint || "",
         ].filter(Boolean).join("\n\n")
       : [
@@ -649,8 +656,9 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
   return null;
 }
 
-function extractHistoricalToolCallSignatures(messages) {
-  const signatures = new Set();
+
+function buildHistoricalToolCallCounts(messages) {
+  const counts = new Map();
   let lastUserIdx = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i].role === ROLE.USER) {
@@ -665,20 +673,18 @@ function extractHistoricalToolCallSignatures(messages) {
     for (const tc of msg.tool_calls) {
       const name = tc.function?.name || "";
       const args = tc.function?.arguments || "";
+      let sig;
       try {
         const parsed = typeof args === "string" ? JSON.parse(args) : args;
         const cmd = parsed.command || parsed.cmd || parsed.code || parsed.run || "";
-        if (cmd) {
-          signatures.add(`${name}::${cmd}`);
-        } else {
-          signatures.add(`${name}::${JSON.stringify(parsed)}`);
-        }
+        sig = cmd ? `${name}::${cmd}` : `${name}::${JSON.stringify(parsed)}`;
       } catch {
-        signatures.add(`${name}::${args}`);
+        sig = `${name}::${args}`;
       }
+      counts.set(sig, (counts.get(sig) || 0) + 1);
     }
   }
-  return signatures;
+  return counts;
 }
 
 function openaiToM365CopilotRequest(model, body, stream, credentials) {
@@ -687,7 +693,7 @@ function openaiToM365CopilotRequest(model, body, stream, credentials) {
 
   const toolCallMetaMap = new Map();
   const toolMeta = buildToolMeta(tools);
-  const historicalToolCallSignatures = extractHistoricalToolCallSignatures(messages);
+  const historicalToolCallCounts = buildHistoricalToolCallCounts(messages);
 
   const lastMsgRole = messages.length > 0 ? messages[messages.length - 1].role : "";
   const hasToolResults = lastMsgRole === ROLE.TOOL;
@@ -769,7 +775,7 @@ function openaiToM365CopilotRequest(model, body, stream, credentials) {
       shellToolSchemas: toolMeta?.shellToolSchemas || {},
       searchToolNames: toolMeta?.searchToolNames || [],
       fileOpToolNames: toolMeta?.fileOpToolNames || [],
-      historicalToolCallSignatures,
+      historicalToolCallCounts,
     },
     stream,
   };
