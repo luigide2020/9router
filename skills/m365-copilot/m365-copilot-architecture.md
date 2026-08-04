@@ -125,5 +125,13 @@ Agent → OpenAI format request → 9router
 |------|------|
 | `open-sse/translator/request/openai-to-m365-copilot.js` | Request translator: routing, anti-exec, sanitize, language detect, earlierContext |
 | `open-sse/translator/response/m365-copilot-to-openai.js` | Response translator: tool_call extraction, remote exec detection |
-| `open-sse/executors/m365-copilot.js` | WebSocket executor, session management, Deep/Precise flags |
+| `open-sse/executors/m365-copilot.js` | WebSocket executor, session management, proxy (HTTPS_PROXY) |
+| `scripts/m365/login.py` | Playwright browser login, region check (TW only), uses M365_PROXY for Taiwan exit IP |
+| `scripts/m365/sync_remote.sh` | Token sync pipeline, passes M365_PROXY to login.py |
 | `open-sse/translator/formats.js` | `FORMATS.M365_COPILOT` format identifier |
+
+## Proxy Architecture
+
+- **WS chat** (executor): `HTTPS_PROXY || HTTP_PROXY` — same as all other providers. No M365-specific proxy needed.
+- **Login browser** (login.py): `M365_PROXY` (falls back to `HTTPS_PROXY`/`HTTP_PROXY`) — must route to Taiwan IP for region check. `ALLOWED_COUNTRY_CODES = {"TW"}`.
+- **sync_remote.sh**: Passes `M365_PROXY` env var + `--proxy` CLI arg to login.py.

@@ -16,20 +16,28 @@ except ImportError:
 CHAT_URL = "https://m365.cloud.microsoft/chat"
 
 # 允许执行的国家/地区代码
-ALLOWED_COUNTRY_CODES = {"CN", "HK", "MO", "TW"}
+ALLOWED_COUNTRY_CODES = {"TW"}
 
 
-def detect_region_by_ip():
+def detect_region_by_ip(proxy_url=None):
     """通过出口 IP 归属地检测网络区域（走 TUN/代理出口）"""
     apis = [
         ("http://ip-api.com/json/?fields=status,countryCode,country,query", "ip-api"),
         ("https://ipapi.co/json/", "ipapi.co"),
     ]
+    handler = None
+    if proxy_url:
+        print(f"[REGION] 使用代理检测出口 IP: {proxy_url}")
+        handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+        opener = urllib.request.build_opener(handler)
+    else:
+        opener = urllib.request.build_opener()
     for url, name in apis:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with opener.open(req, timeout=8) as resp:
                 data = json.loads(resp.read().decode())
+            print(f"[REGION] {name} 返回: {json.dumps(data, ensure_ascii=False)[:200]}")
             if name == "ip-api" and data.get("status") == "success":
                 return data.get("countryCode", ""), data.get("country", ""), data.get("query", "")
             if name == "ipapi.co" and "country_code" in data:
@@ -40,14 +48,14 @@ def detect_region_by_ip():
     return None, None, None
 
 
-def check_region_or_exit():
-    """区域预检：通过出口 IP 判断，仅允许 CN/HK/MO/TW"""
-    code, country, ip = detect_region_by_ip()
+def check_region_or_exit(proxy_url=None):
+    """区域预检：通过出口 IP 判断，仅允许 TW"""
+    code, country, ip = detect_region_by_ip(proxy_url)
     if code and code.upper() in ALLOWED_COUNTRY_CODES:
         print(f"[REGION] ✅ 出口 IP: {ip}，区域: {country}({code})，允许执行")
         return
     if code:
-        print(f"[REGION] ❌ 出口 IP: {ip}，区域: {country}({code})，不在允许列表 (CN/HK/MO/TW)，退出")
+        print(f"[REGION] ❌ 出口 IP: {ip}，区域: {country}({code})，不在允许列表 ({'/'.join(sorted(ALLOWED_COUNTRY_CODES))})，退出")
     else:
         print("[REGION] ❌ 无法检测出口 IP 归属地，退出")
     sys.exit(0)
@@ -192,10 +200,13 @@ def main():
     ap.add_argument("--close", action="store_true")
     ap.add_argument("--skip-region-check", action="store_true", help="跳过区域检测")
     ap.add_argument("--force-clear", action="store_true", help="强制清空浏览器缓存，清除旧登录态")
+    ap.add_argument("--proxy", type=str, help="指定代理地址 (例: http://127.0.0.1:7891)，覆盖 M365_PROXY/HTTPS_PROXY")
     args = ap.parse_args()
 
+    effective_proxy = args.proxy or os.environ.get("M365_PROXY", os.environ.get("HTTPS_PROXY", os.environ.get("HTTP_PROXY", "")))
+
     if not args.skip_region_check:
-        check_region_or_exit()
+        check_region_or_exit(effective_proxy or None)
 
     email = os.environ.get("M365_EMAIL", "")
     password = os.environ.get("M365_PASSWORD", "")
@@ -319,15 +330,21 @@ def main():
         print("[WARN] 没定位到输入框")
         return False
 
+    m365_proxy = effective_proxy
+    launch_kwargs = dict(
+        user_data_dir=USER_DATA_DIR, headless=args.headless,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=AutomationControlled",
+        ],
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+    )
+    if m365_proxy:
+        launch_kwargs["proxy"] = {"server": m365_proxy}
+        print(f"[PROXY] ✅ M365 Copilot 流量走代理: {m365_proxy}")
+
     with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(
-            USER_DATA_DIR, headless=args.headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=AutomationControlled",
-            ],
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-        )
+        ctx = p.chromium.launch_persistent_context(**launch_kwargs)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
         page.on("websocket", on_ws)

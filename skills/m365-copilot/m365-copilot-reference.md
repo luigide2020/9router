@@ -160,6 +160,12 @@ M365 may embed raw search result JSON in bot `text` field of type=2 messages. `i
 
 Always use provider prefix: `m365-copilot/gpt-5.6-sol`, not just `gpt-5.6`.
 
+## Proxy Configuration
+
+- **WS chat connections** (`m365-copilot.js`): Uses `HTTPS_PROXY || HTTP_PROXY` — same as all other providers. No M365-specific proxy.
+- **Login browser** (`login.py`): Uses `M365_PROXY` (falls back to `HTTPS_PROXY`/`HTTP_PROXY`) — Playwright browser traffic routes through this proxy so exit IP is in Taiwan. Region check (`ALLOWED_COUNTRY_CODES = {"TW"}`) validates exit IP before login proceeds.
+- **sync_remote.sh**: Passes `M365_PROXY` env var and `--proxy` CLI arg to `login.py`.
+
 ## Build & Deploy Notes
 
 - **Next.js standalone** runs compiled `.next/server/chunks/` — `docker cp` of source files does NOT take effect

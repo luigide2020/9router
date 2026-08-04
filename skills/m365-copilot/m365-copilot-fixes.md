@@ -389,6 +389,7 @@ Added `extractHistoricalToolCallSignatures(messages)` which scans all ASSISTANT 
 | apply_patch failure forceSummarize (Fix44) | Pending verification — need to confirm M365 switches to manual code changes after 3 failures |
 | WS connect retry + 502 short cooldown (Fix45) | Pending verification — TLS failures should auto-retry, lockout only 5s |
 | Per-conversation conversationId (Fix46) | Pending verification — different chats should get different M365 context |
+| M365 proxy for login only, WS uses HTTPS_PROXY (Fix47) | Pending verification — WS chat through general proxy, login through TW proxy |
 
 ## Fix45: WS Connect Retry + 502 Short Cooldown
 
@@ -420,6 +421,26 @@ new: conversationIdBase = resolveSessionId({ connectionId: email + ":conv:" + sh
 
 **Before**: All chats → same conversationId → M365 mixes contexts from different topics
 **After**: Each chat → unique conversationId → M365 only sees current topic's history ✅
+
+## Fix47: M365 Proxy — Login/Sync Only, WS Chat Uses General Proxy
+
+**Files**: `m365-copilot.js`, `login.py`, `sync_remote.sh`, `docker-compose.yml`, `.env.example`
+
+**Root cause**: M365 Copilot Chat requires a Taiwan/US exit IP for availability. Previously `M365_PROXY` was added as a dedicated proxy for both WS chat connections AND login browser, routing all M365 traffic through a Taiwan node. After testing, WS chat connections work fine through the general proxy (`HTTPS_PROXY`) — only the Playwright browser login needs the Taiwan exit IP to pass the region check.
+
+**Fix**:
+1. Removed `M365_PROXY` priority from `m365-copilot.js` WS connection logic — reverts to `HTTPS_PROXY || HTTP_PROXY` only (same as all other providers)
+2. Removed 3 `[M365-PROXY]` debug console.log lines from `m365-copilot.js`
+3. Removed `M365_PROXY` from `docker-compose.yml` and `.env.example`
+4. Kept `M365_PROXY` in `login.py` — Playwright browser uses it for region check (exit IP must be TW) and for browser traffic
+5. Kept `M365_PROXY` in `sync_remote.sh` — passes it to login.py via env var and `--proxy` CLI arg
+6. Fixed `sync_remote.sh` `--proxy` argument parsing bug: `for` loop + `shift` caused argument misalignment → changed to `while/case` pattern
+7. `login.py` `ALLOWED_COUNTRY_CODES` tightened from `{CN, HK, MO, TW}` to `{TW}` only
+
+**Before**: M365 WS chat forced through M365_PROXY (Taiwan node), general HTTPS_PROXY ignored for M365
+**After**: M365 WS chat uses general HTTPS_PROXY (same as other providers); only login.py browser uses M365_PROXY for TW exit IP ✅
+
+---
 
 ## Known Limitations
 
