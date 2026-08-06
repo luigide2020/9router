@@ -1,0 +1,16 @@
+🔄 sync_remote.sh — Pipeline Report
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📅 Time: 2026-08-03 04:37 UTC
+👤 User: isobelhamil@office.bo.edu.kg
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+| Step | Description | Status |
+|------|------------|--------|
+| 1 | Login | ✅ Taiwan IP (36.231.70.27), existing session, token captured |
+| 2 | Token grab | ✅ Saved to ~/.9router/m365-token.json (expires 05:44 UTC) |
+| 3 | Local DB update | ✅ Updated m365-copilot connection (id=36a4aca1...) |
+| 4 | SCP to oracle | ✅ Token synced to oracle:~/.9router/ |
+| 5 | Remote DB update | ✅ Updated m365-copilot connection (id=6b9b7495...) |
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔑 Token remaining: ~67 minutes
+✅ Full pipeline completed successfully.
