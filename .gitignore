@@ -97,3 +97,4 @@ scripts/m365/.browser_profile/
 .PR/
 .next-analyze/*
 scripts/m365/sync_report.md
+.deveco/
