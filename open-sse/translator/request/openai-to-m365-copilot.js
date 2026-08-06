@@ -24,6 +24,55 @@
 import { register } from "../index.js";
 import { FORMATS } from "../formats.js";
 import { ROLE } from "../schema/index.js";
+import { createHash } from "crypto";
+
+const SEEN_CONV_MAX = 500;
+const SEEN_CONV_TTL_MS = 30 * 60 * 1000;
+const seenConversationFingerprints = new Map();
+
+function getConversationFingerprint(messages) {
+  for (const m of messages) {
+    if (m.role === ROLE.USER) {
+      const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content || "");
+      return text.slice(0, 120);
+    }
+  }
+  return null;
+}
+
+function computeConversationId(fingerprint, connectionId) {
+  const base = fingerprint
+    ? `${connectionId || "anon"}:conv:${createHash("sha256").update(fingerprint).digest("hex").slice(0, 16)}`
+    : `${connectionId || "anon"}`;
+  const hash = createHash("sha256").update(base).digest("hex");
+  return `${hash.slice(0,8)}-${hash.slice(8,12)}-${hash.slice(12,16)}-${hash.slice(16,20)}-${hash.slice(20,32)}`;
+}
+
+function markConversationSeen(conversationId) {
+  seenConversationFingerprints.set(conversationId, Date.now());
+  if (seenConversationFingerprints.size > SEEN_CONV_MAX) {
+    const now = Date.now();
+    for (const [k, ts] of seenConversationFingerprints) {
+      if (now - ts > SEEN_CONV_TTL_MS) seenConversationFingerprints.delete(k);
+    }
+    if (seenConversationFingerprints.size > SEEN_CONV_MAX) {
+      const entries = [...seenConversationFingerprints.entries()].sort((a, b) => a[1] - b[1]);
+      for (let i = 0; i < entries.length - SEEN_CONV_MAX / 2; i++) {
+        seenConversationFingerprints.delete(entries[i][0]);
+      }
+    }
+  }
+}
+
+function isConversationSeen(conversationId) {
+  const ts = seenConversationFingerprints.get(conversationId);
+  if (!ts) return false;
+  if (Date.now() - ts > SEEN_CONV_TTL_MS) {
+    seenConversationFingerprints.delete(conversationId);
+    return false;
+  }
+  return true;
+}
 
 const SEARCH_TOOL_PATTERNS = [
   "websearch", "web_search", "webfetch", "web_fetch",
@@ -277,7 +326,7 @@ function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas, hasSearchToo
       schemaInstr,
       scopeConstraint,
       langHint,
-      "Use plain text only for explanations or summaries when no action is needed.",
+      "IMPORTANT: You MUST output a JSON instruction for ANY action — including reading files, listing directories, checking status, or running commands. The ONLY time you should use plain text is when you are providing a final summary with NO further actions needed.",
     ].filter(Boolean).join(" ");
   }
 
@@ -287,7 +336,7 @@ function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas, hasSearchToo
     schemaInstr,
     scopeConstraint,
     langHint,
-    "Use plain text only for explanations or summaries when no action is needed.",
+    "IMPORTANT: You MUST output a JSON instruction for ANY action — including reading files, listing directories, checking status, or running commands. The ONLY time you should use plain text is when you are providing a final summary with NO further actions needed.",
   ].filter(Boolean).join(" ");
 }
 
@@ -512,6 +561,81 @@ function detectUserLanguage(messages) {
   return "en";
 }
 
+function extractContinuationPrompt(messages, toolCallMetaMap, toolMeta) {
+  const lastMsg = messages[messages.length - 1];
+  const lastRole = lastMsg.role || "";
+
+  const lastUserText = (() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === ROLE.USER) return extractContent(messages[i].content) || "";
+    }
+    return "";
+  })();
+
+  const userLang = detectUserLanguage(messages);
+  const langHint = userLang === "zh" ? "Reply in Chinese (中文)." : "";
+
+  const ctx = buildEarlierContext(messages, messages.length, toolCallMetaMap, 0);
+  const contextParts = [];
+  if (ctx.textWithoutPrevCmd) contextParts.push(ctx.textWithoutPrevCmd);
+
+  let lastPairUserIdx = -1;
+  for (let i = messages.length - 2; i >= 0; i--) {
+    if (messages[i].role === ROLE.USER) {
+      let j = i + 1;
+      while (j < messages.length - 1 && messages[j].role !== ROLE.USER) j++;
+      if (j < messages.length && messages[j].role === ROLE.ASSISTANT) {
+        lastPairUserIdx = i;
+        break;
+      }
+    }
+  }
+  if (lastPairUserIdx >= 0) {
+    const prevUserText = extractContent(messages[lastPairUserIdx].content) || "";
+    let prevAssistantText = "";
+    for (let j = lastPairUserIdx + 1; j < messages.length - 1; j++) {
+      if (messages[j].role === ROLE.ASSISTANT && !messages[j].tool_calls?.length) {
+        prevAssistantText = extractContent(messages[j].content) || "";
+        if (prevAssistantText) break;
+      }
+    }
+    const pairParts = [];
+    if (prevUserText) pairParts.push(`[Previous User]: ${prevUserText.slice(0, 300)}`);
+    if (prevAssistantText) pairParts.push(`[Previous Assistant]: ${prevAssistantText.slice(0, 300)}`);
+    if (pairParts.length > 0) contextParts.push(pairParts.join("\n"));
+  }
+
+  if (lastRole === ROLE.USER) {
+    console.log(`[M365-REQ-CONTINUATION] type=new_user_message textLen=${lastUserText.length} hasPrevPair=${lastPairUserIdx >= 0}`);
+    const parts = [];
+    if (contextParts.length > 0) parts.push(...contextParts);
+    parts.push(`[User]: ${lastUserText}`);
+    if (langHint) parts.push(langHint);
+    return parts.join("\n\n");
+  }
+
+  if (lastRole === ROLE.ASSISTANT) {
+    const assistantText = extractContent(lastMsg.content) || "";
+    const tcNames = [];
+    if (lastMsg.tool_calls) {
+      for (const tc of lastMsg.tool_calls) {
+        const tcName = tc.function?.name || "unknown";
+        tcNames.push(tcName);
+        toolCallMetaMap.set(tc.id || "", tcName);
+      }
+    }
+    console.log(`[M365-REQ-CONTINUATION] type=assistant textLen=${assistantText.length} toolCalls=${tcNames.length} hasPrevPair=${lastPairUserIdx >= 0}`);
+    const parts = [];
+    if (contextParts.length > 0) parts.push(...contextParts);
+    parts.push(`[Assistant]: ${assistantText}`);
+    if (langHint) parts.push(langHint);
+    return parts.join("\n\n");
+  }
+
+  console.log(`[M365-REQ-CONTINUATION] type=unknown lastRole=${lastRole} → fallback to flattenMessages`);
+  return null;
+}
+
 function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
   if (!messages || messages.length === 0) {
     console.log(`[M365-REQ-EXTRACT] no messages, returning null`);
@@ -644,7 +768,7 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
             : ctx.textWithoutPrevCmd.includes("Files already read")
               ? "Do NOT re-read files listed as 'already read' above. Use a different command or proceed to the next step."
               : "",
-          `If the task is fully complete, provide a brief summary including any key content the user asked to see. Otherwise, continue with the next JSON instruction.`,
+          `If the task is fully complete (no more commands needed), provide a summary including any key content the user asked to see. Otherwise, you MUST output a JSON instruction — never describe actions in natural language when you could output a JSON instruction instead.`,
           langHint || "",
         ].filter(Boolean).join("\n\n");
 
@@ -699,23 +823,58 @@ function openaiToM365CopilotRequest(model, body, stream, credentials) {
   const hasToolResults = lastMsgRole === ROLE.TOOL;
   const hasEarlierToolResults = messages.slice(0, -1).some(m => m.role === ROLE.TOOL);
 
-  console.log(`[M365-REQ-TRANSLATE] model=${model} messages=${messages.length} tools=${tools?.length||0} hasToolResults=${hasToolResults} hasEarlierToolResults=${hasEarlierToolResults} needsLocalExec=${!!toolMeta?.needsLocalExec} shellTools=${JSON.stringify(toolMeta?.shellToolNames||[])} searchTools=${JSON.stringify(toolMeta?.searchToolNames||[])} fileOpTools=${JSON.stringify(toolMeta?.fileOpToolNames||[])}`);
+  const fingerprint = getConversationFingerprint(messages);
+  const convId = computeConversationId(fingerprint, credentials?.connectionId || credentials?.email || null);
+  const hasAssistantHistory = messages.some(m => m.role === ROLE.ASSISTANT);
+  const hasSystemPrompt = messages.some(m => m.role === ROLE.SYSTEM || m.role === ROLE.DEVELOPER);
+  const earlierUserCount = messages.filter(m => m.role === ROLE.USER).length - (lastMsgRole === ROLE.USER ? 1 : 0);
+  const isContinuationByCache = isConversationSeen(convId);
+  const isContinuationByStructure = hasAssistantHistory && earlierUserCount > 0 && !hasToolResults;
+  const isContinuation = isContinuationByCache || isContinuationByStructure;
+  markConversationSeen(convId);
+  console.log(`[M365-REQ-TRANSLATE] model=${model} messages=${messages.length} tools=${tools?.length||0} hasToolResults=${hasToolResults} hasEarlierToolResults=${hasEarlierToolResults} needsLocalExec=${!!toolMeta?.needsLocalExec} isContinuation=${isContinuation}(cache=${isContinuationByCache},struct=${isContinuationByStructure}) convId=${convId} hasSystem=${hasSystemPrompt} earlierUser=${earlierUserCount} shellTools=${JSON.stringify(toolMeta?.shellToolNames||[])} searchTools=${JSON.stringify(toolMeta?.searchToolNames||[])} fileOpTools=${JSON.stringify(toolMeta?.fileOpToolNames||[])}`);
+
 
   let flatMessages;
   let usedExtract = false;
-  if (hasToolResults || hasEarlierToolResults) {
+  let strategy = "";
+  if (hasToolResults) {
     flatMessages = extractLatestUserInput(messages, toolCallMetaMap, toolMeta);
     if (flatMessages) {
       usedExtract = true;
-      console.log(`[M365-REQ-TRANSLATE] strategy=extractLatestUserInput result_len=${flatMessages.length}`);
+      strategy = "extractLatestUserInput";
     } else {
       flatMessages = flattenMessages(messages, toolCallMetaMap);
-      console.log(`[M365-REQ-TRANSLATE] strategy=flattenMessages(fallback) result_len=${flatMessages.length}`);
+      strategy = "flattenMessages(tool_fallback)";
+    }
+  } else if (hasEarlierToolResults && isContinuation) {
+    const continuationPrompt = extractContinuationPrompt(messages, toolCallMetaMap, toolMeta);
+    if (continuationPrompt) {
+      flatMessages = continuationPrompt;
+      usedExtract = true;
+      strategy = "extractContinuationPrompt(earlier_tools)";
+    } else {
+      flatMessages = flattenMessages(messages, toolCallMetaMap);
+      strategy = "flattenMessages(earlier_tools_continuation_fallback)";
+    }
+  } else if (hasEarlierToolResults) {
+    flatMessages = flattenMessages(messages, toolCallMetaMap);
+    strategy = "flattenMessages(earlier_tools_first_turn)";
+  } else if (isContinuation) {
+    const continuationPrompt = extractContinuationPrompt(messages, toolCallMetaMap, toolMeta);
+    if (continuationPrompt) {
+      flatMessages = continuationPrompt;
+      usedExtract = true;
+      strategy = "extractContinuationPrompt";
+    } else {
+      flatMessages = flattenMessages(messages, toolCallMetaMap);
+      strategy = "flattenMessages(continuation_fallback)";
     }
   } else {
     flatMessages = flattenMessages(messages, toolCallMetaMap);
-    console.log(`[M365-REQ-TRANSLATE] strategy=flattenMessages(no_tool_results) result_len=${flatMessages.length}`);
+    strategy = "flattenMessages(first_turn)";
   }
+  console.log(`[M365-REQ-TRANSLATE] strategy=${strategy} result_len=${flatMessages.length}`);
 
   const needsLocalExec = !!toolMeta?.needsLocalExec;
   const langHint = detectUserLanguage(messages) === "zh" ? "Reply in Chinese (中文)." : "";
@@ -734,12 +893,37 @@ function openaiToM365CopilotRequest(model, body, stream, credentials) {
       const reminder = [
         `You provided a JSON instruction in the previous step and here is the result.`,
         `Do ONLY what the user explicitly asks — do NOT expand scope or read additional files unless the user asks.`,
-        `If another step is needed, output a JSON instruction using this schema — the user will handle execution:`,
+        `Based on the result above, decide if further action is needed. If YES, you MUST output a JSON instruction (never describe what you would do in natural language). If the task is FULLY complete with no further actions, provide a summary.`,
         antiExecPrompt,
         langFooter,
       ].filter(Boolean).join("\n");
       finalPrompt = `${flatMessages}\n\n---\n\n${reminder}`;
       console.log(`[M365-REQ-TRANSLATE] prompt_layout=flatMessages+reminder finalPrompt_len=${finalPrompt.length}`);
+    } else if (isContinuation && strategy.startsWith("extractContinuationPrompt")) {
+      const schemaHint = (() => {
+        const primaryTool = toolMeta.shellToolNames?.[0] || "exec_command";
+        const schema = toolMeta.shellToolSchemas?.[primaryTool];
+        if (schema && schema.properties) {
+          const props = schema.properties;
+          const required = schema.required || [];
+          const paramParts = [];
+          for (const [key, val] of Object.entries(props)) {
+            const req = required.includes(key) ? " (required)" : " (optional)";
+            paramParts.push(`"${key}": <${val.type || "string"}>${req}`);
+          }
+          return `{"name": "${primaryTool}", "arguments": { ${paramParts.join(", ")} }}`;
+        }
+        return `{"name": "${primaryTool}", "arguments": {"cmd": "<command>"}}`;
+      })();
+      const continuationReminder = [
+        `This is a continuation of our conversation. Based on the context and the user's message above, decide if further action is needed.`,
+        `If YES, output a JSON instruction using this schema:`,
+        schemaHint,
+        `If the task is FULLY complete with no further actions, provide a summary including any key content the user asked to see.`,
+        langHint || "",
+      ].filter(Boolean).join("\n");
+      finalPrompt = `${flatMessages}\n\n---\n\n${continuationReminder}`;
+      console.log(`[M365-REQ-TRANSLATE] prompt_layout=continuation+schema finalPrompt_len=${finalPrompt.length}`);
     } else {
       finalPrompt = `${antiExecPrompt}\n\n---\n\n${flatMessages}`;
       console.log(`[M365-REQ-TRANSLATE] prompt_layout=antiExec+flatMessages finalPrompt_len=${finalPrompt.length}`);
@@ -765,6 +949,7 @@ function openaiToM365CopilotRequest(model, body, stream, credentials) {
     ...body,
     messages: [],
     _m365Prompt: afterSanitize,
+    _m365IsContinuation: isContinuation,
     _m365ToolMeta: {
       hasTools: !!(tools && tools.length > 0),
       needsLocalExec,

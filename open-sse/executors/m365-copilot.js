@@ -657,10 +657,11 @@ export class M365CopilotExecutor extends BaseExecutor {
     // remembers previous commands/results and does not repeat them.
     // Previously used FRESH to prevent CI context inheritance, but now
     // disableCodeInterpreter=true removes CI flags, making FRESH unnecessary.
+    const isContinuation = !!body._m365IsContinuation;
     if (toolMeta.needsLocalExec) {
-      console.log(`[M365-EXEC-CID] strategy=STABLE(disableCodeInterpreter=true) conversationId=${conversationId}`);
+      console.log(`[M365-EXEC-CID] strategy=STABLE(disableCodeInterpreter=true) conversationId=${conversationId} isContinuation=${isContinuation}`);
     } else {
-      console.log(`[M365-EXEC-CID] strategy=STABLE conversationId=${conversationId}`);
+      console.log(`[M365-EXEC-CID] strategy=STABLE conversationId=${conversationId} isContinuation=${isContinuation}`);
     }
     
     // Convert to UUID format for sessionId
@@ -854,11 +855,15 @@ export class M365CopilotExecutor extends BaseExecutor {
     // "copilot" (auto) means let M365 decide the model
     const modelId = model === "copilot" ? null : model;
     const m365Flags = {
-      disableCodeInterpreter: false,
+      disableCodeInterpreter: !!toolMeta?.needsLocalExec,
       enableSearch: true,
     };
-    console.log(`[M365-EXEC-FLAGS] disableCodeInterpreter=${m365Flags.disableCodeInterpreter} enableSearch=${m365Flags.enableSearch} experienceType=Default tone=${enableReasoning ? "Reasoning" : "Balanced"}`);
-    const copilotMsg = buildCopilotMessage(userPrompt, 0, conversationId, sessionIdUuid, enableReasoning, modelId, m365Flags);
+    let effectivePrompt = userPrompt;
+    if (/<image\b/i.test(effectivePrompt)) {
+      effectivePrompt = effectivePrompt + "\n\nIMPORTANT: Images are already included inline above. Do NOT attempt to read, open, or process any image file paths (e.g. /var/folders/...). Just answer based on the images shown.";
+    }
+    console.log(`[M365-EXEC-FLAGS] disableCodeInterpreter=${m365Flags.disableCodeInterpreter} enableSearch=${m365Flags.enableSearch} experienceType=Default tone=${enableReasoning ? "Reasoning" : "Balanced"} hasImage=${/<image\b/i.test(userPrompt)}`);
+    const copilotMsg = buildCopilotMessage(effectivePrompt, 0, conversationId, sessionIdUuid, enableReasoning, modelId, m365Flags);
     log?.info?.("M365-COPILOT", `WS send: optionsSets=${JSON.stringify(copilotMsg.arguments[0].optionsSets)}, plugins=${JSON.stringify(copilotMsg.arguments[0].plugins)}, allowedMessageTypes=${JSON.stringify(copilotMsg.arguments[0].allowedMessageTypes)}`);
     ws.send(JSON.stringify(copilotMsg) + RS);
 

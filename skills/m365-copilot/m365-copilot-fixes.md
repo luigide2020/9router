@@ -390,6 +390,11 @@ Added `extractHistoricalToolCallSignatures(messages)` which scans all ASSISTANT 
 | WS connect retry + 502 short cooldown (Fix45) | Pending verification — TLS failures should auto-retry, lockout only 5s |
 | Per-conversation conversationId (Fix46) | Pending verification — different chats should get different M365 context |
 | M365 proxy for login only, WS uses HTTPS_PROXY (Fix47) | Pending verification — WS chat through general proxy, login through TW proxy |
+| M365 natural language → JSON tool_call (Fix48) | Pending verification — prompt strengthening + INLINE_BACKTICK context-first + NLU fallback |
+| Continuation turn compression 58KB→192 bytes (Fix49) | Verified — 57 MSG → extractContinuationPrompt → 192 bytes, final prompt 916 bytes |
+| NLU fallback exclude past-tense 看到/看了/看过 (Fix50) | Verified — "我看到有些向日葵低下了头" no longer triggers exec_command |
+| Continuation prompt includes previous interaction pair (Fix51) | Pending verification — need to confirm topic retention prevents hallucination |
+| disableCodeInterpreter respects needsLocalExec + image anti-read hint (Fix52) | Pending verification — need to confirm image questions use vision instead of python OCR |
 
 ## Fix45: WS Connect Retry + 502 Short Cooldown
 
@@ -442,6 +447,52 @@ new: conversationIdBase = resolveSessionId({ connectionId: email + ":conv:" + sh
 
 ---
 
+## Fix48: M365 Natural Language → JSON tool_call (Prompt + INLINE_BACKTICK + NLU Fallback)
+
+**Files**: `openai-to-m365-copilot.js`, `m365-copilot-to-openai.js`
+
+**Root cause**: M365 Copilot frequently responds with natural language instead of JSON tool_call instructions (e.g., "我先看一下你提到的附件内容"), causing the agent loop to stall because Codex receives pure text with `finish_reason=stop` and has no next step. Three contributing factors:
+
+1. **Prompt escape hatch**: `buildAntiExecutionPrompt()` says "Use plain text only for explanations or summaries when no action is needed" — M365 interprets "reading attachment" as "explanation" and uses natural language
+2. **INLINE_BACKTICK whitelist gate**: `COMMON_COMMANDS_RE` acts as a gate before `COMMAND_INTENT_RE` — commands not in the whitelist (like `sub`, `sed`, `awk`) are never checked for intent context. Whether something is a command depends on surrounding context, not the word itself.
+3. **No NLU fallback**: When all 8 pattern matchers fail and `needsLocalExec=true`, the text passes through as pure content with no tool_call
+
+**Fix** (three-layer):
+
+### Layer 1: Request-side prompt strengthening
+
+- `buildAntiExecutionPrompt()`: Removed "Use plain text only for explanations or summaries when no action is needed" — replaced with "IMPORTANT: You MUST output a JSON instruction for ANY action... The ONLY time you should use plain text is when you are providing a final summary with NO further actions needed."
+- TOOL-branch reminder: Changed from "If another step is needed, output a JSON instruction" to "If YES, you MUST output a JSON instruction (never describe what you would do in natural language). If the task is FULLY complete with no further actions, provide a summary."
+- `extractLatestUserInput` TOOL branch: Changed from "Otherwise, continue with the next JSON instruction" to "Otherwise, you MUST output a JSON instruction — never describe actions in natural language when you could output a JSON instruction instead."
+
+### Layer 2: INLINE_BACKTICK — context-first, not whitelist-first
+
+- **Removed `COMMON_COMMANDS_RE` gate from INLINE_BACKTICK**. Previously: backtick content → in whitelist? → no → skip (never checks intent). Now: backtick content → check COMMAND_INTENT_RE before it → has intent? → treat as command. No intent? → it's a document reference, skip.
+- This correctly handles: `run \`sub\`` (command, has intent) vs "the \`sub\` module" (reference, no intent)
+- `COMMON_COMMANDS_RE` still used in `REMOTE_EXEC_CHECK` (line 224) — kept there
+- **Expanded `COMMAND_INTENT_RE`** with Chinese intent verbs and English `use`:
+  - Added: `(我[要需来想先会]|让[我咱]|请)(来|去)?(看|读|查|检查|执行|运行|列出|浏览|跑)`
+  - Added: `use` as intent verb ("use `cat` to view")
+
+### Layer 3: Response-side NLU fallback
+
+- New `ACTION_INTENT_PATTERNS` array with 4 patterns for Chinese/English action intent:
+  - Chinese: "我(要/需/来/先/想)看/读/查/执行/运行 X"
+  - Chinese: "让我看/读/查 X"
+  - English: "I'll read/check/run/execute/list/look at X"
+  - English: "Let me see/check/read/run X"
+- New `extractNaturalLanguageIntent(text, toolMeta)` function:
+  - Matches first ACTION_INTENT_PATTERN
+  - Extracts command from captured text: file path → `cat <path>`, looks like command → as-is, otherwise → `ls`
+  - Only activates when `needsLocalExec=true` AND `extracted toolCalls=0`
+  - Safe defaults only (ls/cat), never generates destructive commands
+  - Logs with `[M365-RESP-EXTRACT] rule=NLU_FALLBACK`
+
+**Before**: M365 says "我先看一下附件" → `extracted toolCalls=0` → agent loop stalls
+**After**: M365 says "我先看一下附件" → NLU fallback → `exec_command cat <path>` → Codex executes locally → loop continues ✅
+
+---
+
 ## Known Limitations
 
 1. **First request may still trigger CI** — server-side behavior. Reactive detection handles it.
@@ -456,3 +507,98 @@ new: conversationIdBase = resolveSessionId({ connectionId: email + ":conv:" + sh
 10. **`apply_patch` failures may recur** — Fix44 forces M365 to output manual code changes after 3 failures, but the root cause (patch content not matching actual file, possibly due to sanitizeForM365 corruption or Codex sandbox file differences) is not fixed. See Fix39.
 11. **STABLE conversationId memory unverified** — `isStartOfSession: true` + `invocationId: 0` sent every request may prevent M365 from using conversation memory. If STABLE doesn't work, count-based loop guard (Fix43, threshold=5) is the safety net. Fix46 isolates contexts per conversation to prevent cross-topic pollution regardless of whether M365 actually uses the memory.
 12. **conversationId based on first USER message** — If the same user sends identical first messages in separate chats (rare), they'll share a conversationId. This is acceptable: identical questions can share context.
+
+---
+
+## Fix49: Continuation Turn Context Compression (58KB→192 bytes)
+
+**Files**: `openai-to-m365-copilot.js`, `m365-copilot.js`
+
+**Root cause**: After the first turn, every continuation request sent full conversation history via `flattenMessages()` — 58-113KB prompts. M365's STABLE conversationId provides server-side conversation memory, so re-sending full history is redundant. Massive prompts caused slow processing and occasional M365 errors.
+
+**Fix** (six-layer):
+
+### Layer 1: `seenConversationFingerprints` LRU cache (translator)
+- Map, max 500 entries, TTL 30min
+- `getConversationFingerprint()` — first USER message content (≤120 chars)
+- `computeConversationId()` — deterministic UUID from fingerprint hash
+- Sets `body._m365IsContinuation = true` when fingerprint seen before
+
+### Layer 2: `extractContinuationPrompt()` — lightweight prompt builder
+- Last USER/ASSISTANT message + `buildEarlierContext` summary + langHint
+- No full history flattening — relies on M365 server-side memory
+
+### Layer 3: Restructured strategy selection in `openaiToM365CopilotRequest()`
+- `hasToolResults` → `extractLatestUserInput` (unchanged)
+- `hasEarlierToolResults && isContinuation` → `extractContinuationPrompt(earlier_tools)` (NEW)
+- `hasEarlierToolResults && !isContinuation` → `flattenMessages(earlier_tools_first_turn)` (NEW)
+- `isContinuation && !hasEarlierToolResults` → `extractContinuationPrompt` (NEW)
+- first turn → `flattenMessages(first_turn)` (unchanged)
+
+### Layer 4: `isContinuationByStructure` — structural detection
+- Detects continuation from message composition (`hasAssistantHistory && earlierUserCount > 0 && !hasToolResults`)
+- Works even after container restart when memory cache is empty
+- `isContinuation = isContinuationByCache || isContinuationByStructure`
+
+### Layer 5: Continuation-specific prompt layout
+- In `needsLocalExec` branch: includes schema hint instead of full antiExecPrompt, lighter weight
+
+### Layer 6: Strategy-based prompt layout matching
+- `strategy.startsWith("extractContinuationPrompt")` check for correct prompt layout selection
+
+**Bug fix**: Initially placed seen-cache in executor, but `body._m365IsContinuation` was always undefined in translator (translator runs BEFORE executor). Moved cache to translator; executor now reads `_m365IsContinuation` from body.
+
+**Before**: 57 MSG → `flattenMessages` → 112KB prompt → M365 slow
+**After**: 57 MSG → `extractContinuationPrompt` → 192 bytes → M365 fast ✅
+
+---
+
+## Fix50: NLU Fallback — Exclude Past-Tense "看到/看了/看过"
+
+**File**: `m365-copilot-to-openai.js`
+
+**Root cause**: `ACTION_INTENT_PATTERNS` first pattern `我[要需来想先将会能]*(?:看|读|查|...)...` matched "我看到有些向日葵低下了头" — the `看` in "看到" is past-tense observation, NOT a command intent. This caused a false positive `exec_command: ls` for a pure conversational response about sunflower planting.
+
+**Fix**: Added negative lookahead after `看`: `(?!到|了|过)`. This excludes past-tense forms:
+- "我看到/看了/看过" → `看` followed by `到/了/过` → **NOT matched** ✓
+- "我来看/我要看/让我看" → `看` followed by non-excluded → **matched** ✓
+
+The second pattern `让我(?:看|读|查|...)` is inherently imperative and doesn't need the fix.
+
+**Before**: "我看到有些向日葵低下了头" → NLU fallback → `exec_command: ls` (false positive)
+**After**: "我看到有些向日葵低下了头" → NLU skipped → pure text response ✅
+
+---
+
+## Fix51: Continuation Prompt — Include Previous User-Assistant Interaction Pair
+
+**File**: `openai-to-m365-copilot.js`
+
+**Root cause**: `extractContinuationPrompt()` only included command history context (`buildEarlierContext`) and the latest message. Without the conversation topic, M365 lost memory of what was being discussed and produced hallucinated responses (e.g., answering about unrelated topics when user was asking about sunflower planting).
+
+**Fix**: Added scanning for the most recent USER→ASSISTANT interaction pair before the current message:
+1. Scan messages backwards from `messages.length - 2` to find last USER message
+2. Find the next ASSISTANT message (without tool_calls) after that USER message
+3. Include both as `[Previous User]: ...` and `[Previous Assistant]: ...` (each ≤300 chars)
+4. This provides topic anchor without full history — M365 knows what was being discussed
+
+**Before**: Continuation prompt = `[Context] + [User]: latest message` → M365 loses topic → hallucination
+**After**: Continuation prompt = `[Context] + [Previous User]: Q + [Previous Assistant]: A + [User]: latest` → M365 maintains topic ✅
+
+---
+
+## Fix52: disableCodeInterpreter Now Respects needsLocalExec + Image Anti-Read Hint
+
+**File**: `m365-copilot.js`
+
+**Root cause (part 1)**: `disableCodeInterpreter` was hardcoded to `false` (line 858), even though CID/SID strategy logged `STABLE(disableCodeInterpreter=true)`. When user sent an image, M365's Code Interpreter was active and executed python+PIL+tesseract to OCR the image file — but the file path was local (`/var/folders/...`), inaccessible from M365's remote sandbox.
+
+**Root cause (part 2)**: Prompt contained local image file paths (e.g., `## codex-clipboard-xxx.png: /var/folders/.../xxx.png`). M365 saw the path and tried to execute python to read the file, instead of using its built-in vision capability (`cwcfluxgptv`) to see the inline image.
+
+**Fix**:
+1. Changed `disableCodeInterpreter: false` → `disableCodeInterpreter: !!toolMeta?.needsLocalExec` — now correctly disables CI when local exec is needed
+2. When prompt contains `<image` tag, append: `"IMPORTANT: Images are already included inline above. Do NOT attempt to read, open, or process any image file paths. Just answer based on the images shown."`
+3. Added `hasImage` flag to `[M365-EXEC-FLAGS]` log line for debugging
+
+**Before**: User sends image → M365 executes `python3 + PIL + tesseract` (fails, file not accessible remotely)
+**After**: User sends image → CI disabled + anti-read hint → M365 uses vision capability to see inline image and answer directly ✅

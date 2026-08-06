@@ -35,7 +35,14 @@ const NAKED_CMD_JSON_RE = /\{\s*"(cmd|command|code|run)"\s*:\s*"([^"]+)"\s*\}/g;
 
 const COMMON_COMMANDS_RE = /\b(ls|pwd|cat|find|grep|head|tail|wc|echo|mkdir|rm|cp|mv|chmod|curl|wget|git|npm|node|python|pip|docker|make|gcc|javac|java)\b/;
 
-const COMMAND_INTENT_RE = /\b(run|execute|try|type|enter|issue|invoke)\s+(this\s+)?(command|the\s+following|it|now)|^CMD:/im;
+const COMMAND_INTENT_RE = /\b(run|execute|try|type|enter|issue|invoke|use)\s+(this\s+)?(command|the\s+following|it|now)|^CMD:|(?:我[要需来想先会]|让[我咱]|请)(?:来|去)?(?:看(?:一下)?|读(?:一下)?|查(?:一下)?|检查(?:一下)?|执行(?:一下)?|运行(?:一下)?|列出(?:一下)?|浏览(?:一下)?|跑(?:一下)?|看看|读读|查查)/im;
+
+const ACTION_INTENT_PATTERNS = [
+  /我[要需来想先将会能]*(?:看(?!到|了|过)|读|查|检查|执行|运行|列出|浏览|打开|查看|确认|验证)[一下]*\s*(?:一下\s*)?([^\s，。！？、\n]{2,80})/,
+  /让我(?:看|读|查|检查|执行|运行|列出)\s*([^\s，。！？、\n]{2,80})/,
+  /I'?(?:ll| will)\s+(?:read|check|run|execute|list|look at|examine|try|inspect|view|verify)\s+(.{2,80}?)(?:\.|,|$)/i,
+  /Let me\s+(?:see|check|read|run|execute|look at|try|inspect)\s+(.{2,80}?)(?:\.|,|$)/i,
+];
 
 
 function isRemoteExecutionResult(text) {
@@ -78,6 +85,27 @@ function makeToolCall(name, argumentsObj) {
       arguments: typeof argumentsObj === "string" ? argumentsObj : JSON.stringify(argumentsObj),
     },
   };
+}
+
+function extractNaturalLanguageIntent(text, toolMeta) {
+  for (const pattern of ACTION_INTENT_PATTERNS) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const captured = match[1] || "";
+    const toolName = extractShellToolName(toolMeta);
+    const argName = getShellToolCommandArgName(toolMeta);
+    let command;
+    if (/^[/~.]/.test(captured) || /\.(?:py|js|ts|java|go|rs|rb|php|c|cpp|h|cs|swift|kt|scala|sh|yaml|yml|json|toml|xml|html|css|md|txt|conf|cfg|env|sql|log)\b/i.test(captured)) {
+      command = `cat ${captured}`;
+    } else if (/\s/.test(captured.trim()) && /^[a-zA-Z]/.test(captured.trim())) {
+      command = captured.trim();
+    } else {
+      command = "ls";
+    }
+    console.log(`[M365-RESP-EXTRACT] rule=NLU_FALLBACK pattern_matched="${match[0].slice(0, 60)}", captured="${captured.slice(0, 60)}", command="${command}"`);
+    return makeToolCall(toolName, { [argName]: command });
+  }
+  return null;
 }
 
 function extractToolCallsFromText(text, toolMeta) {
@@ -229,20 +257,26 @@ function extractToolCallsFromText(text, toolMeta) {
       calls.push(makeToolCall(toolName, { [argName]: command }));
     }
   }
-
   if (calls.length === 0) {
     const inlineCmd = text.match(/`([^`]+)`/);
-    const inlineResult = inlineCmd ? `match="${inlineCmd[1]}", isCommonCmd=${COMMON_COMMANDS_RE.test(inlineCmd[1])}` : "no_match";
-    console.log(`[M365-RESP-EXTRACT] rule=INLINE_BACKTICK ${inlineResult}`);
-    if (inlineCmd && COMMON_COMMANDS_RE.test(inlineCmd[1])) {
+    if (inlineCmd) {
       const beforeCmd = text.slice(0, text.indexOf(inlineCmd[0]));
       const hasIntent = COMMAND_INTENT_RE.test(beforeCmd);
-      console.log(`[M365-RESP-EXTRACT] rule=INLINE_BACKTICK hasIntent=${hasIntent} beforeCmd_preview=${beforeCmd.slice(-80).replace(/\n/g,"\\n")}`);
+      console.log(`[M365-RESP-EXTRACT] rule=INLINE_BACKTICK match="${inlineCmd[1]}", hasIntent=${hasIntent}, beforeCmd_preview=${beforeCmd.slice(-80).replace(/\n/g,"\\n")}`);
       if (hasIntent) {
         const toolName = extractShellToolName(toolMeta);
         const argName = getShellToolCommandArgName(toolMeta);
         calls.push(makeToolCall(toolName, { [argName]: inlineCmd[1].trim() }));
       }
+    } else {
+      console.log(`[M365-RESP-EXTRACT] rule=INLINE_BACKTICK no_match`);
+    }
+  }
+
+  if (calls.length === 0 && toolMeta?.needsLocalExec) {
+    const nluCall = extractNaturalLanguageIntent(text, toolMeta);
+    if (nluCall) {
+      calls.push(nluCall);
     }
   }
 

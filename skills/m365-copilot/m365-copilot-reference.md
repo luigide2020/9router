@@ -20,7 +20,7 @@ Evidence from WS logs: `offense="OffenseTrigger"` on `author=user` echo, `conten
 
 **Strategy**: Positive framing instead of negative prohibitions. `"always output a JSON instruction"` instead of `"Do NOT execute"`.
 
-## Tool Call Detection Patterns
+## Tool Call Detection Patterns (Fix48 Update)
 
 | Pattern | Example | Detection |
 |---------|---------|-----------|
@@ -29,8 +29,16 @@ Evidence from WS logs: `offense="OffenseTrigger"` on `author=user` echo, `conten
 | Inline JSON | `{"name":"exec_command","arguments":{...}}` | `INLINE_JSON_TOOL_RE` |
 | Naked JSON | `{"cmd":"ls"}` | `NAKED_CMD_JSON_RE` |
 | `CMD:` prefix | `CMD: ls -la` | `CMD_PREFIX_RE` (legacy compat) |
-| Backtick command | `` `find . -maxdepth 1` `` | `COMMAND_INTENT_RE` + inline backtick |
+| Backtick command (context-first) | `` run `find .` `` / `` 让我看 `config.yaml` `` | `COMMAND_INTENT_RE` (checks intent verb before backtick, no whitelist gate) |
 | Remote exec result | `/mnt/file_upload` + `cwd: /mnt/` | `REMOTE_EXEC_INDICATORS` |
+| Natural language intent (NLU fallback) | "我来看一下附件" / "I'll read the file" | `ACTION_INTENT_PATTERNS` + `extractNaturalLanguageIntent()` |
+| Natural language intent (past-tense excluded) | "我看到有些向日葵低下了头" | `看(?!到|了|过)` negative lookahead — NOT matched |
+
+**Fix48 changes**:
+- INLINE_BACKTICK: removed `COMMON_COMMANDS_RE` whitelist gate. Whether a backtick is a command is determined by `COMMAND_INTENT_RE` context (intent verb before backtick), not by whether the word is in a whitelist.
+- `COMMAND_INTENT_RE` expanded with Chinese intent verbs: `我[要需来想先会]看/读/查/执行/运行`, `让我看/读/查`, `请查/看`
+- NLU fallback: when `needsLocalExec=true` + all 8 patterns fail + `extracted toolCalls=0`, `ACTION_INTENT_PATTERNS` matches Chinese/English action intent and synthesizes a tool_call
+| Natural language intent | "我先看一下附件" / "I'll read the file" | `ACTION_INTENT_PATTERNS` (NLU fallback, Fix48) |
 
 ## Remote Exec Indicators
 
@@ -45,15 +53,15 @@ When detected: `hasRemoteExec=true` → response translator strips remote output
 
 ## Tool Classification & M365 Capability Control
 
-| Agent Tools | needsLocalExec | hasSearchTools | experienceType | Anti-Exec | M365 Search |
-|-------------|---------------|----------------|----------------|-----------|-------------|
-| None | false | false | Default | No | enabled |
-| Shell only (codex) | true | false | Default | Yes | enabled |
-| Shell + Search | true | true | Default | Yes (search forbidden) | disabled |
-| Search only | false | true | Default | No | enabled |
-| File ops only | true | false | Deep | Yes | enabled |
+| Agent Tools | needsLocalExec | hasSearchTools | experienceType | Anti-Exec | M365 Search | disableCodeInterpreter |
+|-------------|---------------|----------------|----------------|-----------|-------------|----------------------|
+| None | false | false | Default | No | enabled | false |
+| Shell only (codex) | true | false | Default | Yes | enabled | true |
+| Shell + Search | true | true | Default | Yes (search forbidden) | disabled | true |
+| Search only | false | true | Default | No | enabled | false |
+| File ops only | true | false | Deep | Yes | enabled | true |
 
-When `disableCodeInterpreter=true` (now always false): previously used Deep+Precise. Current config: always `Default` experienceType + `Reasoning`/`Balanced` tone.
+`disableCodeInterpreter = !!toolMeta?.needsLocalExec` (Fix52). Previously hardcoded `false` — caused M365 Code Interpreter to execute python for image files when `needsLocalExec=true`.
 
 ## Shell Tool Names
 
@@ -80,6 +88,16 @@ const SHELL_TOOL_NAMES = [
 3. In sanitize=true segments: `re.exec()` collects all match positions for dangerous words, builds result by splicing `[cmdN]` at correct offsets
 4. Also replaces `M365_JAILBREAK_PHRASES` → `[note]`
 5. File content, package names, command output inside output blocks are never corrupted
+
+## INLINE_BACKTICK Detection (Fix48)
+
+**Before (Fix47)**: `COMMON_COMMANDS_RE` whitelist gate → only backtick content matching the whitelist was checked for intent. Commands like `sub`, `sed`, `awk` were never checked.
+
+**After (Fix48)**: Context-first approach. `COMMAND_INTENT_RE` checks the text BEFORE the backtick for intent verbs. If intent is found, the backtick content is treated as a command regardless of whether it's in a whitelist.
+
+- "run `sub`" → `hasIntent=true` → tool_call with command="sub" ✅
+- "the `sub` module" → `hasIntent=false` → no tool_call (document reference) ✅
+- "我来看 `config.yaml`" → `hasIntent=true` (Chinese intent verb) → tool_call ✅
 
 ## Loop Guard (Response-Side)
 
@@ -126,7 +144,7 @@ const SHELL_TOOL_NAMES = [
 
 **REMOVED in Fix42**. The gpt-5.6-specific destructive guardrail (`DESTRUCTIVE_COMMAND_PATTERNS` + `isDestructiveCommand()`) was removed due to high false-positive rate blocking legitimate code modification commands. Request-side `sanitizeForM365()` provides equivalent protection by removing dangerous words from the prompt before M365 sees them.
 
-## Request Routing Decision Tree
+## Request Routing Decision Tree (Fix49 Update)
 
 ```
 lastMsg.role === TOOL?
@@ -134,12 +152,21 @@ lastMsg.role === TOOL?
      → pre-scan ASSISTANT tool_calls (skip TOOL first!)
      → buildEarlierContext (cwd + prev command)
      → prompt: "Here is the result..." + schema + reminder
-  → hasEarlierToolResults?
-     → extractLatestUserInput (USER with context path)
-        → scan earlier TOOL for cwd
-        → prompt: [Context: cwd] + [User: text]
-     → flattenMessages (first request path, ~30KB+)
-        → full conversation history flattened to natural language
+
+hasEarlierToolResults?
+  && isContinuation (cache or structure)?
+    → extractContinuationPrompt(earlier_tools)
+       → last USER/ASSISTANT + [Previous User/Assistant pair] + buildEarlierContext summary
+  && !isContinuation (first turn with earlier tools)?
+    → flattenMessages(earlier_tools_first_turn)
+
+isContinuation && !hasEarlierToolResults?
+  → extractContinuationPrompt
+     → last USER/ASSISTANT + [Previous User/Assistant pair] + buildEarlierContext summary
+
+first turn (no history)?
+  → flattenMessages (first request path, ~30KB+)
+     → full conversation history flattened to natural language
 ```
 
 ## Search Bot Message Filtering
@@ -165,6 +192,14 @@ Always use provider prefix: `m365-copilot/gpt-5.6-sol`, not just `gpt-5.6`.
 - **WS chat connections** (`m365-copilot.js`): Uses `HTTPS_PROXY || HTTP_PROXY` — same as all other providers. No M365-specific proxy.
 - **Login browser** (`login.py`): Uses `M365_PROXY` (falls back to `HTTPS_PROXY`/`HTTP_PROXY`) — Playwright browser traffic routes through this proxy so exit IP is in Taiwan. Region check (`ALLOWED_COUNTRY_CODES = {"TW"}`) validates exit IP before login proceeds.
 - **sync_remote.sh**: Passes `M365_PROXY` env var and `--proxy` CLI arg to `login.py`.
+
+## Image Handling (Fix52)
+
+When prompt contains `<image` tag (Codex sends inline images with local file paths):
+- `disableCodeInterpreter = true` (via `needsLocalExec`) prevents M365 from running python+PIL+tesseract
+- Anti-read hint appended: "Images are already included inline above. Do NOT attempt to read, open, or process any image file paths."
+- M365 uses built-in vision capability (`cwcfluxgptv` + `flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch`) to see inline images directly
+- `[M365-EXEC-FLAGS]` log line includes `hasImage=true/false` for debugging
 
 ## Build & Deploy Notes
 
