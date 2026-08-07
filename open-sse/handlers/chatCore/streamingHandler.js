@@ -35,7 +35,6 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
 
   if (needsTranslation(targetFormat, sourceFormat)) {
     return createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey, translatedBody, customToolNames);
->>>>>>> upstream/master
   }
 
   return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey);
