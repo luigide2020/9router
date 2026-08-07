@@ -830,7 +830,7 @@ function openaiToM365CopilotRequest(model, body, stream, credentials) {
   const earlierUserCount = messages.filter(m => m.role === ROLE.USER).length - (lastMsgRole === ROLE.USER ? 1 : 0);
   const isContinuationByCache = isConversationSeen(convId);
   const isContinuationByStructure = hasAssistantHistory && earlierUserCount > 0 && !hasToolResults;
-  const isContinuation = isContinuationByCache || isContinuationByStructure;
+  const isContinuation = isContinuationByStructure || (isContinuationByCache && hasAssistantHistory);
   markConversationSeen(convId);
   console.log(`[M365-REQ-TRANSLATE] model=${model} messages=${messages.length} tools=${tools?.length||0} hasToolResults=${hasToolResults} hasEarlierToolResults=${hasEarlierToolResults} needsLocalExec=${!!toolMeta?.needsLocalExec} isContinuation=${isContinuation}(cache=${isContinuationByCache},struct=${isContinuationByStructure}) convId=${convId} hasSystem=${hasSystemPrompt} earlierUser=${earlierUserCount} shellTools=${JSON.stringify(toolMeta?.shellToolNames||[])} searchTools=${JSON.stringify(toolMeta?.searchToolNames||[])} fileOpTools=${JSON.stringify(toolMeta?.fileOpToolNames||[])}`);
 

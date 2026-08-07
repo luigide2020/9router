@@ -253,9 +253,13 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
       let closed = false;
 
       const rebuildFullText = () => {
+        const seen = new Set();
         const parts = [];
         for (const text of botTextStreams.values()) {
-          if (text) parts.push(text);
+          if (text && !seen.has(text)) {
+            seen.add(text);
+            parts.push(text);
+          }
         }
         fullText = parts.join("\n");
       };
@@ -353,9 +357,19 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
                 if (!botTextStreams) botTextStreams = new Map();
                 const prev = botTextStreams.get(msgId) || "";
                 if (msg.text.length > prev.length) {
-                  const delta = msg.text.slice(prev.length);
-                  botTextStreams.set(msgId, msg.text);
-                  if (!bufferForTools) emitContent(delta);
+                  let isCrossDup = false;
+                  if (msgId !== "default") {
+                    for (const [k, v] of botTextStreams) {
+                      if (k !== msgId && v === msg.text) { isCrossDup = true; break; }
+                    }
+                  }
+                  if (isCrossDup) {
+                    console.log(`[M365-WS-T6] skipped cross-msgId duplicate bot text (msgId=${msgId}, textLen=${msg.text.length})`);
+                  } else {
+                    const delta = msg.text.slice(prev.length);
+                    botTextStreams.set(msgId, msg.text);
+                    if (!bufferForTools) emitContent(delta);
+                  }
                 }
               }
             }
@@ -399,9 +413,19 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
                 const msgId = msg.messageId || msg.responseIdentifier || "default";
                 const prev = botTextStreams.get(msgId) || "";
                 if (msg.text.length > prev.length) {
-                  const delta = msg.text.slice(prev.length);
-                  botTextStreams.set(msgId, msg.text);
-                  if (!bufferForTools) emitContent(delta);
+                  let isCrossDup = false;
+                  if (msgId !== "default") {
+                    for (const [k, v] of botTextStreams) {
+                      if (k !== msgId && v === msg.text) { isCrossDup = true; break; }
+                    }
+                  }
+                  if (isCrossDup) {
+                    console.log(`[M365-WS-T2] skipped cross-msgId duplicate bot text (msgId=${msgId}, textLen=${msg.text.length})`);
+                  } else {
+                    const delta = msg.text.slice(prev.length);
+                    botTextStreams.set(msgId, msg.text);
+                    if (!bufferForTools) emitContent(delta);
+                  }
                 }
               }
             }

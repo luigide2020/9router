@@ -193,6 +193,25 @@ Always use provider prefix: `m365-copilot/gpt-5.6-sol`, not just `gpt-5.6`.
 - **Login browser** (`login.py`): Uses `M365_PROXY` (falls back to `HTTPS_PROXY`/`HTTP_PROXY`) — Playwright browser traffic routes through this proxy so exit IP is in Taiwan. Region check (`ALLOWED_COUNTRY_CODES = {"TW"}`) validates exit IP before login proceeds.
 - **sync_remote.sh**: Passes `M365_PROXY` env var and `--proxy` CLI arg to `login.py`.
 
+## Bot Text Dedup (Fix53)
+
+M365 WS protocol sends each T2 bot message **twice** (identical text, possibly different messageId). Dedup at two layers:
+
+1. **`rebuildFullText`** — Set-based dedup: identical text values from different Map keys are merged into one entry (covers `bufferForTools` mode)
+2. **T6/T2 cross-msgId dedup** — When processing bot text, if `msgId !== "default"` and an identical text already exists under a different key in `botTextStreams`, skip the duplicate (covers streaming mode)
+
+## isContinuation Detection (Fix49 + Fix54)
+
+```
+isContinuationByStructure = hasAssistantHistory && earlierUserCount > 0 && !hasToolResults
+isContinuationByCache = seenConversationFingerprints.has(convId)
+isContinuation = isContinuationByStructure || (isContinuationByCache && hasAssistantHistory)
+```
+
+Fix54: Cache alone is insufficient — new tasks can have cache hits from previous conversations. Requiring `hasAssistantHistory` ensures new tasks (only SYSTEM+USER messages) are never misrouted to `extractContinuationPrompt`.
+
+**Known limitation**: Within a Codex agentic loop, `hasAssistantHistory` is always true after the first turn. Topic switches mid-session still get `isContinuation=true(struct=true)`. This requires Context Agent for proper semantic detection.
+
 ## Image Handling (Fix52)
 
 When prompt contains `<image` tag (Codex sends inline images with local file paths):

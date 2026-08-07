@@ -395,6 +395,8 @@ Added `extractHistoricalToolCallSignatures(messages)` which scans all ASSISTANT 
 | NLU fallback exclude past-tense 看到/看了/看过 (Fix50) | Verified — "我看到有些向日葵低下了头" no longer triggers exec_command |
 | Continuation prompt includes previous interaction pair (Fix51) | Pending verification — need to confirm topic retention prevents hallucination |
 | disableCodeInterpreter respects needsLocalExec + image anti-read hint (Fix52) | Pending verification — need to confirm image questions use vision instead of python OCR |
+| Bot text dedup rebuildFullText Set + cross-msgId (Fix53) | Pending verification — need to confirm duplicate T2 no longer causes doubled output |
+| isContinuation cache requires hasAssistantHistory (Fix54) | Pending verification — need to confirm new tasks are no longer misrouted to extractContinuationPrompt |
 
 ## Fix45: WS Connect Retry + 502 Short Cooldown
 
@@ -507,6 +509,7 @@ new: conversationIdBase = resolveSessionId({ connectionId: email + ":conv:" + sh
 10. **`apply_patch` failures may recur** — Fix44 forces M365 to output manual code changes after 3 failures, but the root cause (patch content not matching actual file, possibly due to sanitizeForM365 corruption or Codex sandbox file differences) is not fixed. See Fix39.
 11. **STABLE conversationId memory unverified** — `isStartOfSession: true` + `invocationId: 0` sent every request may prevent M365 from using conversation memory. If STABLE doesn't work, count-based loop guard (Fix43, threshold=5) is the safety net. Fix46 isolates contexts per conversation to prevent cross-topic pollution regardless of whether M365 actually uses the memory.
 12. **conversationId based on first USER message** — If the same user sends identical first messages in separate chats (rare), they'll share a conversationId. This is acceptable: identical questions can share context.
+13. **isContinuation heuristic is fundamentally limited** — Fix54 reduces cache false positives by requiring `hasAssistantHistory`, but within a single Codex agentic loop, there is no conversation boundary. When a user changes topic mid-session, the message array still contains all prior history with ASSISTANT messages, so `isContinuation=true(struct=true)`. `extractContinuationPrompt` with 200-400 bytes cannot carry enough context for topic switches. Only Context Agent with semantic topic detection can solve this properly.
 
 ---
 
@@ -602,3 +605,40 @@ The second pattern `让我(?:看|读|查|...)` is inherently imperative and does
 
 **Before**: User sends image → M365 executes `python3 + PIL + tesseract` (fails, file not accessible remotely)
 **After**: User sends image → CI disabled + anti-read hint → M365 uses vision capability to see inline image and answer directly ✅
+
+---
+
+## Fix53: Bot Text Dedup — rebuildFullText Set + Cross-msgId Dedup
+
+**File**: `m365-copilot.js`
+
+**Root cause**: M365's WS protocol sends each T2 bot message **twice** (identical text, possibly different messageId). The `botTextStreams` Map keyed by msgId treated these as separate streams. In `bufferForTools` mode, `rebuildFullText()` joined all Map values — duplicate values produced duplicate text. In non-buffer mode, both streams emitted delta independently, causing double content to the client.
+
+**Fix** (two-layer):
+
+### Layer 1: `rebuildFullText` Set dedup
+- Changed from `parts = [...botTextStreams.values()].filter(t => t)` to Set-based dedup: `if (text && !seen.has(text)) { seen.add(text); parts.push(text); }`
+- Covers buffer mode: identical text from different msgIds only included once
+
+### Layer 2: Cross-msgId dedup in T6/T2 bot text handling
+- When `msg.text.length > prev.length` and `msgId !== "default"`, scan all existing Map values for exact match
+- If `v === msg.text` found under a different key → skip (log `[M365-WS-T6/T2] skipped cross-msgId duplicate bot text`)
+- Covers non-buffer mode: duplicate stream not stored or emitted
+
+**Before**: M365 sends T2 bot text twice → user sees identical content repeated
+**After**: Set dedup + cross-msgId check → each unique text emitted once ✅
+
+---
+
+## Fix54: isContinuation Cache False Positive — Require hasAssistantHistory
+
+**File**: `openai-to-m365-copilot.js`
+
+**Root cause**: `isContinuation = isContinuationByCache || isContinuationByStructure` — cache hit alone was enough to flag a request as continuation. When a user started a new task, the fingerprint of the first USER message could match a cached conversationId from a previous task, causing `isContinuation=true(cache=true,struct=false)`. New tasks (only 3 messages, no ASSISTANT history) were routed to `extractContinuationPrompt` instead of `flattenMessages`, giving M365 insufficient context.
+
+**Fix**: Changed to `isContinuation = isContinuationByStructure || (isContinuationByCache && hasAssistantHistory)`. Cache hit now requires `hasAssistantHistory=true` to qualify as continuation. A new task with only SYSTEM+USER messages will never be flagged as continuation by cache alone.
+
+**Before**: New task → `isContinuation=true(cache=true,struct=false)` → `extractContinuationPrompt` → 352 bytes → M365 loses all context
+**After**: New task → `isContinuation=false(cache=true but no assistant history)` → `flattenMessages` → full context ✅
+
+**Note**: This fix addresses the most common cache false-positive case (new tasks). The deeper issue — Codex agentic loops having no conversation boundary within a single message array — can only be properly solved by Context Agent with semantic topic detection.
