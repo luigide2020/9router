@@ -280,7 +280,8 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
         if (bufferForTools && fullText) {
           const hasCmd = /^CMD:/m.test(fullText);
           const hasRemoteExec = /\/mnt\/(file_upload|data|home|tmp|usr|var|workspace|sandbox)/.test(fullText);
-          console.log(`[M365-CLOSE] Buffering tools: textLen=${fullText.length}, needsLocalExec=${!!toolMeta?.needsLocalExec}, hasJsonTool=${fullText.includes('```json-tool')}, hasCmd=${hasCmd}, hasRemoteExec=${hasRemoteExec}`);
+          const hasSandboxFail = /(?:当前执行环境|访问不到|无法访问|No such file or directory|\.codex\/attachments)/.test(fullText);
+          console.log(`[M365-CLOSE] Buffering tools: textLen=${fullText.length}, needsLocalExec=${!!toolMeta?.needsLocalExec}, hasJsonTool=${fullText.includes('```json-tool')}, hasCmd=${hasCmd}, hasRemoteExec=${hasRemoteExec}, hasSandboxFail=${hasSandboxFail}`);
           console.log(`[M365-CLOSE-FULL] ${fullText.slice(0, 1000)}`);
           emitContent(fullText);
         }
@@ -886,7 +887,11 @@ export class M365CopilotExecutor extends BaseExecutor {
     if (/<image\b/i.test(effectivePrompt)) {
       effectivePrompt = effectivePrompt + "\n\nIMPORTANT: Images are already included inline above. Do NOT attempt to read, open, or process any image file paths (e.g. /var/folders/...). Just answer based on the images shown.";
     }
-    console.log(`[M365-EXEC-FLAGS] disableCodeInterpreter=${m365Flags.disableCodeInterpreter} enableSearch=${m365Flags.enableSearch} experienceType=Default tone=${enableReasoning ? "Reasoning" : "Balanced"} hasImage=${/<image\b/i.test(userPrompt)}`);
+    const hasLocalPaths = /\/(Users|home|var|tmp|root|etc)\//.test(effectivePrompt) || /\.codex\/attachments\//.test(effectivePrompt);
+    if (hasLocalPaths && toolMeta?.needsLocalExec) {
+      effectivePrompt = effectivePrompt + "\n\nIMPORTANT: File paths in this conversation are on the user's machine — you do NOT have access to them. Do NOT attempt to execute any commands yourself. Instead, ALWAYS output a JSON instruction for the user to execute on their machine.";
+    }
+    console.log(`[M365-EXEC-FLAGS] disableCodeInterpreter=${m365Flags.disableCodeInterpreter} enableSearch=${m365Flags.enableSearch} experienceType=Default tone=${enableReasoning ? "Reasoning" : "Balanced"} hasImage=${/<image\b/i.test(userPrompt)} hasLocalPaths=${hasLocalPaths}`);
     const copilotMsg = buildCopilotMessage(effectivePrompt, 0, conversationId, sessionIdUuid, enableReasoning, modelId, m365Flags);
     log?.info?.("M365-COPILOT", `WS send: optionsSets=${JSON.stringify(copilotMsg.arguments[0].optionsSets)}, plugins=${JSON.stringify(copilotMsg.arguments[0].plugins)}, allowedMessageTypes=${JSON.stringify(copilotMsg.arguments[0].allowedMessageTypes)}`);
     ws.send(JSON.stringify(copilotMsg) + RS);

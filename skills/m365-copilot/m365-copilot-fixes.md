@@ -642,3 +642,34 @@ The second pattern `让我(?:看|读|查|...)` is inherently imperative and does
 **After**: New task → `isContinuation=false(cache=true but no assistant history)` → `flattenMessages` → full context ✅
 
 **Note**: This fix addresses the most common cache false-positive case (new tasks). The deeper issue — Codex agentic loops having no conversation boundary within a single message array — can only be properly solved by Context Agent with semantic topic detection.
+
+---
+
+## Fix55: Sandbox Execution Failure Detection + Remote Exec Prohibition
+
+**Files**: `openai-to-m365-copilot.js`, `m365-copilot-to-openai.js`, `m365-copilot.js`
+
+**Root cause**: M365's Code Interpreter executes commands in a remote sandbox even when `disableCodeInterpreter=true`. When M365 tries to read local paths (e.g., `/Users/liujie/.codex/attachments/...`), the sandbox can't access them, and M365 returns pure text like "我访问不到" or "No such file or directory". Since the error output doesn't contain `/mnt/` patterns, `isRemoteExecutionResult()` returns `false`, no tool_call is extracted, and the pure error text is passed to Codex — causing the agent loop to stall.
+
+**Fix** (three-layer):
+
+### Layer 1: Prompt-side remote exec prohibition (`openai-to-m365-copilot.js`)
+- Added `remoteExecProhibition` text to `buildAntiExecutionPrompt()`: "You do NOT have direct access to the user's files or machine. NEVER execute any command yourself — always output a JSON instruction for the user to execute on their machine."
+- This makes the anti-exec instruction more explicit and unconditional
+
+### Layer 2: Prompt-side local path hint (`m365-copilot.js`)
+- When prompt contains local paths (`/Users/`, `/home/`, `.codex/attachments/` etc.) AND `needsLocalExec=true`, append: "File paths in this conversation are on the user's machine — you do NOT have access to them. Do NOT attempt to execute any commands yourself."
+- Added `hasLocalPaths` flag to `[M365-EXEC-FLAGS]` log line
+- Similar pattern to Fix52 image anti-read hint
+
+### Layer 3: Response-side sandbox execution failure detection (`m365-copilot-to-openai.js`)
+- Added `SANDBOX_EXEC_FAILURE_INDICATORS` — regex patterns for Chinese/English sandbox failure text: "当前执行环境访问不到", "我按你要求执行了", "No such file or directory", "cat: /Users/...", etc.
+- Added `isSandboxExecutionFailure(text)` function
+- Added `extractCommandFromSandboxFailure(text)` — extracts the command M365 tried to execute from the failure text
+- New `SANDBOX_EXEC_FAILURE_CHECK` rule in `extractToolCallsFromText()`, placed after `REMOTE_EXEC_CHECK` and before `INLINE_BACKTICK`
+- When detected: extracts command → converts to `exec_command` tool_call → Codex executes locally
+- `isRemote` flag in `buildToolCallResults()` now includes sandbox failures — so remote error output is stripped, only tool_call is sent to Codex
+- `stripToolPatternsFromText()` now also cleans sandbox failure patterns from output text
+
+**Before**: M365 executes `cat /Users/liujie/.codex/attachments/...` in sandbox → "我访问不到" → `isRemote=false` → no tool_call → Codex stalls
+**After**: M365 executes `cat /Users/...` in sandbox → "我访问不到" → `isSandboxFail=true` → extract `cat /Users/...` → `exec_command cat /Users/...` tool_call → Codex executes locally ✅

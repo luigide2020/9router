@@ -29,6 +29,16 @@ const REMOTE_EXEC_INDICATORS = [
   /\n\s*count:\s*\d+\s*\n/,
   /file_upload.*\n.*count:/,
 ];
+
+const SANDBOX_EXEC_FAILURE_INDICATORS = [
+  /当前执行环境(?:里)?(?:没有|无法|访问不到|不可)/,
+  /(?:我按你要求|我尝试|我执行了?)(?:执行|运行|读取|查看)/,
+  /(?:访问不到|无法访问|不可访问|No such file or directory)/,
+  /cat:\s*\/(Users|home|tmp|var|root)\//,
+  /(?:结果仍然?是|返回是)[:：]/,
+  /(?:宿主路径|附件路径|文件路径).*(?:没有挂|不可达|不存在|not found)/,
+  /(?:当前|本)(?:执行环境|环境)(?:里)?(?:没有|无法|还是)/,
+];
 const JSON_TOOL_RE = /```json-tool\s*\n([\s\S]*?)```/g;
 const INLINE_JSON_TOOL_RE = /\{[\s\n]*"name"\s*:\s*"[^"]+"[\s\n]*,\s*[\s\n]*"arguments"\s*:\s*\{[\s\S]*?\}\s*\}/g;
 const NAKED_CMD_JSON_RE = /\{\s*"(cmd|command|code|run)"\s*:\s*"([^"]+)"\s*\}/g;
@@ -47,6 +57,28 @@ const ACTION_INTENT_PATTERNS = [
 
 function isRemoteExecutionResult(text) {
   return REMOTE_EXEC_INDICATORS.some(re => re.test(text));
+}
+
+function isSandboxExecutionFailure(text) {
+  return SANDBOX_EXEC_FAILURE_INDICATORS.some(re => re.test(text));
+}
+
+function extractCommandFromSandboxFailure(text) {
+  const patterns = [
+    /```(?:text|bash|shell)?\s*\n\s*(cat|ls|head|tail|grep|find|pwd|wc|file|stat|less|more|sed|awk|python3?)\s+([^\n]+)\n?```/i,
+    /(?:执行了?|运行了?|尝试)(?:了?)?\s*[`"]([^`"]+)[`"]/,
+    /(?:cat|ls|head|tail|grep|find|sed|awk|python3?)\s+\/(Users|home|tmp|var|root)\/[^\s"`',]+/i,
+    /`([^`]*(?:cat|ls|head|tail|grep|find|sed|awk|python3?)[^`]*)`/i,
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match) {
+      const cmd = (match[1] || match[0]).trim();
+      console.log(`[M365-RESP-EXTRACT] rule=SANDBOX_FAILURE_CMD pattern=${pattern.source.slice(0, 40)} cmd="${cmd.slice(0, 100)}"`);
+      return cmd;
+    }
+  }
+  return null;
 }
 
 function extractShellToolName(toolMeta) {
@@ -257,6 +289,28 @@ function extractToolCallsFromText(text, toolMeta) {
       calls.push(makeToolCall(toolName, { [argName]: command }));
     }
   }
+
+  if (calls.length === 0) {
+    const isSandboxFail = isSandboxExecutionFailure(text);
+    console.log(`[M365-RESP-EXTRACT] rule=SANDBOX_EXEC_FAILURE_CHECK isSandboxFail=${isSandboxFail}`);
+    if (isSandboxFail) {
+      const toolName = extractShellToolName(toolMeta);
+      const argName = getShellToolCommandArgName(toolMeta);
+      const extractedCmd = extractCommandFromSandboxFailure(text);
+      let command = extractedCmd || "ls";
+      if (!extractedCmd) {
+        const backtickContent = text.match(/```(?:text|bash|shell)?\s*\n([\s\S]*?)```/);
+        if (backtickContent) {
+          const firstLine = backtickContent[1].trim().split("\n")[0];
+          if (COMMON_COMMANDS_RE.test(firstLine)) {
+            command = firstLine;
+          }
+        }
+      }
+      console.log(`[M365-RESP-EXTRACT] rule=SANDBOX_EXEC_FAILURE → toolCall name=${toolName} command="${command.slice(0, 100)}"`);
+      calls.push(makeToolCall(toolName, { [argName]: command }));
+    }
+  }
   if (calls.length === 0) {
     const inlineCmd = text.match(/`([^`]+)`/);
     if (inlineCmd) {
@@ -300,6 +354,17 @@ function stripToolPatternsFromText(text) {
     cleaned = cleaned.replace(/`[^`]*\/mnt[^`]*`(?:\s+is\s+(?:empty|not found)[.:])?/g, "").trim();
     cleaned = cleaned.replace(/cwd:\s*\/mnt[^\n]*/g, "").trim();
     cleaned = cleaned.replace(/count:\s*\d+/g, "").trim();
+  }
+  if (isSandboxExecutionFailure(cleaned)) {
+    const backtickMatch = cleaned.match(/```(?:text|bash|shell)?\s*\n([\s\S]*?)```/);
+    if (backtickMatch) {
+      cleaned = cleaned.replace(backtickMatch[0], "").trim();
+    }
+    cleaned = cleaned.replace(/(?:我按你要求|我尝试|我执行了?)(?:执行|运行|读取|查看)[^\n]*\n?/g, "").trim();
+    cleaned = cleaned.replace(/(?:当前执行环境|宿主路径|附件路径)[^\n]*\n?/g, "").trim();
+    cleaned = cleaned.replace(/(?:结果仍然?是|返回是)[:：][^\n]*\n?/g, "").trim();
+    cleaned = cleaned.replace(/(?:访问不到|无法访问|不可访问)[^\n]*\n?/g, "").trim();
+    cleaned = cleaned.replace(/cat:\s*\/(Users|home|tmp|var|root)\/[^\n]*\n?/g, "").trim();
   }
   return cleaned;
 }
@@ -401,7 +466,7 @@ function m365CopilotToOpenAIResponse(chunk, state) {
     console.log(`[M365-RESP-TRANSLATE] isRemote=${isRemoteCheck} bufferPreview=${state._m365TextBuffer.slice(0, 200).replace(/\n/g,"\\n")}`);
     const toolCalls = extractToolCallsFromText(state._m365TextBuffer, state._m365ToolMeta);
     console.log(`[M365-RESP-TRANSLATE] extracted toolCalls=${toolCalls.length}, names=[${toolCalls.map(tc => tc.function.name).join(",")}]`);
-    const isRemote = isRemoteExecutionResult(state._m365TextBuffer);
+    const isRemote = isRemoteExecutionResult(state._m365TextBuffer) || isSandboxExecutionFailure(state._m365TextBuffer);
 
     const historicalCounts = state._m365ToolMeta?.historicalToolCallCounts;
     const LOOP_THRESHOLD = 5;

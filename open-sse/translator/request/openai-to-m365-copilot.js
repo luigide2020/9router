@@ -319,11 +319,14 @@ function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas, hasSearchToo
 
   const scopeConstraint = "Do ONLY what the user explicitly asks. Do NOT expand scope — if the user asks to read one file, read only that file; do NOT read related files, dependencies, or follow-up files unless the user asks.";
 
+  const remoteExecProhibition = "You do NOT have direct access to the user's files or machine. NEVER execute any command yourself — always output a JSON instruction for the user to execute on their machine. If you need to read a file, list a directory, or run any command, output the JSON instruction and wait for the result. Do NOT attempt to execute commands in your environment.";
+
   if (hasSearchTools) {
     return [
       destructiveBlock,
       "You are assisting a user who has a command-line interface. For any action the user requests (checking, searching, reading, listing, etc.), always output a JSON instruction using this schema, and the user will handle the execution:",
       schemaInstr,
+      remoteExecProhibition,
       scopeConstraint,
       langHint,
       "IMPORTANT: You MUST output a JSON instruction for ANY action — including reading files, listing directories, checking status, or running commands. The ONLY time you should use plain text is when you are providing a final summary with NO further actions needed.",
@@ -334,6 +337,7 @@ function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas, hasSearchToo
     destructiveBlock,
     "You are assisting a user who has a command-line interface. For any action the user requests, always output a JSON instruction using this schema, and the user will handle the execution:",
     schemaInstr,
+    remoteExecProhibition,
     scopeConstraint,
     langHint,
     "IMPORTANT: You MUST output a JSON instruction for ANY action — including reading files, listing directories, checking status, or running commands. The ONLY time you should use plain text is when you are providing a final summary with NO further actions needed.",
