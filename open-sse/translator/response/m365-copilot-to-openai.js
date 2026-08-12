@@ -124,6 +124,10 @@ function extractNaturalLanguageIntent(text, toolMeta) {
     const match = text.match(pattern);
     if (!match) continue;
     const captured = match[1] || "";
+    if (/^https?:\/\//i.test(captured) || /`https?:\/\//i.test(captured)) {
+      console.log(`[M365-RESP-EXTRACT] rule=NLU_FALLBACK skipped: captured is a URL "${captured.slice(0, 60)}"`);
+      continue;
+    }
     const toolName = extractShellToolName(toolMeta);
     const argName = getShellToolCommandArgName(toolMeta);
     let command;
@@ -466,6 +470,9 @@ function m365CopilotToOpenAIResponse(chunk, state) {
     console.log(`[M365-RESP-TRANSLATE] isRemote=${isRemoteCheck} bufferPreview=${state._m365TextBuffer.slice(0, 200).replace(/\n/g,"\\n")}`);
     const toolCalls = extractToolCallsFromText(state._m365TextBuffer, state._m365ToolMeta);
     console.log(`[M365-RESP-TRANSLATE] extracted toolCalls=${toolCalls.length}, names=[${toolCalls.map(tc => tc.function.name).join(",")}]`);
+    if (toolCalls.length === 0 && state._m365ToolMeta?.consecutivePureTextCount > 0) {
+      console.log(`[M365-RESP-STALL] consecutivePureTextCount=${state._m365ToolMeta.consecutivePureTextCount} (stall detected on request side), toolCalls=0 — pure-text response`);
+    }
     const isRemote = isRemoteExecutionResult(state._m365TextBuffer) || isSandboxExecutionFailure(state._m365TextBuffer);
 
     const historicalCounts = state._m365ToolMeta?.historicalToolCallCounts;

@@ -33,6 +33,7 @@ Evidence from WS logs: `offense="OffenseTrigger"` on `author=user` echo, `conten
 | Remote exec result | `/mnt/file_upload` + `cwd: /mnt/` | `REMOTE_EXEC_INDICATORS` |
 | Natural language intent (NLU fallback) | "我来看一下附件" / "I'll read the file" | `ACTION_INTENT_PATTERNS` + `extractNaturalLanguageIntent()` |
 | Natural language intent (past-tense excluded) | "我看到有些向日葵低下了头" | `看(?!到|了|过)` negative lookahead — NOT matched |
+| Natural language intent (URL excluded) | "我打开 `https://agentrouter.org/register`" | URL detected → NLU skipped (Fix56) |
 
 **Fix48 changes**:
 - INLINE_BACKTICK: removed `COMMON_COMMANDS_RE` whitelist gate. Whether a backtick is a command is determined by `COMMAND_INTENT_RE` context (intent verb before backtick), not by whether the word is in a whitelist.
@@ -144,7 +145,7 @@ const SHELL_TOOL_NAMES = [
 
 **REMOVED in Fix42**. The gpt-5.6-specific destructive guardrail (`DESTRUCTIVE_COMMAND_PATTERNS` + `isDestructiveCommand()`) was removed due to high false-positive rate blocking legitimate code modification commands. Request-side `sanitizeForM365()` provides equivalent protection by removing dangerous words from the prompt before M365 sees them.
 
-## Request Routing Decision Tree (Fix49 Update)
+## Request Routing Decision Tree (Fix57 Update)
 
 ```
 lastMsg.role === TOOL?
@@ -153,12 +154,17 @@ lastMsg.role === TOOL?
      → buildEarlierContext (cwd + prev command)
      → prompt: "Here is the result..." + schema + reminder
 
+isStalling (consecutivePureText >= 2)?
+  → flattenMessages(stall_break)
+     → full conversation history + stallBreakHint
+     → breaks pure-text feedback loop
+
 hasEarlierToolResults?
   && isContinuation (cache or structure)?
-    → extractContinuationPrompt(earlier_tools)
-       → last USER/ASSISTANT + [Previous User/Assistant pair] + buildEarlierContext summary
+     → extractContinuationPrompt(earlier_tools)
+        → last USER/ASSISTANT + [Previous User/Assistant pair] + buildEarlierContext summary
   && !isContinuation (first turn with earlier tools)?
-    → flattenMessages(earlier_tools_first_turn)
+     → flattenMessages(earlier_tools_first_turn)
 
 isContinuation && !hasEarlierToolResults?
   → extractContinuationPrompt
@@ -226,3 +232,25 @@ When prompt contains `<image` tag (Codex sends inline images with local file pat
 - Must either: `docker build`, or directly modify compiled chunks (risky but faster for hotfixes)
 - Compiled chunk for M365 code: `.next/server/chunks/216.js`
 - Crypto imports must use explicit Node.js: `import { createHash, randomUUID } from "crypto"` (not Web Crypto)
+
+## Pure-Text Stall Guard (Fix57)
+
+Detects and breaks the feedback loop where M365 replies with pure text (no tool_call), Codex treats `finish_reason=stop` as "incomplete", and sends another request via `extractContinuationPrompt` with minimal context.
+
+### Detection
+
+- `countConsecutivePureText(messages)` — scans backwards from end, counting consecutive ASSISTANT messages with no `tool_calls`
+- Skips USER messages between them (Codex inserts these as continuation prompts)
+- `STALL_THRESHOLD = 2` — after 2 consecutive pure-text ASSISTANT responses, stall is detected
+
+### Actions when stall detected
+
+1. **Strategy override**: Skip `extractContinuationPrompt`, force `flattenMessages(stall_break)` — full context so M365 sees it already answered
+2. **stallBreakHint**: Appended to `finalPrompt` — "The assistant has already provided a text answer. Do NOT repeat."
+3. **Diagnostic**: `consecutivePureTextCount` carried in `_m365ToolMeta`, logged as `[M365-REQ-STALL]` and `[M365-RESP-STALL]`
+
+### Interaction with other guards
+
+- **LOOP_GUARD (Fix43)**: Complementary — Fix43 handles tool_call signature loops, Fix57 handles pure-text stalls
+- **hasToolResults**: Always takes priority — stall guard never overrides tool_result processing
+- **isContinuation**: Stall guard checks after `isContinuation` computation but before strategy selection

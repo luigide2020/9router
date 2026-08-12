@@ -397,6 +397,8 @@ Added `extractHistoricalToolCallSignatures(messages)` which scans all ASSISTANT 
 | disableCodeInterpreter respects needsLocalExec + image anti-read hint (Fix52) | Pending verification — need to confirm image questions use vision instead of python OCR |
 | Bot text dedup rebuildFullText Set + cross-msgId (Fix53) | Pending verification — need to confirm duplicate T2 no longer causes doubled output |
 | isContinuation cache requires hasAssistantHistory (Fix54) | Pending verification — need to confirm new tasks are no longer misrouted to extractContinuationPrompt |
+| NLU fallback skip URL captured content (Fix56) | Pending verification — need to confirm "我打开 URL" no longer generates meaningless ls |
+| Pure-text stall guard (Fix57) | Pending verification — need to confirm consecutive pure-text turns trigger flattenMessages + stallBreakHint |
 
 ## Fix45: WS Connect Retry + 502 Short Cooldown
 
@@ -673,3 +675,50 @@ The second pattern `让我(?:看|读|查|...)` is inherently imperative and does
 
 **Before**: M365 executes `cat /Users/liujie/.codex/attachments/...` in sandbox → "我访问不到" → `isRemote=false` → no tool_call → Codex stalls
 **After**: M365 executes `cat /Users/...` in sandbox → "我访问不到" → `isSandboxFail=true` → extract `cat /Users/...` → `exec_command cat /Users/...` tool_call → Codex executes locally ✅
+
+---
+
+## Fix56: NLU Fallback — Skip URL Captured Content
+
+**File**: `m365-copilot-to-openai.js`
+
+**Root cause**: M365 replied with pure text answering the user's question about New API / One API registration: "可以，你这个思路是对的...New API / One API 默认确实都有后端注册 API...我打开 `https://agentrouter.org/register`". The NLU_FALLBACK `ACTION_INTENT_PATTERNS[0]` matched "我打开" (打开 is in the intent verb list), captured `` `https://agentrouter.org/register` ``. Since a URL is not a file path or shell command, `extractNaturalLanguageIntent` fell through to `command = "ls"` — a completely meaningless command. Codex executed `ls`, got "outputs\nwork", M365 said "不需要继续执行命令", and the loop stalled with the original answer already given.
+
+**Fix**: In `extractNaturalLanguageIntent()`, when the captured content starts with `https://` or `http://` (with or without backtick wrapping), skip that pattern match and `continue` to the next pattern. Opening a URL is a browser action, not a shell command — the NLU should never generate a tool_call for it.
+
+**Before**: "我打开 `https://agentrouter.org/register`" → NLU_FALLBACK → `exec_command: ls` (meaningless, causes loop stall)
+**After**: "我打开 `https://agentrouter.org/register`" → NLU skipped (URL detected) → `extracted toolCalls=0` → Codex receives the text answer ✅
+
+---
+
+## Fix57: Pure-Text Stall Guard — Break M365 Continuation Feedback Loop
+
+**Files**: `openai-to-m365-copilot.js`, `m365-copilot-to-openai.js`
+
+**Root cause**: When M365 replies with pure text (no tool_call, `finish_reason=stop`), Codex CLI treats it as "model chose not to use tools this turn" and continues the agentic loop. It appends the ASSISTANT pure-text response to history and sends a new request. This triggers `isContinuationByStructure=true` (because `hasAssistantHistory` is permanently true after the first turn), routing to `extractContinuationPrompt` which produces a tiny ~100-byte prompt. M365 sees minimal context, repeats the same answer or gets confused, and the loop continues indefinitely.
+
+The existing LOOP_GUARD (Fix43) only tracks tool_call signatures — pure-text responses are invisible to it. The forceSummarize mechanism (Fix36) only triggers at `totalCommands >= 15`, which pure-text turns don't increment.
+
+**Fix** (three-layer):
+
+### Layer 1: Request-side stall detection — `countConsecutivePureText()`
+
+- New function scans message history **backwards**, counting consecutive ASSISTANT messages with no `tool_calls`
+- Skips USER messages between them (Codex inserts these as continuation prompts, not genuine new input)
+- `STALL_THRESHOLD = 2`: after 2 consecutive pure-text ASSISTANT responses, stall is detected
+
+### Layer 2: Strategy override — break the feedback loop
+
+When `isStalling=true`:
+1. **Skip `extractContinuationPrompt`**: Force `flattenMessages` instead (strategy = `"flattenMessages(stall_break)"`)
+   - Gives M365 the full conversation context so it can see it already answered the question
+2. **Append `stallBreakHint`**: Tells M365 "The assistant has already provided a text answer. Do NOT repeat. Either provide NEW information with a JSON instruction, or confirm the task is complete."
+3. Logs: `[M365-REQ-STALL] consecutivePureText=N >= 2, switching from extractContinuationPrompt to flattenMessages`
+
+### Layer 3: `_m365ToolMeta.consecutivePureTextCount` for diagnostics
+
+- New field carried in toolMeta, read by response translator
+- Response translator logs: `[M365-RESP-STALL] consecutivePureTextCount=N (stall detected on request side), toolCalls=0`
+
+**Before**: M365 pure text → Codex re-sends → `extractContinuationPrompt` (~100 bytes) → M365 repeats → infinite loop
+**After**: M365 pure text (×2) → stall detected → `flattenMessages` (full context) + stallBreakHint → M365 sees full context, provides final answer or new action ✅

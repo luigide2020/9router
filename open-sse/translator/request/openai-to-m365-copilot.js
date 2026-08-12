@@ -28,6 +28,7 @@ import { createHash } from "crypto";
 
 const SEEN_CONV_MAX = 500;
 const SEEN_CONV_TTL_MS = 30 * 60 * 1000;
+const STALL_THRESHOLD = 2;
 const seenConversationFingerprints = new Map();
 
 function getConversationFingerprint(messages) {
@@ -815,6 +816,21 @@ function buildHistoricalToolCallCounts(messages) {
   return counts;
 }
 
+function countConsecutivePureText(messages) {
+  let count = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === ROLE.ASSISTANT) {
+      if (messages[i].tool_calls && messages[i].tool_calls.length > 0) break;
+      count++;
+    } else if (messages[i].role === ROLE.USER) {
+      continue;
+    } else {
+      break;
+    }
+  }
+  return count;
+}
+
 function openaiToM365CopilotRequest(model, body, stream, credentials) {
   const tools = body.tools;
   const messages = body.messages || [];
@@ -835,8 +851,10 @@ function openaiToM365CopilotRequest(model, body, stream, credentials) {
   const isContinuationByCache = isConversationSeen(convId);
   const isContinuationByStructure = hasAssistantHistory && earlierUserCount > 0 && !hasToolResults;
   const isContinuation = isContinuationByStructure || (isContinuationByCache && hasAssistantHistory);
+  const consecutivePureText = countConsecutivePureText(messages);
+  const isStalling = consecutivePureText >= STALL_THRESHOLD;
   markConversationSeen(convId);
-  console.log(`[M365-REQ-TRANSLATE] model=${model} messages=${messages.length} tools=${tools?.length||0} hasToolResults=${hasToolResults} hasEarlierToolResults=${hasEarlierToolResults} needsLocalExec=${!!toolMeta?.needsLocalExec} isContinuation=${isContinuation}(cache=${isContinuationByCache},struct=${isContinuationByStructure}) convId=${convId} hasSystem=${hasSystemPrompt} earlierUser=${earlierUserCount} shellTools=${JSON.stringify(toolMeta?.shellToolNames||[])} searchTools=${JSON.stringify(toolMeta?.searchToolNames||[])} fileOpTools=${JSON.stringify(toolMeta?.fileOpToolNames||[])}`);
+  console.log(`[M365-REQ-TRANSLATE] model=${model} messages=${messages.length} tools=${tools?.length||0} hasToolResults=${hasToolResults} hasEarlierToolResults=${hasEarlierToolResults} needsLocalExec=${!!toolMeta?.needsLocalExec} isContinuation=${isContinuation}(cache=${isContinuationByCache},struct=${isContinuationByStructure}) consecutivePureText=${consecutivePureText} isStalling=${isStalling} convId=${convId} hasSystem=${hasSystemPrompt} earlierUser=${earlierUserCount} shellTools=${JSON.stringify(toolMeta?.shellToolNames||[])} searchTools=${JSON.stringify(toolMeta?.searchToolNames||[])} fileOpTools=${JSON.stringify(toolMeta?.fileOpToolNames||[])}`);
 
 
   let flatMessages;
@@ -851,6 +869,10 @@ function openaiToM365CopilotRequest(model, body, stream, credentials) {
       flatMessages = flattenMessages(messages, toolCallMetaMap);
       strategy = "flattenMessages(tool_fallback)";
     }
+  } else if (isStalling) {
+    console.log(`[M365-REQ-STALL] consecutivePureText=${consecutivePureText} >= ${STALL_THRESHOLD}, switching from extractContinuationPrompt to flattenMessages`);
+    flatMessages = flattenMessages(messages, toolCallMetaMap);
+    strategy = "flattenMessages(stall_break)";
   } else if (hasEarlierToolResults && isContinuation) {
     const continuationPrompt = extractContinuationPrompt(messages, toolCallMetaMap, toolMeta);
     if (continuationPrompt) {
@@ -937,6 +959,12 @@ function openaiToM365CopilotRequest(model, body, stream, credentials) {
     console.log(`[M365-REQ-TRANSLATE] prompt_layout=flatMessages_only finalPrompt_len=${finalPrompt.length}`);
   }
 
+  if (isStalling) {
+    const stallBreakHint = `\n\n[IMPORTANT: The assistant has already provided a text answer to this question in the conversation above. This is a continuation loop — do NOT repeat the same answer. Either provide NEW information with a JSON instruction, or confirm that the task is complete with a brief summary.]`;
+    finalPrompt += stallBreakHint;
+    console.log(`[M365-REQ-STALL] appended stallBreakHint, finalPrompt_len=${finalPrompt.length}`);
+  }
+
   const beforeSanitize = finalPrompt;
   const afterSanitize = sanitizeForM365(finalPrompt);
   const sanitizeRe = /\b(rm|rmdir|del|delete|shred|format|erase|wipe|destroy|destructive|truncate|overwrite|kill|killall|chmod|chown)\b/gi;
@@ -965,6 +993,7 @@ function openaiToM365CopilotRequest(model, body, stream, credentials) {
       searchToolNames: toolMeta?.searchToolNames || [],
       fileOpToolNames: toolMeta?.fileOpToolNames || [],
       historicalToolCallCounts,
+      consecutivePureTextCount: consecutivePureText,
     },
     stream,
   };
