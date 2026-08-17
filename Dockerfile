@@ -48,6 +48,9 @@ COPY --from=builder /app/node_modules/https-proxy-agent ./node_modules/https-pro
 COPY --from=builder /app/node_modules/agent-base ./node_modules/agent-base
 COPY --from=builder /app/node_modules/debug ./node_modules/debug
 COPY --from=builder /app/node_modules/ms ./node_modules/ms
+# sql.js loads dist/sql-wasm.wasm by path at runtime; tracing only follows JS imports,
+# so the last-resort DB driver would abort with ENOENT on the missing binary.
+COPY --from=builder /app/node_modules/sql.js ./node_modules/sql.js
 
 RUN mkdir -p /app/data && chown -R node:node /app && \
   ln -sf /app/data /root/.9router 2>/dev/null || true
