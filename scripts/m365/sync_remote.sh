@@ -12,14 +12,8 @@ UV="$(command -v uv 2>/dev/null || echo /Users/liujie/.local/bin/uv)"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-ENV_FILE="$PROJECT_DIR/.env"
 
-# 进入项目目录，确保 uv run 能找到正确的 venv / pyproject.toml
 cd "$PROJECT_DIR"
-
-M365_EMAIL="${M365_EMAIL:-$(grep '^M365_EMAIL=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "\"'")}"
-M365_PASSWORD="${M365_PASSWORD:-$(grep '^M365_PASSWORD=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "\"'")}"
-M365_PROXY="${M365_PROXY:-$(grep '^M365_PROXY=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "\"'")}"
 
 HOST="${HOST:-oracle}"
 REMOTE_TOKEN_DIR='~/.9router'
@@ -40,8 +34,7 @@ while [ $# -gt 0 ]; do
 done
 
 echo "========== [STEP 1] 本地抓取 token =========="
-env M365_EMAIL="$M365_EMAIL" M365_PASSWORD="$M365_PASSWORD" M365_PROXY="$M365_PROXY" \
-    "$UV" run python "$SCRIPT_DIR/login.py" $HEADLESS --close $FORCE_CLEAR $M365_PROXY_ARG || exit 1
+"$UV" run python "$SCRIPT_DIR/login.py" $HEADLESS --close $FORCE_CLEAR $M365_PROXY_ARG || exit 1
 
 [ -f "$TOKEN_FILE" ] || { echo "[ERROR] token 文件未生成: $TOKEN_FILE"; exit 1; }
 

@@ -8,6 +8,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
+except ImportError:
+    pass
+
+try:
     from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
 except ImportError:
     print("❌ 运行: uv add playwright && uv run playwright install chromium")
