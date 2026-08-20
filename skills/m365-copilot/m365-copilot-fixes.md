@@ -725,7 +725,7 @@ When `isStalling=true`:
 
 ---
 
-## Fix48: Chromium Proxy Performance — System Proxy vs --proxy-server
+## Fix50: Chromium Proxy Performance — System Proxy vs --proxy-server
 
 **Files**: `scripts/m365/login.py`, `scripts/m365/sync_remote.sh`
 
@@ -759,7 +759,7 @@ When `isStalling=true`:
 
 ---
 
-## Fix49: Correct M365 WS Protocol Based on DevTools Capture
+## Fix51: Correct M365 WS Protocol Based on DevTools Capture
 
 **Files**: `open-sse/executors/m365-copilot.js`, `open-sse/providers/registry/m365-copilot.js`
 
