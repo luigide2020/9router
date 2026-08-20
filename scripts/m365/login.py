@@ -207,6 +207,7 @@ def main():
     ap.add_argument("--skip-region-check", action="store_true", help="跳过区域检测")
     ap.add_argument("--force-clear", action="store_true", help="强制清空浏览器缓存，清除旧登录态")
     ap.add_argument("--proxy", type=str, help="指定代理地址 (例: http://127.0.0.1:7891)，覆盖 M365_PROXY/HTTPS_PROXY")
+    ap.add_argument("--no-proxy", action="store_true", help="禁用代理，走系统网络")
     args = ap.parse_args()
 
     effective_proxy = args.proxy or os.environ.get("M365_PROXY", os.environ.get("HTTPS_PROXY", os.environ.get("HTTP_PROXY", "")))
@@ -310,6 +311,11 @@ def main():
                 items[idx].click(timeout=5000, force=True)
                 print(f"[INFO] ✅ 点击了第 {idx+1} 个历史聊天 (selector={sel}, total={len(items)})")
                 page.wait_for_timeout(3000)
+                try:
+                    page.wait_for_selector('[role="textbox"], div[contenteditable="true"]', state="visible", timeout=10000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(2000)
                 break
             except Exception as e:
                 print(f"[INFO] selector={sel} 失败: {e}")
@@ -329,7 +335,8 @@ def main():
                 except Exception:
                     pass
                 box.type(word, delay=120)
-                print(f"[INFO] ✅ 已在 {sel} 输入: {word}")
+                page.keyboard.press("Enter")
+                print(f"[INFO] ✅ 已在 {sel} 输入并发送: {word}")
                 return True
             except Exception:
                 continue
@@ -345,9 +352,11 @@ def main():
         ],
         user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     )
-    if m365_proxy:
+    if m365_proxy and not args.no_proxy:
         launch_kwargs["proxy"] = {"server": m365_proxy}
-        print(f"[PROXY] ✅ M365 Copilot 流量走代理: {m365_proxy}")
+        print(f"[PROXY] 浏览器走显式代理: {m365_proxy}")
+    elif args.no_proxy:
+        print(f"[PROXY] --no-proxy: 浏览器走系统代理设置")
 
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(**launch_kwargs)
@@ -399,10 +408,10 @@ def main():
                 break
             print(f"\n========== 第 {i}/{args.attempts} 轮：reload → 等聊天框 → 点历史 → 敲字 → 等 WS ==========")
             try:
-                page.reload(wait_until="domcontentloaded", timeout=60000)
+                page.reload(wait_until="commit", timeout=90000)
             except Exception as e:
                 print(f"[WARN] reload 失败: {e}")
-                if "net::" in str(e).lower() or "timeout" in str(e).lower() or "err_" in str(e).lower():
+                if "net::" in str(e).lower() or "err_" in str(e).lower():
                     print(f"[ERROR] 网络不可达，终止重试")
                     break
                 continue

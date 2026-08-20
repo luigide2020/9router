@@ -722,3 +722,36 @@ When `isStalling=true`:
 
 **Before**: M365 pure text → Codex re-sends → `extractContinuationPrompt` (~100 bytes) → M365 repeats → infinite loop
 **After**: M365 pure text (×2) → stall detected → `flattenMessages` (full context) + stallBreakHint → M365 sees full context, provides final answer or new action ✅
+
+---
+
+## Fix48: Chromium Proxy Performance — System Proxy vs --proxy-server
+
+**Files**: `scripts/m365/login.py`, `scripts/m365/sync_remote.sh`
+
+**Root cause**: Playwright's `--proxy-server` flag forces Chromium to use HTTP CONNECT tunnel for all traffic, disabling QUIC/HTTP2 multiplexing. This makes M365 Copilot page loads extremely slow (30-60s+ vs 5-10s without proxy). The proxy is only needed to get a TW exit IP for login; once the page loads, the WebSocket itself works fine.
+
+**Fix** (two-part):
+
+### login.py: `--no-proxy` flag
+
+- New `--no-proxy` CLI arg: when set, skips `proxy` in `launch_persistent_context`, letting Chromium use the OS-level system proxy instead
+- System proxy preserves QUIC/HTTP2, so page load is fast
+- Region check (requests to `substrate.office.com`) still uses explicit `M365_PROXY` env var (not affected by `--no-proxy`)
+- Also fixed:
+  - `page.reload(wait_until="commit", timeout=90000)` — more reliable than `domcontentloaded` with slow networks
+  - Removed `timeout` from network-unreachable check (timeout on reload is just slow, not unreachable)
+  - Wait for textbox after clicking history item (2s + selector wait)
+  - Press Enter after typing to trigger WS send
+
+### sync_remote.sh: Auto system proxy setup/restore
+
+- Replaced `--proxy` arg with automatic `networksetup` system proxy management
+- On start: sets macOS Wi-Fi + Ethernet web/secure/socks proxy to `127.0.0.1:7891`
+- Calls login.py with `--no-proxy` (browser reads system proxy = fast QUIC)
+- On exit (trap EXIT): restores all proxy settings to off
+- `M365_PROXY_PORT` env var configurable (default 7891)
+- Removed `--proxy` CLI arg, removed redundant comments
+
+**Before**: `--proxy-server` → HTTP CONNECT tunnel → no QUIC → slow page load (30-60s+)
+**After**: System proxy → Chromium QUIC enabled → fast page load (5-10s) + automatic proxy cleanup ✅
