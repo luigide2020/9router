@@ -2,8 +2,13 @@
 M365 Copilot access_token 抓取（修正 websocket 监听挂载点）
 关键修正：websocket 是 Page 事件，不是 BrowserContext 事件。
 必须 page.on("websocket", ...)，之前 ctx.on("websocket") 永不触发。
+
+代理策略：
+- 默认：自动设置 macOS 系统代理 (networksetup)，浏览器和区域检测都走系统代理
+- 浏览器不使用 --proxy-server（HTTP CONNECT 会禁用 QUIC，导致慢）
+- M365_PROXY 环境变量不再需要
 """
-import argparse, base64, json, os, re, sys, time, urllib.parse, urllib.request
+import argparse, base64, json, os, re, subprocess, sys, time, urllib.parse, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,21 +26,76 @@ except ImportError:
 
 CHAT_URL = "https://m365.cloud.microsoft/chat"
 
-# 允许执行的国家/地区代码
 ALLOWED_COUNTRY_CODES = {"TW"}
 
+SYSTEM_PROXY_PORT = int(os.environ.get("M365_PROXY_PORT", "7891"))
+NETWORK_SERVICES = ["Wi-Fi", "Ethernet"]
 
-def detect_region_by_ip(proxy_url=None):
-    """通过出口 IP 归属地检测网络区域（走 TUN/代理出口）"""
+_proxy_was_set = False
+_proxy_original_state = {}
+
+
+def _run_networksetup(*args):
+    try:
+        subprocess.run(["networksetup", *args], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
+def _get_proxy_state(service, proxy_type):
+    try:
+        result = subprocess.run(
+            ["networksetup", f"-get{proxy_type}proxy", service],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
+def setup_system_proxy():
+    global _proxy_was_set, _proxy_original_state
+    _proxy_original_state = {}
+    for svc in NETWORK_SERVICES:
+        for ptype in ("web", "secureweb", "socksfirewall"):
+            key = f"{svc}:{ptype}"
+            _proxy_original_state[key] = _get_proxy_state(svc, ptype)
+            state_key = f"{svc}:{ptype}:state"
+            _proxy_original_state[state_key] = _get_proxy_state(svc, ptype).split("\n")[0] if _get_proxy_state(svc, ptype) else ""
+    for svc in NETWORK_SERVICES:
+        _run_networksetup("-setwebproxy", svc, "127.0.0.1", str(SYSTEM_PROXY_PORT))
+        _run_networksetup("-setsecurewebproxy", svc, "127.0.0.1", str(SYSTEM_PROXY_PORT))
+        _run_networksetup("-setsocksfirewallproxy", svc, "127.0.0.1", str(SYSTEM_PROXY_PORT))
+    _proxy_was_set = True
+    os.environ["HTTP_PROXY"] = f"http://127.0.0.1:{SYSTEM_PROXY_PORT}"
+    os.environ["HTTPS_PROXY"] = f"http://127.0.0.1:{SYSTEM_PROXY_PORT}"
+    print(f"[PROXY] ✅ 系统代理已设置 → 127.0.0.1:{SYSTEM_PROXY_PORT} ({', '.join(NETWORK_SERVICES)})")
+
+
+def restore_system_proxy():
+    global _proxy_was_set
+    if not _proxy_was_set:
+        return
+    for svc in NETWORK_SERVICES:
+        _run_networksetup("-setwebproxystate", svc, "off")
+        _run_networksetup("-setsecurewebproxystate", svc, "off")
+        _run_networksetup("-setsocksfirewallproxystate", svc, "off")
+    _proxy_was_set = False
+    os.environ.pop("HTTP_PROXY", None)
+    os.environ.pop("HTTPS_PROXY", None)
+    print("[PROXY] ✅ 系统代理已恢复")
+
+
+def detect_region_by_ip():
+    """通过出口 IP 归属地检测网络区域（走系统代理 / HTTP_PROXY 环境变量）"""
     apis = [
         ("http://ip-api.com/json/?fields=status,countryCode,country,query", "ip-api"),
         ("https://ipapi.co/json/", "ipapi.co"),
     ]
-    handler = None
+    proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
     if proxy_url:
         print(f"[REGION] 使用代理检测出口 IP: {proxy_url}")
-        handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
-        opener = urllib.request.build_opener(handler)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
     else:
         opener = urllib.request.build_opener()
     for url, name in apis:
@@ -54,9 +114,9 @@ def detect_region_by_ip(proxy_url=None):
     return None, None, None
 
 
-def check_region_or_exit(proxy_url=None):
-    """区域预检：通过出口 IP 判断，仅允许 TW"""
-    code, country, ip = detect_region_by_ip(proxy_url)
+def check_region_or_exit():
+    """区域预检：通过出口 IP 判断，仅允许 TW（依赖系统代理）"""
+    code, country, ip = detect_region_by_ip()
     if code and code.upper() in ALLOWED_COUNTRY_CODES:
         print(f"[REGION] ✅ 出口 IP: {ip}，区域: {country}({code})，允许执行")
         return
@@ -198,6 +258,9 @@ def do_login(page, email, password):
 
 
 def main():
+    import atexit
+    atexit.register(restore_system_proxy)
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--sniff-only", action="store_true")
     ap.add_argument("--headless", action="store_true")
@@ -206,14 +269,12 @@ def main():
     ap.add_argument("--close", action="store_true")
     ap.add_argument("--skip-region-check", action="store_true", help="跳过区域检测")
     ap.add_argument("--force-clear", action="store_true", help="强制清空浏览器缓存，清除旧登录态")
-    ap.add_argument("--proxy", type=str, help="指定代理地址 (例: http://127.0.0.1:7891)，覆盖 M365_PROXY/HTTPS_PROXY")
-    ap.add_argument("--no-proxy", action="store_true", help="禁用代理，走系统网络")
     args = ap.parse_args()
 
-    effective_proxy = args.proxy or os.environ.get("M365_PROXY", os.environ.get("HTTPS_PROXY", os.environ.get("HTTP_PROXY", "")))
+    setup_system_proxy()
 
     if not args.skip_region_check:
-        check_region_or_exit(effective_proxy or None)
+        check_region_or_exit()
 
     email = os.environ.get("M365_EMAIL", "")
     password = os.environ.get("M365_PASSWORD", "")
@@ -343,7 +404,6 @@ def main():
         print("[WARN] 没定位到输入框")
         return False
 
-    m365_proxy = effective_proxy
     launch_kwargs = dict(
         user_data_dir=USER_DATA_DIR, headless=args.headless,
         args=[
@@ -352,11 +412,7 @@ def main():
         ],
         user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     )
-    if m365_proxy and not args.no_proxy:
-        launch_kwargs["proxy"] = {"server": m365_proxy}
-        print(f"[PROXY] 浏览器走显式代理: {m365_proxy}")
-    elif args.no_proxy:
-        print(f"[PROXY] --no-proxy: 浏览器走系统代理设置")
+    print("[PROXY] 浏览器走系统代理 (不使用 --proxy-server，保留 QUIC)")
 
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(**launch_kwargs)

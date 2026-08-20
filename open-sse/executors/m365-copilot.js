@@ -82,6 +82,13 @@ const M365_DEFAULT_OPTIONS_SETS = [
   "cwc_flux_v3",
   "flux_v3_progress_messages",
   "enable_batch_token_processing",
+  "async_client_interaction",
+  "flux_v3_references",
+  "flux_v3_references_entities",
+  "flux_v3_references_ci",
+  "add_filestore_filetype",
+  "cwc_code_interpreter_citation_sourceannotations",
+  "cdxcwc_code_interpreter_hallucinated_url_filter",
   "flux_v3_image_gen_enable_dimensions",
   "flux_v3_image_gen_enable_non_watermarked_storage",
   "flux_v3_image_gen_enable_icon_dimensions",
@@ -95,25 +102,30 @@ const M365_DEFAULT_OPTIONS_SETS = [
 
 /**
  * Build M365 Copilot feature flags.
- * @param {boolean} enableReasoning - if true, add "enable_gg_gpt" for deep thinking
+ * @param {string} tone - "Magic" (auto), "Gpt_5_6_Chat" (fast), "Gpt_5_6_Reasoning" (deep)
  * @param {boolean} disableCodeInterpreter - if true, strip code interpreter / image generation flags
  * @param {boolean} keepSearch - if true, keep search-related flags (web search is useful)
  * @returns {string[]}
  */
-function buildCopilotOptionsSets(enableReasoning = false, disableCodeInterpreter = false, keepSearch = true) {
+function buildCopilotOptionsSets(tone = "Magic", disableCodeInterpreter = false, keepSearch = true) {
   const sets = [...M365_DEFAULT_OPTIONS_SETS];
-  if (enableReasoning && !sets.includes("enable_gg_gpt")) {
+  if (tone === "Gpt_5_6_Reasoning" && !sets.includes("enable_gg_gpt")) {
     sets.push("enable_gg_gpt");
   }
   if (disableCodeInterpreter) {
     const ciFlags = [
       "cwc_code_interpreter", "cwc_code_interpreter_amsfix",
-      "cwc_code_interpreter_citation_fix", "code_interpreter_interactive_charts",
+      "cwc_code_interpreter_citation_fix", "cwc_code_interpreter_citation_sourceannotations",
+      "cdxcwc_code_interpreter_hallucinated_url_filter",
+      "code_interpreter_interactive_charts",
       "cwc_code_interpreter_interactive_charts_inline_image",
       "code_interpreter_matplotlib_patching", "cwc_fileupload_odb",
+      "add_filestore_filetype",
       "cwc_flux_image", "cwcfluxgptv",
       "flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch",
-      "cwc_flux_v3", "flux_v3_image_gen_enable_dimensions",
+      "cwc_flux_v3", "flux_v3_references", "flux_v3_references_entities",
+      "flux_v3_references_ci",
+      "flux_v3_image_gen_enable_dimensions",
       "flux_v3_image_gen_enable_non_watermarked_storage",
       "flux_v3_image_gen_enable_icon_dimensions",
       "flux_v3_image_gen_enable_system_text_with_params",
@@ -131,15 +143,20 @@ function buildCopilotOptionsSets(enableReasoning = false, disableCodeInterpreter
   return sets;
 }
 
-function buildCopilotMessage(text, invocationId, conversationId, sessionId, enableReasoning = false, modelId = null, m365Flags = {}) {
+function buildCopilotMessage(text, invocationId, sessionId, tone = "Magic", m365Flags = {}) {
   const { disableCodeInterpreter = false, enableSearch = true } = m365Flags;
-  const threadLevelGptId = modelId ? { [conversationId]: modelId } : {};
+  const threadLevelGptId = {};
 
   const allowedMessageTypes = [
-    "Chat", "Suggestion", "InternalSearchQuery", "InternalSearchResult",
-    "Disengaged", "InternalLoaderMessage", "RenderCardRequest",
-    "AdsQuery", "SemanticSerp", "GenerateContentQuery", "SearchQuery",
-    "ConfirmationCard", "AuthError", "DeveloperLogs",
+    "Chat", "Suggestion", "InternalSearchQuery", "Disengaged",
+    "InternalLoaderMessage", "Progress", "GeneratedCode", "RenderCardRequest",
+    "AdsQuery", "SemanticSerp", "GenerateContentQuery", "GenerateGraphicArt",
+    "SearchQuery", "ConfirmationCard", "AuthError", "DeveloperLogs",
+    "TriggerPlugin", "HintInvocation", "MemoryUpdate", "EndOfRequest",
+    "TriggerConfirmation", "ResumeInvokeAction", "ResumeUserInputRequest",
+    "TriggerUserInputRequest", "EscapeHatch", "TriggerPluginAuth",
+    "ResumePluginAuth", "SideBySide", "ReferencesListComplete",
+    "SwitchRespondingEndpoint",
   ];
 
   const plugins = enableSearch
@@ -153,32 +170,49 @@ function buildCopilotMessage(text, invocationId, conversationId, sessionId, enab
       source: "officeweb",
       clientCorrelationId: randomUUID(),
       sessionId,
-      optionsSets: ["enterprise_flux_handoff_outlook_compose", ...buildCopilotOptionsSets(enableReasoning, disableCodeInterpreter, enableSearch)],
+      optionsSets: buildCopilotOptionsSets(tone, disableCodeInterpreter, enableSearch),
+      streamingMode: "ConciseWithPadding",
       options: {},
-      tone: enableReasoning ? "Reasoning" : "Balanced",
+      extraExtensionParameters: {},
       allowedMessageTypes,
       sliceIds: [],
       threadLevelGptId,
-      conversationId,
       traceId: randomUUID(),
       isStartOfSession: invocationId === 0,
-      productThreadType: "Office",
-      clientInfo: { clientPlatform: "web" },
+      clientInfo: {
+        clientPlatform: "mcmcopilot-web",
+        clientAppName: "Office",
+        clientEntrypoint: "mcmcopilot-officeweb",
+        clientSessionId: sessionId,
+        ProductCategory: "Chat",
+        clientAppType: "Web",
+        productEntryPoint: "ChatPanel",
+        deviceOS: "macOS",
+        deviceType: "Desktop",
+        clientPlatformVersion: "10.15.7",
+      },
       message: {
         author: "user",
         inputMethod: "Keyboard",
         text,
-        entityAnnotationTypes: ["People", "File", "Event"],
+        entityAnnotationTypes: ["People", "File", "Event", "Email", "TeamsMessage"],
         requestId: randomUUID(),
         locationInfo: {
           timeZoneOffset: new Date().getTimezoneOffset() / -60,
           timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
         },
-        locale: "en-US",
+        locale: "zh-cn",
         messageType: "Chat",
         experienceType,
+        adaptiveCards: [],
+        clientPreferences: {},
+        connectedFederatedConnections: ["dummyId"],
       },
       plugins,
+      isSbsSupported: true,
+      tone,
+      renderReferencesBehindEOS: true,
+      disconnectBehavior: "continue",
     }],
     invocationId: String(invocationId),
     target: "chat",
@@ -626,17 +660,13 @@ export class M365CopilotExecutor extends BaseExecutor {
 
     const { oid, tid } = extractTokenClaims(accessToken);
 
-    const isGpt55 = model === "gpt-5.5" || model.toLowerCase().includes("gpt-5.5");
-    const isGpt55Fast = model === "gpt-5.5-fast" || model.toLowerCase().includes("gpt-5.5-fast");
-    const isGpt56 = model === "gpt-5.6" || model.toLowerCase().includes("gpt-5.6");
-    const isGpt56Luna = model === "gpt-5.6-luna" || model.toLowerCase().includes("gpt-5.6-luna");
-    const isFastModel = isGpt55Fast || isGpt56Luna;
-    const isDeepModel = isGpt55 || (isGpt56 && !isGpt56Luna);
-    const enableReasoning = isFastModel
-      ? false
+    const isFastModel = model === "gpt-5.6-fast" || model.toLowerCase().includes("gpt-5.6-fast");
+    const isDeepModel = model === "gpt-5.6" || (model.toLowerCase().includes("gpt-5.6") && !isFastModel);
+    const m365Tone = isFastModel
+      ? "Gpt_5_6_Chat"
       : isDeepModel
-        ? body?.reasoning !== false && body?.enable_deep_thinking !== false
-        : (body?.reasoning === true || body?.enable_deep_thinking === true);
+        ? (body?.reasoning !== false && body?.enable_deep_thinking !== false ? "Gpt_5_6_Reasoning" : "Gpt_5_6_Chat")
+        : (body?.reasoning === true || body?.enable_deep_thinking === true ? "Gpt_5_6_Reasoning" : "Magic");
 
     // Use session manager for stable conversation/session IDs (enables multi-turn tool calling)
     const connectionId = credentials?.connectionId || credentials?.email || `${oid}@${tid}`;
@@ -876,9 +906,6 @@ export class M365CopilotExecutor extends BaseExecutor {
     // Send keep-alive ping (type 6)
     ws.send(JSON.stringify({ type: 6 }) + RS);
 
-    // Send user message — pass model so M365 uses the correct GPT variant
-    // "copilot" (auto) means let M365 decide the model
-    const modelId = model === "copilot" ? null : model;
     const m365Flags = {
       disableCodeInterpreter: !!toolMeta?.needsLocalExec,
       enableSearch: true,
@@ -891,9 +918,9 @@ export class M365CopilotExecutor extends BaseExecutor {
     if (hasLocalPaths && toolMeta?.needsLocalExec) {
       effectivePrompt = effectivePrompt + "\n\nIMPORTANT: File paths in this conversation are on the user's machine — you do NOT have access to them. Do NOT attempt to execute any commands yourself. Instead, ALWAYS output a JSON instruction for the user to execute on their machine.";
     }
-    console.log(`[M365-EXEC-FLAGS] disableCodeInterpreter=${m365Flags.disableCodeInterpreter} enableSearch=${m365Flags.enableSearch} experienceType=Default tone=${enableReasoning ? "Reasoning" : "Balanced"} hasImage=${/<image\b/i.test(userPrompt)} hasLocalPaths=${hasLocalPaths}`);
-    const copilotMsg = buildCopilotMessage(effectivePrompt, 0, conversationId, sessionIdUuid, enableReasoning, modelId, m365Flags);
-    log?.info?.("M365-COPILOT", `WS send: optionsSets=${JSON.stringify(copilotMsg.arguments[0].optionsSets)}, plugins=${JSON.stringify(copilotMsg.arguments[0].plugins)}, allowedMessageTypes=${JSON.stringify(copilotMsg.arguments[0].allowedMessageTypes)}`);
+    console.log(`[M365-EXEC-FLAGS] disableCodeInterpreter=${m365Flags.disableCodeInterpreter} enableSearch=${m365Flags.enableSearch} experienceType=Default tone=${m365Tone} hasImage=${/<image\b/i.test(userPrompt)} hasLocalPaths=${hasLocalPaths}`);
+    const copilotMsg = buildCopilotMessage(effectivePrompt, 0, sessionIdUuid, m365Tone, m365Flags);
+    log?.info?.("M365-COPILOT", `WS send: tone=${m365Tone}, optionsSets=${JSON.stringify(copilotMsg.arguments[0].optionsSets)}, plugins=${JSON.stringify(copilotMsg.arguments[0].plugins)}, allowedMessageTypes=${JSON.stringify(copilotMsg.arguments[0].allowedMessageTypes)}`);
     ws.send(JSON.stringify(copilotMsg) + RS);
 
     log?.info?.("M365-COPILOT", `Message sent (model=${model}), waiting for response stream`);

@@ -731,27 +731,93 @@ When `isStalling=true`:
 
 **Root cause**: Playwright's `--proxy-server` flag forces Chromium to use HTTP CONNECT tunnel for all traffic, disabling QUIC/HTTP2 multiplexing. This makes M365 Copilot page loads extremely slow (30-60s+ vs 5-10s without proxy). The proxy is only needed to get a TW exit IP for login; once the page loads, the WebSocket itself works fine.
 
-**Fix** (two-part):
+**Fix** (unified proxy management in login.py):
 
-### login.py: `--no-proxy` flag
+### login.py: Auto networksetup + no --proxy-server
 
-- New `--no-proxy` CLI arg: when set, skips `proxy` in `launch_persistent_context`, letting Chromium use the OS-level system proxy instead
-- System proxy preserves QUIC/HTTP2, so page load is fast
-- Region check (requests to `substrate.office.com`) still uses explicit `M365_PROXY` env var (not affected by `--no-proxy`)
+- Removed `--proxy` and `--no-proxy` CLI args; removed `M365_PROXY` env var
+- Added `setup_system_proxy()` / `restore_system_proxy()` using `networksetup` directly in Python
+- On start: automatically sets macOS Wi-Fi + Ethernet web/secure/socks proxy to `127.0.0.1:$M365_PROXY_PORT`
+- Browser never uses `--proxy-server` — always reads system proxy (preserves QUIC)
+- Region check also uses system proxy (Python urllib follows macOS system proxy via networksetup)
+- `atexit.register(restore_system_proxy)` ensures cleanup on any exit
+- `M365_PROXY_PORT` env var for port config (default 7891), replaces `M365_PROXY`
 - Also fixed:
   - `page.reload(wait_until="commit", timeout=90000)` — more reliable than `domcontentloaded` with slow networks
   - Removed `timeout` from network-unreachable check (timeout on reload is just slow, not unreachable)
   - Wait for textbox after clicking history item (2s + selector wait)
   - Press Enter after typing to trigger WS send
 
-### sync_remote.sh: Auto system proxy setup/restore
+### sync_remote.sh: Simplified
 
-- Replaced `--proxy` arg with automatic `networksetup` system proxy management
-- On start: sets macOS Wi-Fi + Ethernet web/secure/socks proxy to `127.0.0.1:7891`
-- Calls login.py with `--no-proxy` (browser reads system proxy = fast QUIC)
-- On exit (trap EXIT): restores all proxy settings to off
-- `M365_PROXY_PORT` env var configurable (default 7891)
-- Removed `--proxy` CLI arg, removed redundant comments
+- Removed all `networksetup` logic (now handled by login.py)
+- Removed `--no-proxy` arg (no longer needed)
+- Just calls `login.py` directly; proxy lifecycle managed by login.py
 
-**Before**: `--proxy-server` → HTTP CONNECT tunnel → no QUIC → slow page load (30-60s+)
-**After**: System proxy → Chromium QUIC enabled → fast page load (5-10s) + automatic proxy cleanup ✅
+**Before**: `--proxy-server` → HTTP CONNECT tunnel → no QUIC → slow; M365_PROXY needed; sync_remote.sh had duplicate networksetup code
+**After**: login.py manages system proxy lifecycle; browser always fast QUIC; no M365_PROXY; sync_remote.sh simplified ✅
+
+---
+
+## Fix49: Correct M365 WS Protocol Based on DevTools Capture
+
+**Files**: `open-sse/executors/m365-copilot.js`, `open-sse/providers/registry/m365-copilot.js`
+
+**Root cause**: 9router's M365 executor used guessed values for tone, threadLevelGptId, allowedMessageTypes, and several other fields. DevTools WS frame capture from actual M365 web client revealed numerous discrepancies between 9router's request and the real M365 client.
+
+### Discovery 1: tone values
+
+- `"Balanced"` / `"Reasoning"` were wrong. Actual values: `"Magic"` (auto), `"Gpt_5_6_Chat"` (fast), `"Gpt_5_6_Reasoning"` (deep thinking)
+- Tone directly encodes the model: `Gpt_5_6` confirms backend is GPT-5.6
+- Replaced `enableReasoning` boolean with `m365Tone` string
+
+### Discovery 2: threadLevelGptId always empty
+
+- Client never sends a model ID — always `{}`
+- Model selection is entirely server-side, driven by the `tone` field
+- Removed `modelId` parameter from `buildCopilotMessage()`
+
+### Discovery 3: Missing WS message fields
+
+- `streamingMode: "ConciseWithPadding"` — controls streaming output style (concise + padding). Missing may cause shorter/truncated responses
+- `isSbsSupported: true` — Side-by-Side support flag
+- `renderReferencesBehindEOS: true` — render references after End-of-Stream
+- `disconnectBehavior: "continue"` — server keeps session state on WS disconnect
+- `extraExtensionParameters: {}` — empty but expected by M365
+- `clientInfo` was minimal `{clientPlatform:"web"}` — expanded to full M365 web client profile
+
+### Discovery 4: Missing optionsSets flags
+
+- `enable_gg_gpt` was only added for reasoning tone; now conditionally added in `buildCopilotOptionsSets`
+- Added: `async_client_interaction`, `flux_v3_references`, `flux_v3_references_entities`, `flux_v3_references_ci`, `add_filestore_filetype`, `cwc_code_interpreter_citation_sourceannotations`, `cdxcwc_code_interpreter_hallucinated_url_filter`
+- `enable_gg_gpt` must NOT be in default set — only added for `Gpt_5_6_Reasoning` tone (bug found during review: was in default set, removed)
+- CI disable list updated to include new flags
+
+### Discovery 5: allowedMessageTypes incomplete
+
+- 9router had 15 types, real M365 sends 31
+- Key missing: `Progress`, `GeneratedCode`, `ReferencesListComplete`, `EndOfRequest`, `TriggerPlugin`, `ResumeInvokeAction`, `SwitchRespondingEndpoint`, `GenerateGraphicArt`, `MemoryUpdate`, etc.
+- `InternalSearchResult` removed (not in real M365 traffic)
+
+### Discovery 6: Other message field differences
+
+- `entityAnnotationTypes`: `["People","File","Event"]` → `["People","File","Event","Email","TeamsMessage"]`
+- `locale`: `"en-US"` → `"zh-cn"`
+- `message` now includes `adaptiveCards: []`, `clientPreferences: {}`, `connectedFederatedConnections: ["dummyId"]`
+- `productThreadType: "Office"` removed (not in real traffic)
+
+### Discovery 7: metering (from type:2 response)
+
+- `LLMOnly`: 100 — normal GPT-5.6 quota
+- `ReasoningModelTurnUsage`: 10 — deep thinking quota
+- `ClaudeOpusQuery`: 100 / `ClaudeOpusQueryDaily`: 40 — M365 backend also routes to Claude Opus
+- `CodeInterpreter`: 0, `DeepResearch`: 0 — not available on this account
+
+### Registry: model list
+
+- Before: `copilot`, `gpt-5.5`, `gpt-5.5-fast`, `gpt-5.6`, `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.6-sol`
+- After: `copilot`, `gpt-5.6`, `gpt-5.6-fast`
+- Removed `enterprise_flux_handoff_outlook_compose` from optionsSets (not in real traffic)
+
+**Before**: Wrong tone values, missing streamingMode/disconnectBehavior, incomplete allowedMessageTypes, dead threadLevelGptId, speculative model IDs, enable_gg_gpt always on
+**After**: All WS fields match real M365 client; tone drives model selection; CI flags properly managed; clean registry ✅
