@@ -102,7 +102,7 @@ const M365_DEFAULT_OPTIONS_SETS = [
 
 /**
  * Build M365 Copilot feature flags.
- * @param {string} tone - "Magic" (auto), "Gpt_5_6_Chat" (fast), "Gpt_5_6_Reasoning" (deep)
+ * @param {boolean} enableReasoning - if true, add "enable_gg_gpt" for deep thinking
  * @param {boolean} disableCodeInterpreter - if true, strip code interpreter / image generation flags
  * @param {boolean} keepSearch - if true, keep search-related flags (web search is useful)
  * @returns {string[]}
@@ -143,7 +143,7 @@ function buildCopilotOptionsSets(tone = "Magic", disableCodeInterpreter = false,
   return sets;
 }
 
-function buildCopilotMessage(text, invocationId, sessionId, tone = "Magic", m365Flags = {}) {
+function buildCopilotMessage(text, invocationId, conversationId, sessionId, tone = "Magic", m365Flags = {}) {
   const { disableCodeInterpreter = false, enableSearch = true } = m365Flags;
   const threadLevelGptId = {};
 
@@ -170,13 +170,15 @@ function buildCopilotMessage(text, invocationId, sessionId, tone = "Magic", m365
       source: "officeweb",
       clientCorrelationId: randomUUID(),
       sessionId,
-      optionsSets: buildCopilotOptionsSets(tone, disableCodeInterpreter, enableSearch),
+      optionsSets: ["enterprise_flux_handoff_outlook_compose", ...buildCopilotOptionsSets(tone, disableCodeInterpreter, enableSearch)],
       streamingMode: "ConciseWithPadding",
       options: {},
       extraExtensionParameters: {},
+      tone,
       allowedMessageTypes,
       sliceIds: [],
       threadLevelGptId,
+      conversationId,
       traceId: randomUUID(),
       isStartOfSession: invocationId === 0,
       clientInfo: {
@@ -210,7 +212,6 @@ function buildCopilotMessage(text, invocationId, sessionId, tone = "Magic", m365
       },
       plugins,
       isSbsSupported: true,
-      tone,
       renderReferencesBehindEOS: true,
       disconnectBehavior: "continue",
     }],
@@ -284,6 +285,7 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
 
       let fullText = "";
       let botTextStreams = new Map();
+      let writeAtCursorEmittedLen = 0;
       let closed = false;
 
       const rebuildFullText = () => {
@@ -349,6 +351,17 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
       const processData = (data) => {
         if (data.type === 1) {
           const payload = data.item || data.arguments?.[0];
+
+          if (payload?.writeAtCursor && !payload?.messages) {
+            const cursorText = payload.writeAtCursor;
+            if (cursorText && !bufferForTools) {
+              emitContent(cursorText);
+              writeAtCursorEmittedLen += cursorText.length;
+            }
+          } else if (payload?.patches) {
+            console.log(`[M365-WS-PATCHES] ${JSON.stringify(payload.patches).slice(0, 200)}`);
+          }
+
           if (payload?.messages) {
             for (const msg of payload.messages) {
               const msgAuthor = msg.author || "NONE";
@@ -359,6 +372,22 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
               const msgTurnState = msg.turnState || "none";
               const msgContentOrigin = msg.contentOrigin || "none";
               console.log(`[M365-WS-T1] author=${msgAuthor} type=${msgType} textLen=${(msg.text||"").length} hiddenLen=${(msg.hiddenText||"").length} offense=${JSON.stringify(msgOffense)} turnState=${JSON.stringify(msgTurnState)} contentOrigin=${msgContentOrigin} text=${msgText}`);
+
+              if (msgContentOrigin === "ChainOfThoughtSummary") {
+                console.log(`[M365-WS-COT] skipped ChainOfThoughtSummary (textLen=${(msg.text||"").length})`);
+                continue;
+              }
+              if (msgType === "Progress" && msgContentOrigin !== "DeepLeo") {
+                console.log(`[M365-WS-PROGRESS] skipped Progress message (contentOrigin=${msgContentOrigin})`);
+                continue;
+              }
+              if (msgType === "ReferencesListComplete") {
+                console.log(`[M365-WS-REFS] ReferencesListComplete signal, turnCount=${msg.turnCount || "n/a"}`);
+                continue;
+              }
+              if (msgType === "Suggestion") {
+                continue;
+              }
 
               if (msg.hiddenText && /Conversation disengaged|Sorry.*(?:chat|help|assist)|I can't (?:help|chat|assist)/i.test(msg.hiddenText)) {
                 console.log(`[M365-WS-DISENGAGE-T1] DETECTED in hiddenText! hiddenText=${msgHidden} author=${msgAuthor} type=${msgType}`);
@@ -401,13 +430,17 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
                   if (isCrossDup) {
                     console.log(`[M365-WS-T6] skipped cross-msgId duplicate bot text (msgId=${msgId}, textLen=${msg.text.length})`);
                   } else {
-                    const delta = msg.text.slice(prev.length);
+                    const emitStart = Math.max(prev.length, writeAtCursorEmittedLen);
+                    const delta = msg.text.slice(emitStart);
                     botTextStreams.set(msgId, msg.text);
-                    if (!bufferForTools) emitContent(delta);
+                    if (delta && !bufferForTools) emitContent(delta);
                   }
                 }
               }
             }
+          }
+          if (payload?.isLastUpdate) {
+            console.log(`[M365-WS-LAST] isLastUpdate=true, streaming complete for this request`);
           }
         }
         if (data.type === 2) {
@@ -423,6 +456,18 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
               const msgTurnState = msg?.turnState || "none";
               const msgContentOrigin = msg?.contentOrigin || "none";
               console.log(`[M365-WS-T2] author=${msgAuthor} type=${msgType} textLen=${(msg?.text||"").length} hiddenLen=${(msg?.hiddenText||"").length} offense=${JSON.stringify(msgOffense)} turnState=${JSON.stringify(msgTurnState)} contentOrigin=${msgContentOrigin} text=${msgText}`);
+
+              if (msgContentOrigin === "ChainOfThoughtSummary") {
+                console.log(`[M365-WS-COT-T2] skipped ChainOfThoughtSummary (textLen=${(msg?.text||"").length})`);
+                continue;
+              }
+              if (msgType === "Progress" && msgContentOrigin !== "DeepLeo") {
+                console.log(`[M365-WS-PROGRESS-T2] skipped Progress message (contentOrigin=${msgContentOrigin})`);
+                continue;
+              }
+              if (msgType === "ReferencesListComplete" || msgType === "Suggestion") {
+                continue;
+              }
 
               if (msg?.hiddenText && /Conversation disengaged|Sorry.*(?:chat|help|assist)|I can't (?:help|chat|assist)/i.test(msg.hiddenText)) {
                 console.log(`[M365-WS-DISENGAGE-T2] DETECTED in hiddenText! hiddenText=${msgHidden} author=${msgAuthor} type=${msgType}`);
@@ -545,24 +590,35 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, mes
     };
 
     const processData = (data) => {
-      // Type 1: streaming text updates
       if (data.type === 1) {
         const payload = data.item || data.arguments?.[0];
+        if (payload?.writeAtCursor && !payload?.messages) {
+          fullText += payload.writeAtCursor;
+        }
         if (payload?.messages) {
           for (const msg of payload.messages) {
             if (isSearchBotMessage(msg)) continue;
+            const contentOrigin = msg.contentOrigin || "none";
+            const msgType = msg.messageType || msg.type || "unknown";
+            if (contentOrigin === "ChainOfThoughtSummary") continue;
+            if (msgType === "Progress" && contentOrigin !== "DeepLeo") continue;
+            if (msgType === "ReferencesListComplete" || msgType === "Suggestion") continue;
             if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
               fullText = msg.text;
             }
           }
         }
       }
-      // Type 2: final complete message (M365 completion signal)
       if (data.type === 2) {
         const payload = data.item || data.arguments?.[0];
         if (payload?.messages) {
           for (const msg of payload.messages) {
             if (isSearchBotMessage(msg)) continue;
+            const contentOrigin = msg?.contentOrigin || "none";
+            const msgType = msg?.messageType || msg?.type || "unknown";
+            if (contentOrigin === "ChainOfThoughtSummary") continue;
+            if (msgType === "Progress" && contentOrigin !== "DeepLeo") continue;
+            if (msgType === "ReferencesListComplete" || msgType === "Suggestion") continue;
             if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
               fullText = msg.text;
             }
@@ -660,8 +716,8 @@ export class M365CopilotExecutor extends BaseExecutor {
 
     const { oid, tid } = extractTokenClaims(accessToken);
 
-    const isFastModel = model === "gpt-5.6-fast" || model.toLowerCase().includes("gpt-5.6-fast");
-    const isDeepModel = model === "gpt-5.6" || (model.toLowerCase().includes("gpt-5.6") && !isFastModel);
+    const isFastModel = model.toLowerCase().includes("gpt-5.6-fast") || model.toLowerCase().includes("gpt-5.5-fast");
+    const isDeepModel = (model.toLowerCase().includes("gpt-5.6") || model.toLowerCase().includes("gpt-5.5")) && !isFastModel;
     const m365Tone = isFastModel
       ? "Gpt_5_6_Chat"
       : isDeepModel
@@ -919,7 +975,7 @@ export class M365CopilotExecutor extends BaseExecutor {
       effectivePrompt = effectivePrompt + "\n\nIMPORTANT: File paths in this conversation are on the user's machine — you do NOT have access to them. Do NOT attempt to execute any commands yourself. Instead, ALWAYS output a JSON instruction for the user to execute on their machine.";
     }
     console.log(`[M365-EXEC-FLAGS] disableCodeInterpreter=${m365Flags.disableCodeInterpreter} enableSearch=${m365Flags.enableSearch} experienceType=Default tone=${m365Tone} hasImage=${/<image\b/i.test(userPrompt)} hasLocalPaths=${hasLocalPaths}`);
-    const copilotMsg = buildCopilotMessage(effectivePrompt, 0, sessionIdUuid, m365Tone, m365Flags);
+    const copilotMsg = buildCopilotMessage(effectivePrompt, 0, conversationId, sessionIdUuid, m365Tone, m365Flags);
     log?.info?.("M365-COPILOT", `WS send: tone=${m365Tone}, optionsSets=${JSON.stringify(copilotMsg.arguments[0].optionsSets)}, plugins=${JSON.stringify(copilotMsg.arguments[0].plugins)}, allowedMessageTypes=${JSON.stringify(copilotMsg.arguments[0].allowedMessageTypes)}`);
     ws.send(JSON.stringify(copilotMsg) + RS);
 
