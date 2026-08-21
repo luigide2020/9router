@@ -404,6 +404,7 @@ Added `extractHistoricalToolCallSignatures(messages)` which scans all ASSISTANT 
 | isStartOfSession fix (Fix60) | Verified — continuation requests no longer cause InvalidRequest |
 | T2 firstNewMessageIndex filtering (Fix61) | Verified — streaming and non-streaming paths both filter history messages |
 | NLU fallback exclude 看看/看一/看出 (Fix62) | Verified — "我想看看睡衣之下的美" no longer triggers exec_command |
+| Full browser fingerprint fields (Fix63) | Verified — all fields individually tested safe, only disconnectBehavior causes InvalidRequest |
 
 ## Fix45: WS Connect Retry + 502 Short Cooldown
 
@@ -779,41 +780,37 @@ for (let mi = 0; mi < payload.messages.length; mi++) {
 
 After incremental re-addition testing from e8518e49 (merge base), the following fields were tested one by one:
 
-### Confirmed SAFE (no InvalidRequest):
+### Confirmed SAFE (逐个测试通过):
 | Field | Notes |
 |-------|-------|
 | `streamingMode: "ConciseWithPadding"` | M365 accepts this streaming mode |
 | `extraExtensionParameters: {}` | Empty object, no validation |
-| `threadLevelGptId: {}` | Empty object (was already in Fix58) |
-| 7 optionsSets flags: `async_client_interaction`, `flux_v3_references`, `flux_v3_references_entities`, `flux_v3_references_ci`, `add_filestore_filetype`, `cwc_code_interpreter_citation_sourceannotations`, `cdxcwc_code_interpreter_hallucinated_url_filter` | Feature flags — M365 ignores unrecognized ones |
+| `threadLevelGptId: {}` | Empty object |
+| 7 optionsSets flags (`async_client_interaction`, `flux_v3_references*`, `add_filestore_filetype`, etc.) | Feature flags, M365 ignores unrecognized ones |
 | CI ciFlags expansion (6 flags for disableCodeInterpreter removal) | Same as above |
 | Removed `productThreadType: "Office"` | Reducing fields is safe |
+| `clientInfo` full struct (`mcmcopilot-web`, `Office`, `macOS`, etc.) | 单独测试通过 |
+| `allowedMessageTypes` 13→31 | 单独测试通过 |
+| `locale: "zh-cn"` | 单独测试通过 |
+| `adaptiveCards: []` | 单独测试通过 |
+| `clientPreferences: {}` | 单独测试通过 |
+| `isSbsSupported: true` | 单独测试通过 |
+| `renderReferencesBehindEOS: true` | 单独测试通过 |
+| `entityAnnotationTypes: ["People", "File", "Event", "Email", "TeamsMessage"]` | 单独测试通过 |
 
 ### Confirmed CAUSES InvalidRequest:
 | Field | Risk | Notes |
 |-------|------|-------|
-| `isSbsSupported: true` | Confirmed | M365 may validate SBS capability; we don't handle SideBySide responses |
-| `renderReferencesBehindEOS: true` | Confirmed | Coupled with SBS, triggers same validation |
-| `disconnectBehavior: "continue"` | Confirmed | Coupled with above fields, tested together as batch |
-| `entityAnnotationTypes: ["People", "File", "Event", "Email", "TeamsMessage"]` | Confirmed | Adding Email/TeamsMessage triggered InvalidRequest |
+| `disconnectBehavior: "continue"` | **Confirmed root cause** | 单独测试即触发InvalidRequest。告诉M365"WS断开后继续处理"，但我们的连接模式是每次新建WS，与该行为不兼容，M365验证失败直接拒绝 |
+| `connectedFederatedConnections: ["dummyId"]` | High (未单独测试) | 假连接ID，M365很可能验证失败 |
 
-### Suspected HIGH Risk (NOT yet tested individually):
-| Field | Risk | Notes |
-|-------|------|-------|
-| `clientInfo` full struct (`mcmcopilot-web`, `Office`, `macOS`, etc.) | High | Changes `clientPlatform` from "web" — may trigger server-side routing/validation |
-| `allowedMessageTypes` 13→31 (Progress, GeneratedCode, SideBySide, etc.) | High | Declares capability for 31 message types we don't handle — M365 may send SideBySide/TriggerPlugin and expect responses |
-| `locale: "zh-cn"` | Medium | M365 may only accept certain locale values; real browser sends "zh-cn" but our request context differs |
-| `adaptiveCards: []` | Medium | Empty array vs absent field — M365 may interpret empty array as "client supports adaptiveCards but has none" |
-| `clientPreferences: {}` | Medium | Same as adaptiveCards |
-| `connectedFederatedConnections: ["dummyId"]` | High | Fake connection ID — M365 likely validates against real federated connections, "dummyId" will fail lookup |
+### 之前误判的原因：
+Fix58中4个字段一起加导致InvalidRequest，当时以为4个都有问题。逐个测试后发现 `disconnectBehavior: "continue"` 是唯一根因，其余3个（isSbsSupported、renderReferencesBehindEOS、entityAnnotationTypes扩展）都是安全的。
 
 ### Root Cause Summary:
-InvalidRequest is NOT caused by a single field. It's triggered by a **combination** of fields that make M365's server-side validation stricter:
-1. When `isStartOfSession=true` (the Fix60 bug), M365's new-session validation is stricter — checks more fields
-2. Fields that declare capabilities we don't actually support (SBS, SideBySide, extended message types) fail validation
-3. Fake IDs (`dummyId`) and capability declarations that M365 can't verify on server side are rejected
+InvalidRequest 由 `disconnectBehavior: "continue"` 单独导致。该字段声明"WS断开后服务端继续处理"，但我们的连接模式是每次请求新建WS连接，不存在断连继续的场景，M365验证此行为与实际连接模式不兼容直接拒绝。其他声明能力的字段（isSbsSupported、allowedMessageTypes 31种）反而安全——M365可能检查但不强制验证。
 
-**Strategy going forward**: Only add fields that are **passive** (feature flags, empty containers) or **reducing** (removing productThreadType). Never add fields that **declare capabilities** (SBS, extended message types) or **reference server-side resources** (federated connections).
+**策略**: 避免 `disconnectBehavior` 和 `connectedFederatedConnections`（假ID），其他字段安全。
 
 ---
 
@@ -841,11 +838,8 @@ InvalidRequest is NOT caused by a single field. It's triggered by a **combinatio
 - **Fix61**: T2 firstNewMessageIndex history filtering (streaming path only)
 
 ### NOT Applied (confirmed causes InvalidRequest):
-- `isSbsSupported: true` / `renderReferencesBehindEOS: true` / `disconnectBehavior: "continue"`
-- `entityAnnotationTypes` expanded with Email/TeamsMessage
-- `clientInfo` full struct (mcmcopilot-web)
-- `allowedMessageTypes` 13→31
-- `locale: "zh-cn"` / `adaptiveCards: []` / `clientPreferences: {}` / `connectedFederatedConnections: ["dummyId"]`
+- `disconnectBehavior: "continue"` — **唯一确认导致InvalidRequest的字段**，单独测试即触发
+- `connectedFederatedConnections: ["dummyId"]` — 高风险，假ID未测试
 
 ### Still TODO:
 - `clientInfo` full struct (needs individual testing)
