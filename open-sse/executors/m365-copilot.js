@@ -102,7 +102,7 @@ const M365_DEFAULT_OPTIONS_SETS = [
 
 /**
  * Build M365 Copilot feature flags.
- * @param {boolean} enableReasoning - if true, add "enable_gg_gpt" for deep thinking
+ * @param {string} tone - "Magic" (auto), "Gpt_5_6_Chat" (fast), "Gpt_5_6_Reasoning" (deep)
  * @param {boolean} disableCodeInterpreter - if true, strip code interpreter / image generation flags
  * @param {boolean} keepSearch - if true, keep search-related flags (web search is useful)
  * @returns {string[]}
@@ -125,7 +125,6 @@ function buildCopilotOptionsSets(tone = "Magic", disableCodeInterpreter = false,
       "flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch",
       "cwc_flux_v3", "flux_v3_references", "flux_v3_references_entities",
       "flux_v3_references_ci",
-      "flux_v3_image_gen_enable_dimensions",
       "flux_v3_image_gen_enable_non_watermarked_storage",
       "flux_v3_image_gen_enable_icon_dimensions",
       "flux_v3_image_gen_enable_system_text_with_params",
@@ -148,15 +147,10 @@ function buildCopilotMessage(text, invocationId, conversationId, sessionId, tone
   const threadLevelGptId = {};
 
   const allowedMessageTypes = [
-    "Chat", "Suggestion", "InternalSearchQuery", "Disengaged",
-    "InternalLoaderMessage", "Progress", "GeneratedCode", "RenderCardRequest",
-    "AdsQuery", "SemanticSerp", "GenerateContentQuery", "GenerateGraphicArt",
-    "SearchQuery", "ConfirmationCard", "AuthError", "DeveloperLogs",
-    "TriggerPlugin", "HintInvocation", "MemoryUpdate", "EndOfRequest",
-    "TriggerConfirmation", "ResumeInvokeAction", "ResumeUserInputRequest",
-    "TriggerUserInputRequest", "EscapeHatch", "TriggerPluginAuth",
-    "ResumePluginAuth", "SideBySide", "ReferencesListComplete",
-    "SwitchRespondingEndpoint",
+    "Chat", "Suggestion", "InternalSearchQuery", "InternalSearchResult",
+    "Disengaged", "InternalLoaderMessage", "RenderCardRequest",
+    "AdsQuery", "SemanticSerp", "GenerateContentQuery", "SearchQuery",
+    "ConfirmationCard", "AuthError", "DeveloperLogs",
   ];
 
   const plugins = enableSearch
@@ -181,39 +175,22 @@ function buildCopilotMessage(text, invocationId, conversationId, sessionId, tone
       conversationId,
       traceId: randomUUID(),
       isStartOfSession: invocationId === 0,
-      clientInfo: {
-        clientPlatform: "mcmcopilot-web",
-        clientAppName: "Office",
-        clientEntrypoint: "mcmcopilot-officeweb",
-        clientSessionId: sessionId,
-        ProductCategory: "Chat",
-        clientAppType: "Web",
-        productEntryPoint: "ChatPanel",
-        deviceOS: "macOS",
-        deviceType: "Desktop",
-        clientPlatformVersion: "10.15.7",
-      },
+      clientInfo: { clientPlatform: "web" },
       message: {
         author: "user",
         inputMethod: "Keyboard",
         text,
-        entityAnnotationTypes: ["People", "File", "Event", "Email", "TeamsMessage"],
+        entityAnnotationTypes: ["People", "File", "Event"],
         requestId: randomUUID(),
         locationInfo: {
           timeZoneOffset: new Date().getTimezoneOffset() / -60,
           timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
         },
-        locale: "zh-cn",
+        locale: "en-US",
         messageType: "Chat",
         experienceType,
-        adaptiveCards: [],
-        clientPreferences: {},
-        connectedFederatedConnections: ["dummyId"],
       },
       plugins,
-      isSbsSupported: true,
-      renderReferencesBehindEOS: true,
-      disconnectBehavior: "continue",
     }],
     invocationId: String(invocationId),
     target: "chat",
@@ -374,7 +351,10 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
               console.log(`[M365-WS-T1] author=${msgAuthor} type=${msgType} textLen=${(msg.text||"").length} hiddenLen=${(msg.hiddenText||"").length} offense=${JSON.stringify(msgOffense)} turnState=${JSON.stringify(msgTurnState)} contentOrigin=${msgContentOrigin} text=${msgText}`);
 
               if (msgContentOrigin === "ChainOfThoughtSummary") {
-                console.log(`[M365-WS-COT] skipped ChainOfThoughtSummary (textLen=${(msg.text||"").length})`);
+                console.log(`[M365-WS-COT] ChainOfThoughtSummary (textLen=${(msg.text||"").length})`);
+                if (msg.text && !bufferForTools) {
+                  emitContent(`[Thinking] ${msg.text}\n`);
+                }
                 continue;
               }
               if (msgType === "Progress" && msgContentOrigin !== "DeepLeo") {
@@ -439,14 +419,17 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
               }
             }
           }
-          if (payload?.isLastUpdate) {
-            console.log(`[M365-WS-LAST] isLastUpdate=true, streaming complete for this request`);
-          }
         }
         if (data.type === 2) {
           const payload = data.item || data.arguments?.[0];
           if (payload?.messages) {
-            for (const msg of payload.messages) {
+            const firstNew = payload.firstNewMessageIndex ?? 0;
+            for (let mi = 0; mi < payload.messages.length; mi++) {
+              const msg = payload.messages[mi];
+              if (mi < firstNew) {
+                console.log(`[M365-WS-T2-HIST] skipped history msg idx=${mi} author=${msg?.author}`);
+                continue;
+              }
               const msgKeys = Object.keys(msg || {}).join(",");
               const msgAuthor = msg?.author || "NONE";
               const msgType = msg?.messageType || msg?.type || "unknown";
@@ -458,7 +441,10 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
               console.log(`[M365-WS-T2] author=${msgAuthor} type=${msgType} textLen=${(msg?.text||"").length} hiddenLen=${(msg?.hiddenText||"").length} offense=${JSON.stringify(msgOffense)} turnState=${JSON.stringify(msgTurnState)} contentOrigin=${msgContentOrigin} text=${msgText}`);
 
               if (msgContentOrigin === "ChainOfThoughtSummary") {
-                console.log(`[M365-WS-COT-T2] skipped ChainOfThoughtSummary (textLen=${(msg?.text||"").length})`);
+                console.log(`[M365-WS-COT-T2] ChainOfThoughtSummary (textLen=${(msg?.text||"").length})`);
+                if (msg?.text && !bufferForTools) {
+                  emitContent(`[Thinking] ${msg.text}\n`);
+                }
                 continue;
               }
               if (msgType === "Progress" && msgContentOrigin !== "DeepLeo") {
@@ -600,13 +586,19 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, mes
             if (isSearchBotMessage(msg)) continue;
             const contentOrigin = msg.contentOrigin || "none";
             const msgType = msg.messageType || msg.type || "unknown";
-            if (contentOrigin === "ChainOfThoughtSummary") continue;
+            if (contentOrigin === "ChainOfThoughtSummary") {
+              if (msg.text) fullText += `[Thinking] ${msg.text}\n`;
+              continue;
+            }
             if (msgType === "Progress" && contentOrigin !== "DeepLeo") continue;
             if (msgType === "ReferencesListComplete" || msgType === "Suggestion") continue;
             if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
               fullText = msg.text;
             }
           }
+        }
+        if (payload?.isLastUpdate) {
+          console.log(`[M365-WS-LAST] isLastUpdate=true, streaming complete for this request`);
         }
       }
       if (data.type === 2) {
@@ -616,7 +608,10 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, mes
             if (isSearchBotMessage(msg)) continue;
             const contentOrigin = msg?.contentOrigin || "none";
             const msgType = msg?.messageType || msg?.type || "unknown";
-            if (contentOrigin === "ChainOfThoughtSummary") continue;
+            if (contentOrigin === "ChainOfThoughtSummary") {
+              if (msg?.text) fullText += `[Thinking] ${msg.text}\n`;
+              continue;
+            }
             if (msgType === "Progress" && contentOrigin !== "DeepLeo") continue;
             if (msgType === "ReferencesListComplete" || msgType === "Suggestion") continue;
             if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
@@ -975,8 +970,8 @@ export class M365CopilotExecutor extends BaseExecutor {
       effectivePrompt = effectivePrompt + "\n\nIMPORTANT: File paths in this conversation are on the user's machine — you do NOT have access to them. Do NOT attempt to execute any commands yourself. Instead, ALWAYS output a JSON instruction for the user to execute on their machine.";
     }
     console.log(`[M365-EXEC-FLAGS] disableCodeInterpreter=${m365Flags.disableCodeInterpreter} enableSearch=${m365Flags.enableSearch} experienceType=Default tone=${m365Tone} hasImage=${/<image\b/i.test(userPrompt)} hasLocalPaths=${hasLocalPaths}`);
-    const copilotMsg = buildCopilotMessage(effectivePrompt, 0, conversationId, sessionIdUuid, m365Tone, m365Flags);
-    log?.info?.("M365-COPILOT", `WS send: tone=${m365Tone}, optionsSets=${JSON.stringify(copilotMsg.arguments[0].optionsSets)}, plugins=${JSON.stringify(copilotMsg.arguments[0].plugins)}, allowedMessageTypes=${JSON.stringify(copilotMsg.arguments[0].allowedMessageTypes)}`);
+    const copilotMsg = buildCopilotMessage(effectivePrompt, isContinuation ? 1 : 0, conversationId, sessionIdUuid, m365Tone, m365Flags);
+    log?.info?.("M365-COPILOT", `WS send: isStartOfSession=${copilotMsg.arguments[0].isStartOfSession} isContinuation=${isContinuation} optionsSets=${JSON.stringify(copilotMsg.arguments[0].optionsSets)}, plugins=${JSON.stringify(copilotMsg.arguments[0].plugins)}, allowedMessageTypes=${JSON.stringify(copilotMsg.arguments[0].allowedMessageTypes)}`);
     ws.send(JSON.stringify(copilotMsg) + RS);
 
     log?.info?.("M365-COPILOT", `Message sent (model=${model}), waiting for response stream`);

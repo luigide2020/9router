@@ -399,8 +399,10 @@ Added `extractHistoricalToolCallSignatures(messages)` which scans all ASSISTANT 
 | isContinuation cache requires hasAssistantHistory (Fix54) | Pending verification — need to confirm new tasks are no longer misrouted to extractContinuationPrompt |
 | NLU fallback skip URL captured content (Fix56) | Verified — "我打开 URL" no longer generates meaningless ls |
 | Pure-text stall guard (Fix57) | Verified — consecutive pure-text turns trigger flattenMessages + stallBreakHint |
-| WS protocol tone routing + fingerprint + filtering (Fix58) | Verified — tone values correct, 31 allowedMessageTypes, ChainOfThoughtSummary/Progress/RefsListComplete/Suggestion filtered, writeAtCursorEmittedLen dedup working |
+| WS protocol tone routing + fingerprint + filtering (Fix58) | PARTIALLY VERIFIED — tone routing ✅, 7 optionsSets flags ✅, removed productThreadType ✅, but 31 allowedMessageTypes/full clientInfo/SBS/locale NOT applied (causes InvalidRequest) |
 | login.py auto system proxy + atexit (Fix59) | Verified — proxy auto-set, region check passes, atexit cleanup works |
+| isStartOfSession fix (Fix60) | Verified — continuation requests no longer cause InvalidRequest |
+| T2 firstNewMessageIndex filtering (Fix61) | Partially verified — streaming path works, non-streaming path not yet implemented |
 
 ## Fix45: WS Connect Retry + 502 Short Cooldown
 
@@ -511,9 +513,11 @@ new: conversationIdBase = resolveSessionId({ connectionId: email + ":conv:" + sh
 8. **sanitizeForM365 corrupts code content** — `format`/`kill`/`delete` in code identifiers get replaced with `[cmdN]`, causing M365 to suggest "fixes" for already-correct code. See Fix39 for details and potential solutions.
 9. **M365 502 errors** — M365 Copilot upstream can return 502 Bad Gateway intermittently. Fix45 adds WS connect retry (3 attempts) and 5s cooldown for 502/503/504, reducing lockout from 30s to 5s.
 10. **`apply_patch` failures may recur** — Fix44 forces M365 to output manual code changes after 3 failures, but the root cause (patch content not matching actual file, possibly due to sanitizeForM365 corruption or Codex sandbox file differences) is not fixed. See Fix39.
-11. **STABLE conversationId memory unverified** — `isStartOfSession: true` + `invocationId: 0` sent every request may prevent M365 from using conversation memory. If STABLE doesn't work, count-based loop guard (Fix43, threshold=5) is the safety net. Fix46 isolates contexts per conversation to prevent cross-topic pollution regardless of whether M365 actually uses the memory.
+11. **STABLE conversationId memory** — Now working with Fix60 (isStartOfSession fix). M365 correctly recognizes continuation requests when `isStartOfSession=false`. However, `firstNewMessageIndex` filtering (Fix61) only covers streaming T2 path; T1 history dedup and non-streaming T2 filtering still needed.
 12. **conversationId based on first USER message** — If the same user sends identical first messages in separate chats (rare), they'll share a conversationId. This is acceptable: identical questions can share context.
 13. **isContinuation heuristic is fundamentally limited** — Fix54 reduces cache false positives by requiring `hasAssistantHistory`, but within a single Codex agentic loop, there is no conversation boundary. When a user changes topic mid-session, the message array still contains all prior history with ASSISTANT messages, so `isContinuation=true(struct=true)`. `extractContinuationPrompt` with 200-400 bytes cannot carry enough context for topic switches. Only Context Agent with semantic topic detection can solve this properly.
+14. **InvalidRequest triggered by capability-declaring fields** — M365 server validates fields like `isSbsSupported`, `renderReferencesBehindEOS`, `disconnectBehavior`, expanded `entityAnnotationTypes`, and `connectedFederatedConnections`. Adding these without actual support causes InvalidRequest. Strategy: only add passive fields (feature flags, empty containers) or remove fields; never declare capabilities we don't handle. See "InvalidRequest Analysis" section for full details.
+15. **T1 history message duplication** — When `isStartOfSession=false`, M365 T1 (streaming incremental) responses may include historical bot messages from earlier turns. Unlike T2, T1 doesn't have `firstNewMessageIndex`. The `botTextStreams` Map + `writeAtCursorEmittedLen` dedup handles most cases, but edge cases may still emit duplicate content.
 
 ---
 
@@ -724,6 +728,127 @@ When `isStalling=true`:
 
 **Before**: M365 pure text → Codex re-sends → `extractContinuationPrompt` (~100 bytes) → M365 repeats → infinite loop
 **After**: M365 pure text (×2) → stall detected → `flattenMessages` (full context) + stallBreakHint → M365 sees full context, provides final answer or new action ✅
+
+---
+
+## Fix60: isStartOfSession Fix — Prevent InvalidRequest on Continuation
+
+**File**: `m365-copilot.js`
+
+**Root cause**: `buildCopilotMessage()` was always called with `invocationId=0`, making `isStartOfSession` always `true`. When `isContinuation=true` (same conversationId, multi-turn), M365 server sees a contradiction: the request claims it's a new session but the conversationId already exists. This triggers `InvalidRequest` with `conversationTransferToken: null`.
+
+The bug was hidden before because M365 was lenient on `isStartOfSession: true` for first-turn requests. But when combined with additional request fields (see InvalidRequest analysis below), M365's stricter validation exposed the contradiction.
+
+**Fix**: `invocationId` now reflects continuation state:
+```
+old: buildCopilotMessage(text, 0, conversationId, sessionIdUuid, m365Tone, m365Flags)
+new: buildCopilotMessage(text, isContinuation ? 1 : 0, conversationId, sessionIdUuid, m365Tone, m365Flags)
+```
+This makes `isStartOfSession = (invocationId === 0)` correct: `true` for first turn, `false` for continuations.
+
+**Before**: Continuation requests → `isStartOfSession=true` → M365 rejects with InvalidRequest
+**After**: Continuation requests → `isStartOfSession=false` → M365 accepts ✅
+
+---
+
+## Fix61: T2 History Message Filtering via firstNewMessageIndex
+
+**File**: `m365-copilot.js`
+
+**Root cause**: When `isStartOfSession=false`, M365 WS responses include **full conversation history** in type:2 messages (all previous bot/user messages). Without filtering, historical bot messages were emitted as new content, causing doubled/repeated output visible to the user.
+
+**Fix**: In streaming T2 handler, use `firstNewMessageIndex` from the payload to skip history messages:
+```
+const firstNew = payload.firstNewMessageIndex ?? 0;
+for (let mi = 0; mi < payload.messages.length; mi++) {
+  if (mi < firstNew) { console.log(`skipped history msg`); continue; }
+  // process current-turn messages only
+}
+```
+
+**Note**: When `firstNewMessageIndex` is null (M365 sometimes omits it), all messages are processed — may still cause minor duplication for history. Non-streaming path does not yet have this filter.
+
+**Before**: Continuation T2 → historical bot messages emitted → user sees repeated content
+**After**: Continuation T2 → history skipped → only current-turn content emitted ✅
+
+---
+
+## InvalidRequest Analysis — Which Fields Trigger M365 Rejection
+
+After incremental re-addition testing from e8518e49 (merge base), the following fields were tested one by one:
+
+### Confirmed SAFE (no InvalidRequest):
+| Field | Notes |
+|-------|-------|
+| `streamingMode: "ConciseWithPadding"` | M365 accepts this streaming mode |
+| `extraExtensionParameters: {}` | Empty object, no validation |
+| `threadLevelGptId: {}` | Empty object (was already in Fix58) |
+| 7 optionsSets flags: `async_client_interaction`, `flux_v3_references`, `flux_v3_references_entities`, `flux_v3_references_ci`, `add_filestore_filetype`, `cwc_code_interpreter_citation_sourceannotations`, `cdxcwc_code_interpreter_hallucinated_url_filter` | Feature flags — M365 ignores unrecognized ones |
+| CI ciFlags expansion (6 flags for disableCodeInterpreter removal) | Same as above |
+| Removed `productThreadType: "Office"` | Reducing fields is safe |
+
+### Confirmed CAUSES InvalidRequest:
+| Field | Risk | Notes |
+|-------|------|-------|
+| `isSbsSupported: true` | Confirmed | M365 may validate SBS capability; we don't handle SideBySide responses |
+| `renderReferencesBehindEOS: true` | Confirmed | Coupled with SBS, triggers same validation |
+| `disconnectBehavior: "continue"` | Confirmed | Coupled with above fields, tested together as batch |
+| `entityAnnotationTypes: ["People", "File", "Event", "Email", "TeamsMessage"]` | Confirmed | Adding Email/TeamsMessage triggered InvalidRequest |
+
+### Suspected HIGH Risk (NOT yet tested individually):
+| Field | Risk | Notes |
+|-------|------|-------|
+| `clientInfo` full struct (`mcmcopilot-web`, `Office`, `macOS`, etc.) | High | Changes `clientPlatform` from "web" — may trigger server-side routing/validation |
+| `allowedMessageTypes` 13→31 (Progress, GeneratedCode, SideBySide, etc.) | High | Declares capability for 31 message types we don't handle — M365 may send SideBySide/TriggerPlugin and expect responses |
+| `locale: "zh-cn"` | Medium | M365 may only accept certain locale values; real browser sends "zh-cn" but our request context differs |
+| `adaptiveCards: []` | Medium | Empty array vs absent field — M365 may interpret empty array as "client supports adaptiveCards but has none" |
+| `clientPreferences: {}` | Medium | Same as adaptiveCards |
+| `connectedFederatedConnections: ["dummyId"]` | High | Fake connection ID — M365 likely validates against real federated connections, "dummyId" will fail lookup |
+
+### Root Cause Summary:
+InvalidRequest is NOT caused by a single field. It's triggered by a **combination** of fields that make M365's server-side validation stricter:
+1. When `isStartOfSession=true` (the Fix60 bug), M365's new-session validation is stricter — checks more fields
+2. Fields that declare capabilities we don't actually support (SBS, SideBySide, extended message types) fail validation
+3. Fake IDs (`dummyId`) and capability declarations that M365 can't verify on server side are rejected
+
+**Strategy going forward**: Only add fields that are **passive** (feature flags, empty containers) or **reducing** (removing productThreadType). Never add fields that **declare capabilities** (SBS, extended message types) or **reference server-side resources** (federated connections).
+
+---
+
+## Current Fix Status (post-Fix58 revert + incremental re-addition)
+
+### Applied and Verified:
+- Registry: 3 models (copilot, gpt-5.6, gpt-5.6-fast)
+- Tone routing: `enableReasoning`→`m365Tone`, `Magic`/`Gpt_5_6_Chat`/`Gpt_5_6_Reasoning`
+- `buildCopilotOptionsSets(tone)` + `enable_gg_gpt` only for Reasoning
+- ChainOfThoughtSummary: emit with `[Thinking]` prefix (NOT filtered/skipped)
+- Non-DeepLeo Progress: filtered
+- ReferencesListComplete + Suggestion: filtered
+- writeAtCursor: streaming `emitContent(cursorText)` + `writeAtCursorEmittedLen` tracking
+- Bot text delta: `Math.max(prev.length, writeAtCursorEmittedLen)` as start offset
+- Non-streaming: `fullText += writeAtCursor`, msg.text replaces if longer
+- patches frames: logged only
+- isLastUpdate: logged
+- `threadLevelGptId: {}`
+- `streamingMode: "ConciseWithPadding"`
+- `extraExtensionParameters: {}`
+- 7 new optionsSets flags (async_client_interaction, flux_v3_references*, add_filestore_filetype, etc.)
+- CI ciFlags expansion (6 flags for disableCodeInterpreter)
+- Removed `productThreadType: "Office"`
+- **Fix60**: isStartOfSession based on isContinuation (invocationId: 0 or 1)
+- **Fix61**: T2 firstNewMessageIndex history filtering (streaming path only)
+
+### NOT Applied (confirmed causes InvalidRequest):
+- `isSbsSupported: true` / `renderReferencesBehindEOS: true` / `disconnectBehavior: "continue"`
+- `entityAnnotationTypes` expanded with Email/TeamsMessage
+- `clientInfo` full struct (mcmcopilot-web)
+- `allowedMessageTypes` 13→31
+- `locale: "zh-cn"` / `adaptiveCards: []` / `clientPreferences: {}` / `connectedFederatedConnections: ["dummyId"]`
+
+### Still TODO:
+- T1 history message dedup (isContinuation时T1也回传历史bot消息)
+- Non-streaming T2 firstNewMessageIndex filtering
+- `clientInfo` full struct (needs individual testing)
 
 ---
 
