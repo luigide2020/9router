@@ -402,7 +402,8 @@ Added `extractHistoricalToolCallSignatures(messages)` which scans all ASSISTANT 
 | WS protocol tone routing + fingerprint + filtering (Fix58) | PARTIALLY VERIFIED — tone routing ✅, 7 optionsSets flags ✅, removed productThreadType ✅, but 31 allowedMessageTypes/full clientInfo/SBS/locale NOT applied (causes InvalidRequest) |
 | login.py auto system proxy + atexit (Fix59) | Verified — proxy auto-set, region check passes, atexit cleanup works |
 | isStartOfSession fix (Fix60) | Verified — continuation requests no longer cause InvalidRequest |
-| T2 firstNewMessageIndex filtering (Fix61) | Partially verified — streaming path works, non-streaming path not yet implemented |
+| T2 firstNewMessageIndex filtering (Fix61) | Verified — streaming and non-streaming paths both filter history messages |
+| NLU fallback exclude 看看/看一/看出 (Fix62) | Verified — "我想看看睡衣之下的美" no longer triggers exec_command |
 
 ## Fix45: WS Connect Retry + 502 Short Cooldown
 
@@ -517,7 +518,8 @@ new: conversationIdBase = resolveSessionId({ connectionId: email + ":conv:" + sh
 12. **conversationId based on first USER message** — If the same user sends identical first messages in separate chats (rare), they'll share a conversationId. This is acceptable: identical questions can share context.
 13. **isContinuation heuristic is fundamentally limited** — Fix54 reduces cache false positives by requiring `hasAssistantHistory`, but within a single Codex agentic loop, there is no conversation boundary. When a user changes topic mid-session, the message array still contains all prior history with ASSISTANT messages, so `isContinuation=true(struct=true)`. `extractContinuationPrompt` with 200-400 bytes cannot carry enough context for topic switches. Only Context Agent with semantic topic detection can solve this properly.
 14. **InvalidRequest triggered by capability-declaring fields** — M365 server validates fields like `isSbsSupported`, `renderReferencesBehindEOS`, `disconnectBehavior`, expanded `entityAnnotationTypes`, and `connectedFederatedConnections`. Adding these without actual support causes InvalidRequest. Strategy: only add passive fields (feature flags, empty containers) or remove fields; never declare capabilities we don't handle. See "InvalidRequest Analysis" section for full details.
-15. **T1 history message duplication** — When `isStartOfSession=false`, M365 T1 (streaming incremental) responses may include historical bot messages from earlier turns. Unlike T2, T1 doesn't have `firstNewMessageIndex`. The `botTextStreams` Map + `writeAtCursorEmittedLen` dedup handles most cases, but edge cases may still emit duplicate content.
+15. **T1 history message duplication** — When `isStartOfSession=false`, M365 T1 (streaming incremental) responses may include historical bot messages from earlier turns. Unlike T2, T1 doesn't have `firstNewMessageIndex`. However, the `botTextStreams` Map + `writeAtCursorEmittedLen` dedup handles this correctly — same msgId tracks cumulative text and only emits deltas. Log shows duplicate entries but user output is correct.
+16. **NLU_FALLBACK false positives for Chinese verbs** — Pattern `看(?!到|了|过)` matches "看看" (reduplication, means "take a look" not "read X") and "看一" (as in "看一看"). These are conversational, not command intent. Fix62 adds negative lookahead `看(?!看|到|了|过|一|出)`.
 
 ---
 
@@ -846,9 +848,25 @@ InvalidRequest is NOT caused by a single field. It's triggered by a **combinatio
 - `locale: "zh-cn"` / `adaptiveCards: []` / `clientPreferences: {}` / `connectedFederatedConnections: ["dummyId"]`
 
 ### Still TODO:
-- T1 history message dedup (isContinuation时T1也回传历史bot消息)
-- Non-streaming T2 firstNewMessageIndex filtering
 - `clientInfo` full struct (needs individual testing)
+
+---
+
+## Fix62: NLU_FALLBACK — Exclude "看看/看一/看出" Reduplication
+
+**File**: `m365-copilot-to-openai.js`
+
+**Root cause**: `ACTION_INTENT_PATTERNS[0]` uses `看(?!到|了|过)` negative lookahead to exclude past-tense forms, but "看看" (reduplication = "take a look") and "看一看" are also non-command conversational Chinese. When M365 translates "I want to see the beauty beneath the pajamas" as "我想看看睡衣之下的美", the pattern matches `看` → captures "睡衣之下的美" → NLU fallback generates `exec_command: ls` — a completely meaningless command that causes agentic loop stalling.
+
+**Fix**: Expanded negative lookahead from `看(?!到|了|过)` to `看(?!看|到|了|过|一|出)`:
+- 看看 (reduplication) → excluded ✓
+- 看一看 → excluded ✓
+- 看出 (perceive/realize) → excluded ✓
+- 看到/看了/看过 (past tense) → still excluded ✓
+- 我要看文件 (command intent) → matched ✓
+
+**Before**: "我想看看睡衣之下的美" → NLU_FALLBACK → `exec_command: ls` (false positive, causes loop)
+**After**: "我想看看睡衣之下的美" → NLU skipped → pure text response ✓
 
 ---
 

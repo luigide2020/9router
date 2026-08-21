@@ -48,7 +48,7 @@ const COMMON_COMMANDS_RE = /\b(ls|pwd|cat|find|grep|head|tail|wc|echo|mkdir|rm|c
 const COMMAND_INTENT_RE = /\b(run|execute|try|type|enter|issue|invoke|use)\s+(this\s+)?(command|the\s+following|it|now)|^CMD:|(?:我[要需来想先会]|让[我咱]|请)(?:来|去)?(?:看(?:一下)?|读(?:一下)?|查(?:一下)?|检查(?:一下)?|执行(?:一下)?|运行(?:一下)?|列出(?:一下)?|浏览(?:一下)?|跑(?:一下)?|看看|读读|查查)/im;
 
 const ACTION_INTENT_PATTERNS = [
-  /我[要需来想先将会能]*(?:看(?!到|了|过)|读|查|检查|执行|运行|列出|浏览|打开|查看|确认|验证)[一下]*\s*(?:一下\s*)?([^\s，。！？、\n]{2,80})/,
+  /我[要需来想先将会能]*(?:看(?!看|到|了|过|一|出)|读|查|检查|执行|运行|列出|浏览|打开|查看|确认|验证)[一下]*\s*(?:一下\s*)?([^\s，。！？、\n]{2,80})/,
   /让我(?:看|读|查|检查|执行|运行|列出)\s*([^\s，。！？、\n]{2,80})/,
   /I'?(?:ll| will)\s+(?:read|check|run|execute|list|look at|examine|try|inspect|view|verify)\s+(.{2,80}?)(?:\.|,|$)/i,
   /Let me\s+(?:see|check|read|run|execute|look at|try|inspect)\s+(.{2,80}?)(?:\.|,|$)/i,

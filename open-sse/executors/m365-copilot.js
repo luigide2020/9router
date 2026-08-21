@@ -604,12 +604,18 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, mes
       if (data.type === 2) {
         const payload = data.item || data.arguments?.[0];
         if (payload?.messages) {
-          for (const msg of payload.messages) {
+          const firstNew = payload.firstNewMessageIndex ?? 0;
+          for (let mi = 0; mi < payload.messages.length; mi++) {
+            const msg = payload.messages[mi];
+            if (mi < firstNew) {
+              console.log(`[M365-WS-T2-HIST-NS] skipped history msg idx=${mi} author=${msg?.author}`);
+              continue;
+            }
             if (isSearchBotMessage(msg)) continue;
             const contentOrigin = msg?.contentOrigin || "none";
             const msgType = msg?.messageType || msg?.type || "unknown";
             if (contentOrigin === "ChainOfThoughtSummary") {
-              if (msg?.text) fullText += `[Thinking] ${msg.text}\n`;
+              if (msg?.text) fullText += `[Thinking] ${msg?.text}\n`;
               continue;
             }
             if (msgType === "Progress" && contentOrigin !== "DeepLeo") continue;
