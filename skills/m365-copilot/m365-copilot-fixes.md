@@ -945,3 +945,46 @@ Filtered: `ChainOfThoughtSummary` (internal thinking), non-DeepLeo `Progress` (p
 - `msg.messageType === 'InternalLoaderMessage'` → skip (log `[M365-WS-T1/T2] InternalLoaderMessage filtered`)
 
 **Verification**: "Hide" no longer appears in `M365-CLOSE-FULL` output; "正在生成响应。" no longer emitted. Both still logged for diagnostics (before filter).
+
+---
+
+## Fix65: Remove justification/sandbox_permissions from Codex Instructions
+
+**File**: `codexInstructions.js`
+
+**Root cause**: `codexInstructions.js` instructed the model to use `justification` and `sandbox_permissions` parameters in `exec_command` calls (lines 49-65). M365's CI sandbox does NOT support these parameters — when a command includes `justification` without `sandbox_permissions`, the sandbox rejects it with "执行未发生：`justification` 必须与显式的 `sandbox_permissions` 一起使用", and the original `cmd` is LOST (not returned to client).
+
+**Fix**: Replaced the entire sandbox/approval/escalation section with a clear prohibition:
+- "CRITICAL: Do NOT use `justification` or `sandbox_permissions` parameters in any command."
+- "Always use plain `exec_command` with only standard parameters (cmd, workdir, max_output_tokens, yield_time_ms)."
+- "When a command fails due to sandboxing, try alternative approaches rather than requesting permission escalation."
+
+**Impact**: Commands without `justification` execute successfully in M365's sandbox (verified by `uv run pytest -v`, `cat`, `python` commands that all worked when they lacked `justification`). Only commands with `justification` were rejected.
+
+---
+
+## Fix66: Prevent M365 CI Execution + Sandbox Failure Suppression
+
+**Files**: `m365-copilot.js` (executor), `codexInstructions.js`
+
+**Root cause**: Even with `disableCodeInterpreter=true`, M365's CI sandbox still executes commands that the model generates. When commands include `justification`, sandbox rejects them and the original `cmd` is lost.
+
+**Fix** (dual approach):
+
+### Primary: Remove CI message types when disableCodeInterpreter=true
+
+When `disableCodeInterpreter=true`, filter out CI-related `allowedMessageTypes`:
+- `GeneratedCode`, `RenderCardRequest`, `GenerateGraphicArt`, `GenerateContentQuery`, `ConfirmationCard`
+- These 5 types signal CI capability; removing them should prevent M365 from executing commands in its sandbox
+- Logged as `[M365-MSG-TYPES] disableCodeInterpreter=true allowedCount=26 removed=5`
+
+### Secondary: Sandbox failure detection and suppression
+
+Even if M365 still executes, sandbox rejection messages are now filtered:
+- T1/T2 streaming: `/执行未发生|`justification`.*`sandbox_permissions`/` → skip message, log `[M365-WS-SANDBOX-FAIL-T1/T2]`
+- Non-streaming T1/T2: same regex → skip message
+- Close buffer: `hasSandboxFail` expanded to include "执行未发生" pattern; when detected, output is suppressed instead of emitted to client, log `[M365-CLOSE-SANDBOX-FAIL]`
+
+### Tertiary: codexInstructions.js prohibition (Fix65)
+
+Instructions now explicitly prohibit `justification` and `sandbox_permissions` parameters, preventing the model from generating them in the first place.
