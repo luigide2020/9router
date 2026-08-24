@@ -388,6 +388,9 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
               if (msgType === "Suggestion") {
                 continue;
               }
+              if (msgType === "EscapeHatch" || msgType === "InternalLoaderMessage") {
+                continue;
+              }
 
               if (msg.hiddenText && /Conversation disengaged|Sorry.*(?:chat|help|assist)|I can't (?:help|chat|assist)/i.test(msg.hiddenText)) {
                 console.log(`[M365-WS-DISENGAGE-T1] DETECTED in hiddenText! hiddenText=${msgHidden} author=${msgAuthor} type=${msgType}`);
@@ -472,6 +475,9 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
                 continue;
               }
               if (msgType === "ReferencesListComplete" || msgType === "Suggestion") {
+                continue;
+              }
+              if (msgType === "EscapeHatch" || msgType === "InternalLoaderMessage") {
                 continue;
               }
 
@@ -612,6 +618,7 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, mes
             }
             if (msgType === "Progress" && contentOrigin !== "DeepLeo") continue;
             if (msgType === "ReferencesListComplete" || msgType === "Suggestion") continue;
+            if (msgType === "EscapeHatch" || msgType === "InternalLoaderMessage") continue;
             if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
               fullText = msg.text;
             }
@@ -640,6 +647,7 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, mes
             }
             if (msgType === "Progress" && contentOrigin !== "DeepLeo") continue;
             if (msgType === "ReferencesListComplete" || msgType === "Suggestion") continue;
+            if (msgType === "EscapeHatch" || msgType === "InternalLoaderMessage") continue;
             if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
               fullText = msg.text;
             }

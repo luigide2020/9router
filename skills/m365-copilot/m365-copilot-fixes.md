@@ -405,6 +405,7 @@ Added `extractHistoricalToolCallSignatures(messages)` which scans all ASSISTANT 
 | T2 firstNewMessageIndex filtering (Fix61) | Verified — streaming and non-streaming paths both filter history messages |
 | NLU fallback exclude 看看/看一/看出 (Fix62) | Verified — "我想看看睡衣之下的美" no longer triggers exec_command |
 | Full browser fingerprint fields (Fix63) | Verified — all fields individually tested safe, only disconnectBehavior causes InvalidRequest |
+| EscapeHatch/InternalLoaderMessage filter (Fix64) | Verified — "Hide" and "正在生成响应。" no longer appear in output |
 
 ## Fix45: WS Connect Retry + 502 Short Cooldown
 
@@ -928,3 +929,19 @@ Filtered: `ChainOfThoughtSummary` (internal thinking), non-DeepLeo `Progress` (p
 4. Browser uses system proxy (QUIC preserved) instead of `--proxy-server`
 5. `sync_remote.sh` simplified — delegates to `login.py`, removed manual `.env` parsing
 6. `login.py` loads `.env` via `dotenv`
+
+---
+
+## Fix64: EscapeHatch + InternalLoaderMessage Filter
+
+**File**: `m365-copilot.js` (executor)
+
+**Root cause**: M365 sends two non-user-facing message types that were being emitted to clients:
+- `EscapeHatch` (type field): text="Hide" — M365's collapsible "Hide" button marker
+- `InternalLoaderMessage`: text="正在生成响应。" — loading indicator
+
+**Fix**: Filter both types in T1, T2 (streaming), and non-streaming paths:
+- `msg.messageType === 'EscapeHatch'` → skip (log `[M365-WS-T1/T2] EscapeHatch filtered`)
+- `msg.messageType === 'InternalLoaderMessage'` → skip (log `[M365-WS-T1/T2] InternalLoaderMessage filtered`)
+
+**Verification**: "Hide" no longer appears in `M365-CLOSE-FULL` output; "正在生成响应。" no longer emitted. Both still logged for diagnostics (before filter).
