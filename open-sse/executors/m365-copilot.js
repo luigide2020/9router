@@ -324,14 +324,11 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
         if (bufferForTools && fullText) {
           const hasCmd = /^CMD:/m.test(fullText);
           const hasRemoteExec = /\/mnt\/(file_upload|data|home|tmp|usr|var|workspace|sandbox)/.test(fullText);
+          const hasCiResult = /^命令已成功执行|^命令执行失败.*退出码|^无需进一步操作$/.test(fullText);
           const hasSandboxFail = /(?:当前执行环境|访问不到|无法访问|No such file or directory|\.codex\/attachments|执行未发生|`justification`.*`sandbox_permissions`)/.test(fullText);
-          console.log(`[M365-CLOSE] Buffering tools: textLen=${fullText.length}, needsLocalExec=${!!toolMeta?.needsLocalExec}, hasJsonTool=${fullText.includes('```json-tool')}, hasCmd=${hasCmd}, hasRemoteExec=${hasRemoteExec}, hasSandboxFail=${hasSandboxFail}`);
+          console.log(`[M365-CLOSE] Buffering tools: textLen=${fullText.length}, needsLocalExec=${!!toolMeta?.needsLocalExec}, hasJsonTool=${fullText.includes('```json-tool')}, hasCmd=${hasCmd}, hasRemoteExec=${hasRemoteExec}, hasSandboxFail=${hasSandboxFail}, hasCiResult=${hasCiResult}`);
           console.log(`[M365-CLOSE-FULL] ${fullText.slice(0, 1000)}`);
-          if (hasSandboxFail && bufferForTools) {
-            console.log(`[M365-CLOSE-SANDBOX-FAIL] sandbox failure detected in buffered output, suppressing`);
-          } else {
-            emitContent(fullText);
-          }
+          emitContent(fullText);
         }
         closed = true;
         try {
@@ -408,6 +405,10 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
               }
               if (msg.text && /执行未发生|`justification`.*`sandbox_permissions`/.test(msg.text)) {
                 console.log(`[M365-WS-SANDBOX-FAIL-T1] sandbox rejection filtered: text=${(msg.text||"").slice(0,200)}`);
+                continue;
+              }
+              if (bufferForTools && msg.text && /^命令已成功执行|^命令执行失败.*退出码|无需进一步操作$/.test(msg.text)) {
+                console.log(`[M365-WS-CI-RESULT-T1] CI execution result filtered: text=${(msg.text||"").slice(0,200)}`);
                 continue;
               }
 
@@ -501,6 +502,10 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
               }
               if (msg.text && /执行未发生|`justification`.*`sandbox_permissions`/.test(msg.text)) {
                 console.log(`[M365-WS-SANDBOX-FAIL-T2] sandbox rejection filtered: text=${(msg.text||"").slice(0,200)}`);
+                continue;
+              }
+              if (bufferForTools && msg.text && /^命令已成功执行|^命令执行失败.*退出码|无需进一步操作$/.test(msg.text)) {
+                console.log(`[M365-WS-CI-RESULT-T2] CI execution result filtered: text=${(msg.text||"").slice(0,200)}`);
                 continue;
               }
 
@@ -643,6 +648,7 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, mes
             if (msgType === "ReferencesListComplete" || msgType === "Suggestion") continue;
             if (msgType === "EscapeHatch" || msgType === "InternalLoaderMessage") continue;
             if (msg.text && /执行未发生|`justification`.*`sandbox_permissions`/.test(msg.text)) continue;
+            if (msg.text && /^命令已成功执行|^命令执行失败.*退出码|^无需进一步操作$/.test(msg.text)) continue;
             if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
               fullText = msg.text;
             }
@@ -673,6 +679,7 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, mes
             if (msgType === "ReferencesListComplete" || msgType === "Suggestion") continue;
             if (msgType === "EscapeHatch" || msgType === "InternalLoaderMessage") continue;
             if (msg.text && /执行未发生|`justification`.*`sandbox_permissions`/.test(msg.text)) continue;
+            if (msg.text && /^命令已成功执行|^命令执行失败.*退出码|^无需进一步操作$/.test(msg.text)) continue;
             if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
               fullText = msg.text;
             }

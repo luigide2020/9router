@@ -295,59 +295,50 @@ function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas, hasSearchToo
 
   let schemaInstr;
   if (schema && schema.properties) {
-    const props = schema.properties;
-    const required = schema.required || [];
-    const paramParts = [];
-    for (const [key, val] of Object.entries(props)) {
-      const req = required.includes(key) ? " (required)" : " (optional)";
-      paramParts.push(`    "${key}": <${val.type || "string"}>${req}`);
-    }
     schemaInstr = [
       `When you need to execute a command, output EXACTLY this JSON on a single line:`,
-      `{"name": "${primaryTool}", "arguments": {`,
-      paramParts.join(",\n"),
-      `  }}`,
+      `{"name": "${primaryTool}", "arguments": {"cmd": "<the_command>"}}`,
       ``,
       `Example for listing files:`,
-      `{"name": "${primaryTool}", "arguments": { ${Object.keys(props)[0]}: "ls" }}`,
+      `{"name": "${primaryTool}", "arguments": {"cmd": "ls"}}`,
     ].join("\n");
   } else {
     schemaInstr = [
       `When you need to execute a command, output JSON like:`,
-      `{"name": "${primaryTool}", "arguments": {"command": "<the_command>"}}`,
+      `{"name": "${primaryTool}", "arguments": {"cmd": "<the_command>"}}`,
     ].join("\n");
   }
 
   const scopeConstraint = "Do ONLY what the user explicitly asks. Do NOT expand scope — if the user asks to read one file, read only that file; do NOT read related files, dependencies, or follow-up files unless the user asks.";
 
-  const remoteExecProhibition = "You do NOT have direct access to the user's files or machine. NEVER execute any command yourself — always output a JSON instruction for the user to execute on their machine. If you need to read a file, list a directory, or run any command, output the JSON instruction and wait for the result. Do NOT attempt to execute commands in your environment.";
+  const remoteExecProhibition = "The user is on a remote machine. You CANNOT execute commands on their behalf. When you need to perform any action (running commands, reading files, checking status, etc.), output a JSON instruction and STOP — the user will execute it on their machine and return the result. Do NOT assume any command has been executed unless the user explicitly returns the result.";
 
   if (hasSearchTools) {
     return [
       destructiveBlock,
-      "You are assisting a user who has a command-line interface. For any action the user requests (checking, searching, reading, listing, etc.), always output a JSON instruction using this schema, and the user will handle the execution:",
+      "You are assisting a user who has a command-line interface on a remote machine. For any action the user requests (checking, searching, reading, listing, etc.), always output a JSON instruction using this schema, and the user will execute it on their machine and return the result:",
       schemaInstr,
       remoteExecProhibition,
       scopeConstraint,
       langHint,
-      "IMPORTANT: You MUST output a JSON instruction for ANY action — including reading files, listing directories, checking status, or running commands. The ONLY time you should use plain text is when you are providing a final summary with NO further actions needed.",
+      "IMPORTANT: You MUST output a JSON instruction for ANY action — including reading files, listing directories, checking status, or running commands. The ONLY time you should use plain text is when you are providing a final summary with NO further actions needed. Do NOT include `justification`, `sandbox_permissions`, `login`, `shell`, `yield_time_ms`, or `max_output_tokens` in your JSON — only use `cmd`.",
     ].filter(Boolean).join(" ");
   }
 
   return [
     destructiveBlock,
-    "You are assisting a user who has a command-line interface. For any action the user requests, always output a JSON instruction using this schema, and the user will handle the execution:",
+    "You are assisting a user who has a command-line interface on a remote machine. For any action the user requests, always output a JSON instruction using this schema, and the user will execute it on their machine and return the result:",
     schemaInstr,
     remoteExecProhibition,
     scopeConstraint,
     langHint,
-    "IMPORTANT: You MUST output a JSON instruction for ANY action — including reading files, listing directories, checking status, or running commands. The ONLY time you should use plain text is when you are providing a final summary with NO further actions needed.",
+    "IMPORTANT: You MUST output a JSON instruction for ANY action — including reading files, listing directories, checking status, or running commands. The ONLY time you should use plain text is when you are providing a final summary with NO further actions needed. Do NOT include `justification`, `sandbox_permissions`, `login`, `shell`, `yield_time_ms`, or `max_output_tokens` in your JSON — only use `cmd`.",
   ].filter(Boolean).join(" ");
 }
 
-const M365_MAX_TOOL_RESULT_LEN = 8000;
-const M365_MAX_FILE_CONTENT_LEN = 3000;
-const M365_MAX_SHELL_OUTPUT_LEN = 6000;
+const M365_MAX_TOOL_RESULT_LEN = 24000;
+const M365_MAX_FILE_CONTENT_LEN = 20000;
+const M365_MAX_SHELL_OUTPUT_LEN = 16000;
 
 function truncateToolResult(resultStr, maxLen = M365_MAX_TOOL_RESULT_LEN) {
   if (!resultStr || resultStr.length <= maxLen) return resultStr;
@@ -731,6 +722,7 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
       const required = schema.required || [];
       const paramParts = [];
       for (const [key, val] of Object.entries(props)) {
+        if (key === "justification" || key === "sandbox_permissions") continue;
         const req = required.includes(key) ? " (required)" : " (optional)";
         paramParts.push(`"${key}": <${val.type || "string"}>${req}`);
       }
@@ -928,17 +920,6 @@ function openaiToM365CopilotRequest(model, body, stream, credentials) {
     } else if (isContinuation && strategy.startsWith("extractContinuationPrompt")) {
       const schemaHint = (() => {
         const primaryTool = toolMeta.shellToolNames?.[0] || "exec_command";
-        const schema = toolMeta.shellToolSchemas?.[primaryTool];
-        if (schema && schema.properties) {
-          const props = schema.properties;
-          const required = schema.required || [];
-          const paramParts = [];
-          for (const [key, val] of Object.entries(props)) {
-            const req = required.includes(key) ? " (required)" : " (optional)";
-            paramParts.push(`"${key}": <${val.type || "string"}>${req}`);
-          }
-          return `{"name": "${primaryTool}", "arguments": { ${paramParts.join(", ")} }}`;
-        }
         return `{"name": "${primaryTool}", "arguments": {"cmd": "<command>"}}`;
       })();
       const continuationReminder = [

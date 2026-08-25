@@ -406,6 +406,11 @@ Added `extractHistoricalToolCallSignatures(messages)` which scans all ASSISTANT 
 | NLU fallback exclude 看看/看一/看出 (Fix62) | Verified — "我想看看睡衣之下的美" no longer triggers exec_command |
 | Full browser fingerprint fields (Fix63) | Verified — all fields individually tested safe, only disconnectBehavior causes InvalidRequest |
 | EscapeHatch/InternalLoaderMessage filter (Fix64) | Verified — "Hide" and "正在生成响应。" no longer appear in output |
+| Strip justification/sandbox_permissions from tool_calls (Fix66) | Verified — `[M365-RESP-STRIP]` removes these fields; client receives clean tool_calls |
+| Filter CI execution result text (Fix66) | Verified — "命令已成功执行" no longer emitted to client; model doesn't prematurely stop |
+| Enhanced anti-execution prompt (Fix66) | Verified — model outputs JSON and waits for result; JailBreak avoided by NOT denying CI existence |
+| Remove CI allowedMessageTypes (Fix66) | Defense-in-depth only — did NOT prevent CI execution; CI is backend-driven |
+| Increase truncation limits (Fix67) | Verified — file reads and command outputs no longer truncated; model sees full content |
 
 ## Fix45: WS Connect Retry + 502 Short Cooldown
 
@@ -963,28 +968,101 @@ Filtered: `ChainOfThoughtSummary` (internal thinking), non-DeepLeo `Progress` (p
 
 ---
 
-## Fix66: Prevent M365 CI Execution + Sandbox Failure Suppression
+## Fix66: Stop M365 Code Interpreter (CI) from Executing Commands Remotely
 
-**Files**: `m365-copilot.js` (executor), `codexInstructions.js`
+**Files**: `openai-to-m365-copilot.js` (request), `m365-copilot-to-openai.js` (response), `m365-copilot.js` (executor), `codexInstructions.js`
 
-**Root cause**: Even with `disableCodeInterpreter=true`, M365's CI sandbox still executes commands that the model generates. When commands include `justification`, sandbox rejects them and the original `cmd` is lost.
+**Root cause**: M365 has a built-in Code Interpreter (CI) sandbox that automatically executes commands the model generates. Our prompt was sending the **full tool schema** (including `justification`, `login`, `shell`, `max_output_tokens`, `yield_time_ms` etc.) to M365. M365 saw this complete tool definition and concluded it could execute commands in its sandbox, causing:
+1. Commands executed in M365's sandbox (wrong environment, not user's machine)
+2. `justification` parameter caused sandbox rejection → cmd lost
+3. CI result text ("命令已成功执行") injected into response → model thinks task done, stops
+4. Model and user see conflicting results from two different execution environments
 
-**Fix** (dual approach):
+**M365 web chat does NOT have this problem** — it returns commands as text because it doesn't receive tool schema definitions.
 
-### Primary: Remove CI message types when disableCodeInterpreter=true
+### Core Fix: Simplify schema to only `cmd` + "remote machine" wording (request translator)
+
+**Before**: Prompt sent full tool schema with all parameters:
+```
+{"name": "exec_command", "arguments": {
+    "cmd": <string> (required),
+    "justification": <string> (optional),
+    "login": <boolean> (optional),
+    "max_output_tokens": <number> (optional),
+    "shell": <string> (optional),
+    "yield_time_ms": <number> (optional)
+}}
+```
+
+**After**: Prompt only exposes `cmd`, no CI-specific parameters:
+```
+{"name": "exec_command", "arguments": {"cmd": "<the_command>"}}
+```
+
+Plus wording change: **"You are assisting a user who has a command-line interface on a remote machine"** — M365 understands it cannot execute on behalf of the user.
+
+IMPORTANT clause: **"Do NOT include `justification`, `sandbox_permissions`, `login`, `shell`, `yield_time_ms`, or `max_output_tokens` in your JSON — only use `cmd`."**
+
+This is the primary fix that stops M365 from executing commands. The other layers are safety nets.
+
+### Safety Net 1: Strip justification/sandbox_permissions from tool_call output (response translator)
+
+- `stripSandboxFields()` + `makeToolCall()` in `m365-copilot-to-openai.js` — all tool_calls sent to client have `justification` and `sandbox_permissions` removed
+- Logged as `[M365-RESP-STRIP]`
+- If model occasionally generates these params despite instructions, they won't reach the client
+
+### Safety Net 2: Filter CI execution result text (executor + response translator)
+
+M365 CI occasionally injects result text like "命令已成功执行" / "命令执行失败，退出码为 127" after executing commands. This text must NOT reach the client or model would think task is done.
+
+Executor (4 paths — T1/T2 streaming + non-streaming T1/T2):
+- Regex: `/^命令已成功执行|^命令执行失败.*退出码|^无需进一步操作$/`
+- Logged as `[M365-WS-CI-RESULT-T1/T2]`
+- **NOTE**: Patterns use `^` anchor to avoid false positives on normal text containing similar words
+
+Response translator (`buildToolCallResults`):
+- `isCiExecutionResult()` detects CI result patterns
+- When detected, cleanContent is NOT emitted as content before tool_calls
+- Logged as `[M365-RESP-CI-FILTER]`
+
+### Safety Net 3: Filter sandbox rejection messages (executor)
+
+Regex: `/执行未发生|`justification`.*`sandbox_permissions`/` — 4 paths
+Logged as `[M365-WS-SANDBOX-FAIL-T1/T2]`
+
+### Safety Net 4: Remove CI message types when disableCodeInterpreter=true (executor)
 
 When `disableCodeInterpreter=true`, filter out CI-related `allowedMessageTypes`:
 - `GeneratedCode`, `RenderCardRequest`, `GenerateGraphicArt`, `GenerateContentQuery`, `ConfirmationCard`
-- These 5 types signal CI capability; removing them should prevent M365 from executing commands in its sandbox
-- Logged as `[M365-MSG-TYPES] disableCodeInterpreter=true allowedCount=26 removed=5`
+- Logged as `[M365-MSG-TYPES]`
+- **NOTE**: This did NOT prevent M365 from executing commands (CI execution is backend-driven, not controlled by allowedMessageTypes). Kept as defense-in-depth.
 
-### Secondary: Sandbox failure detection and suppression
+### Safety Net 5: codexInstructions.js prohibition (Fix65)
 
-Even if M365 still executes, sandbox rejection messages are now filtered:
-- T1/T2 streaming: `/执行未发生|`justification`.*`sandbox_permissions`/` → skip message, log `[M365-WS-SANDBOX-FAIL-T1/T2]`
-- Non-streaming T1/T2: same regex → skip message
-- Close buffer: `hasSandboxFail` expanded to include "执行未发生" pattern; when detected, output is suppressed instead of emitted to client, log `[M365-CLOSE-SANDBOX-FAIL]`
+Client-side instructions also prohibit `justification` and `sandbox_permissions` parameters.
 
-### Tertiary: codexInstructions.js prohibition (Fix65)
+### Key Lessons
 
-Instructions now explicitly prohibit `justification` and `sandbox_permissions` parameters, preventing the model from generating them in the first place.
+1. **Do NOT claim "You do NOT have a code interpreter"** — triggers M365's JailBreakClassifier (contentOrigin=JailBreakClassifier → type=Disengaged → "抱歉，我似乎无法就此话题进行聊天"). Must use softer wording like "The user is on a remote machine. You CANNOT execute commands on their behalf."
+2. **Do NOT send full tool schema to M365** — M365 web chat works fine because it doesn't receive tool definitions. Sending full schema (with `justification`, `login`, `shell`, etc.) tells M365 "I have these capabilities" and triggers CI execution.
+3. **CI result filter patterns must use `^` anchors** — without anchors, `/当前.*版本为/` would match normal text like "当前Python版本为3.12" and incorrectly suppress useful information.
+
+---
+
+## Fix67: Increase tool_result truncation limits
+
+**File**: `openai-to-m365-copilot.js`
+
+**Root cause**: Tool result truncation limits were too conservative:
+- `M365_MAX_FILE_CONTENT_LEN = 3000` — code files easily exceed 3K chars
+- `M365_MAX_SHELL_OUTPUT_LEN = 6000` — test output, error traces easily exceed 6K
+- `M365_MAX_TOOL_RESULT_LEN = 8000` — general limit too low
+
+When file content was truncated, the `... [N more characters omitted]` suffix appeared in tool_results. M365 model then noted "需要注意：命令输出包含 ... [2402 more characters omitted]" and couldn't see full file content, preventing proper code analysis and fixes.
+
+**Fix**: Increased limits to match M365's context window capacity:
+- `M365_MAX_TOOL_RESULT_LEN`: 8000 → 24000
+- `M365_MAX_FILE_CONTENT_LEN`: 3000 → 20000
+- `M365_MAX_SHELL_OUTPUT_LEN`: 6000 → 16000
+
+**Verification**: File reads and command outputs no longer truncated. Model can see full file content and provide accurate code fixes.

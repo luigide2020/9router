@@ -107,14 +107,34 @@ function getShellToolCommandArgName(toolMeta) {
   return "command";
 }
 
+const SANDBOX_PARAMS_TO_STRIP = new Set(["justification", "sandbox_permissions"]);
+
+function stripSandboxFields(args) {
+  if (!args || typeof args !== "object") return args;
+  const cleaned = {};
+  let stripped = false;
+  for (const [k, v] of Object.entries(args)) {
+    if (SANDBOX_PARAMS_TO_STRIP.has(k)) {
+      stripped = true;
+      continue;
+    }
+    cleaned[k] = v;
+  }
+  if (stripped) console.log(`[M365-RESP-STRIP] removed sandbox params from tool_call args`);
+  return cleaned;
+}
+
 function makeToolCall(name, argumentsObj) {
   const callId = `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+  const cleanArgs = typeof argumentsObj === "string"
+    ? (() => { try { return JSON.stringify(stripSandboxFields(JSON.parse(argumentsObj))); } catch { return argumentsObj; } })()
+    : JSON.stringify(stripSandboxFields(argumentsObj));
   return {
     id: callId,
     type: "function",
     function: {
       name: String(name),
-      arguments: typeof argumentsObj === "string" ? argumentsObj : JSON.stringify(argumentsObj),
+      arguments: cleanArgs,
     },
   };
 }
@@ -373,12 +393,27 @@ function stripToolPatternsFromText(text) {
   return cleaned;
 }
 
+const CI_RESULT_PATTERNS = [
+  /^命令已成功执行/,
+  /^命令执行失败.*退出码/,
+  /^无需进一步操作$/,
+];
+
+function isCiExecutionResult(text) {
+  if (!text) return false;
+  for (const p of CI_RESULT_PATTERNS) {
+    if (p.test(text)) return true;
+  }
+  return false;
+}
+
 function buildToolCallResults(toolCalls, textBuffer, chunk, hasToolMeta, choice, isRemote = false) {
   const results = [];
 
   if (toolCalls.length > 0) {
     const cleanContent = stripToolPatternsFromText(textBuffer);
-    if (cleanContent && !isRemote) {
+    const isCiResult = isCiExecutionResult(cleanContent);
+    if (cleanContent && !isRemote && !isCiResult) {
       results.push({
         id: chunk.id,
         object: "chat.completion.chunk",
@@ -387,6 +422,9 @@ function buildToolCallResults(toolCalls, textBuffer, chunk, hasToolMeta, choice,
         system_fingerprint: null,
         choices: [{ index: 0, delta: { content: cleanContent }, finish_reason: null, logprobs: null }],
       });
+    }
+    if (isCiResult) {
+      console.log(`[M365-RESP-CI-FILTER] suppressed CI execution result from tool_call response: "${cleanContent.slice(0, 100)}"`);
     }
 
     results.push({
