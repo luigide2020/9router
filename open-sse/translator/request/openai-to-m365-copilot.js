@@ -717,16 +717,8 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
     const primaryTool = shellToolNames[0] || "exec_command";
     const schema = toolMeta?.shellToolSchemas?.[primaryTool];
     let schemaHint;
-    if (schema && schema.properties) {
-      const props = schema.properties;
-      const required = schema.required || [];
-      const paramParts = [];
-      for (const [key, val] of Object.entries(props)) {
-        if (key === "justification" || key === "sandbox_permissions") continue;
-        const req = required.includes(key) ? " (required)" : " (optional)";
-        paramParts.push(`"${key}": <${val.type || "string"}>${req}`);
-      }
-      schemaHint = `{"name": "${primaryTool}", "arguments": { ${paramParts.join(", ")} }}`;
+    if (schema && schema.properties && schema.properties.cmd) {
+      schemaHint = `{"name": "${primaryTool}", "arguments": {"cmd": "<command>"}}`;
     } else {
       schemaHint = `{"name": "${primaryTool}", "arguments": {"cmd": "<command>"}}`;
     }

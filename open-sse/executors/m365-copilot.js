@@ -407,7 +407,7 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
                 console.log(`[M365-WS-SANDBOX-FAIL-T1] sandbox rejection filtered: text=${(msg.text||"").slice(0,200)}`);
                 continue;
               }
-              if (bufferForTools && msg.text && /^命令已成功执行|^命令执行失败.*退出码|无需进一步操作$/.test(msg.text)) {
+              if (bufferForTools && msg.text && /^命令已成功执行|^命令执行失败.*退出码|^无需进一步操作$/.test(msg.text)) {
                 console.log(`[M365-WS-CI-RESULT-T1] CI execution result filtered: text=${(msg.text||"").slice(0,200)}`);
                 continue;
               }
@@ -504,7 +504,7 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
                 console.log(`[M365-WS-SANDBOX-FAIL-T2] sandbox rejection filtered: text=${(msg.text||"").slice(0,200)}`);
                 continue;
               }
-              if (bufferForTools && msg.text && /^命令已成功执行|^命令执行失败.*退出码|无需进一步操作$/.test(msg.text)) {
+              if (bufferForTools && msg.text && /^命令已成功执行|^命令执行失败.*退出码|^无需进一步操作$/.test(msg.text)) {
                 console.log(`[M365-WS-CI-RESULT-T2] CI execution result filtered: text=${(msg.text||"").slice(0,200)}`);
                 continue;
               }
