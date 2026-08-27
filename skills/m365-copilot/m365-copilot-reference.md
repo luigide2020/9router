@@ -31,26 +31,57 @@ Evidence from WS logs: `offense="OffenseTrigger"` on `author=user` echo, `conten
 | `CMD:` prefix | `CMD: ls -la` | `CMD_PREFIX_RE` (legacy compat) |
 | Backtick command (context-first) | `` run `find .` `` / `` 让我看 `config.yaml` `` | `COMMAND_INTENT_RE` (checks intent verb before backtick, no whitelist gate) |
 | Remote exec result | `/mnt/file_upload` + `cwd: /mnt/` | `REMOTE_EXEC_INDICATORS` |
+| Sandbox execution failure | "当前执行环境访问不到" / "cat: /Users/..." | `SANDBOX_EXEC_FAILURE_INDICATORS` + `extractCommandFromSandboxFailure()` |
 | Natural language intent (NLU fallback) | "我来看一下附件" / "I'll read the file" | `ACTION_INTENT_PATTERNS` + `extractNaturalLanguageIntent()` |
-| Natural language intent (past-tense excluded) | "我看到有些向日葵低下了头" | `看(?!到|了|过)` negative lookahead — NOT matched |
+| Natural language intent (past-tense excluded) | "我看到有些向日葵低下了头" | `看(?!看|到|了|过|一|出)` negative lookahead — NOT matched (Fix50 + Fix62) |
 | Natural language intent (URL excluded) | "我打开 `https://agentrouter.org/register`" | URL detected → NLU skipped (Fix56) |
 
 **Fix48 changes**:
 - INLINE_BACKTICK: removed `COMMON_COMMANDS_RE` whitelist gate. Whether a backtick is a command is determined by `COMMAND_INTENT_RE` context (intent verb before backtick), not by whether the word is in a whitelist.
-- `COMMAND_INTENT_RE` expanded with Chinese intent verbs: `我[要需来想先会]看/读/查/执行/运行`, `让我看/读/查`, `请查/看`
+- `COMMAND_INTENT_RE` expanded with Chinese intent verbs (with optional `一下` suffixes and reduplication forms): `我[要需来想先会]|让[我咱]|请)(?:来|去)?(?:看(?:一下)?|读(?:一下)?|查(?:一下)?|检查(?:一下)?|执行(?:一下)?|运行(?:一下)?|列出(?:一下)?|浏览(?:一下)?|跑(?:一下)?|看看|读读|查查)`
 - NLU fallback: when `needsLocalExec=true` + all 8 patterns fail + `extracted toolCalls=0`, `ACTION_INTENT_PATTERNS` matches Chinese/English action intent and synthesizes a tool_call
-| Natural language intent | "我先看一下附件" / "I'll read the file" | `ACTION_INTENT_PATTERNS` (NLU fallback, Fix48) |
 
 ## Remote Exec Indicators
 
 ```javascript
 const REMOTE_EXEC_INDICATORS = [
-  "/mnt/file_upload", "/mnt/data", "/mnt/home", "/mnt/tmp",
-  "/mnt/usr", "/mnt/var", "/mnt/workspace", "/mnt/sandbox", "cwd: /mnt/",
+  /cwd:\s*\/mnt\//,
+  /\/mnt\/(file_upload|data|home|tmp|usr|var|workspace|sandbox)/,
+  /\/mnt\/[a-z_]+\s+is\s+(empty|not found)/,
+  /\n\s*count:\s*\d+\s*\n/,
+  /file_upload.*\n.*count:/,
 ];
 ```
 
 When detected: `hasRemoteExec=true` → response translator strips remote output, extracts tool_calls instead, skips `cleanContent`.
+
+## Sandbox Execution Failure Indicators (Fix55)
+
+```javascript
+const SANDBOX_EXEC_FAILURE_INDICATORS = [
+  /当前执行环境(?:里)?(?:没有|无法|访问不到|不可)/,
+  /(?:我按你要求|我尝试|我执行了?)(?:执行|运行|读取|查看)/,
+  /(?:访问不到|无法访问|不可访问|No such file or directory)/,
+  /cat:\s*\/(Users|home|tmp|var|root)\//,
+  /(?:结果仍然?是|返回是)[:：]/,
+  /(?:宿主路径|附件路径|文件路径).*(?:没有挂|不可达|不存在|not found)/,
+  /(?:当前|本)(?:执行环境|环境)(?:里)?(?:没有|无法|还是)/,
+];
+```
+
+When detected: `isSandboxFail=true` → `extractCommandFromSandboxFailure()` extracts command → converts to `exec_command` tool_call → Codex executes locally.
+
+## CI Result Filter Patterns (Fix66)
+
+```javascript
+const CI_RESULT_PATTERNS = [
+  /^命令已成功执行/,
+  /^命令执行失败.*退出码/,
+  /^无需进一步操作$/,
+];
+```
+
+All patterns use `^` anchor to prevent false positives on normal text. When detected in executor or response translator, CI result text is filtered (not emitted to client).
 
 ## Tool Classification & M365 Capability Control
 
@@ -60,18 +91,22 @@ When detected: `hasRemoteExec=true` → response translator strips remote output
 | Shell only (codex) | true | false | Default | Yes | enabled | true |
 | Shell + Search | true | true | Default | Yes (search forbidden) | disabled | true |
 | Search only | false | true | Default | No | enabled | false |
-| File ops only | true | false | Deep | Yes | enabled | true |
+| File ops only | true | false | Default | Yes | enabled | true |
 
 `disableCodeInterpreter = !!toolMeta?.needsLocalExec` (Fix52). Previously hardcoded `false` — caused M365 Code Interpreter to execute python for image files when `needsLocalExec=true`.
 
 ## Shell Tool Names
 
+Request translator (Set):
 ```javascript
-const SHELL_TOOL_NAMES = [
+const SHELL_TOOL_NAMES = new Set([
   "local_shell", "run_command", "execute_command", "exec_command",
-  "shell", "bash", "terminal", "command_line",
-];
+  "Bash", "bash", "execute_bash", "run_bash",
+  "shell_exec", "computer_terminal", "terminal",
+]);
 ```
+
+Response translator (inline check in `extractShellToolName()`): names containing `"shell"`, `"bash"`, `"exec"` or equal to `"local_shell"`, `"run_command"`, `"execute_command"`, `"Bash"`, `"execute_bash"`, `"terminal"`.
 
 ## Tool Result Formatting
 
@@ -81,6 +116,16 @@ const SHELL_TOOL_NAMES = [
 | File listing | `[File listing (Glob):\n...]` |
 | Search results | `[Search results (Grep):\n...]` |
 | Shell command | `[Output (exec_command):\n...]` |
+
+## Tool Result Truncation Limits (Fix67)
+
+| Constant | Value | Applies To |
+|----------|-------|------------|
+| `M365_MAX_TOOL_RESULT_LEN` | 24000 | General limit |
+| `M365_MAX_FILE_CONTENT_LEN` | 20000 | File read/view_file results |
+| `M365_MAX_SHELL_OUTPUT_LEN` | 16000 | exec_command/Bash output |
+
+`truncateToolResult()` truncates at line boundary, appends `... [N more characters omitted]`. Applied in: `extractLatestUserInput()` TOOL branch, `flattenMessages()` TOOL role, `buildToolResultPrompt()`.
 
 ## sanitizeForM365 — Segment-Based Replacement
 
@@ -99,6 +144,8 @@ const SHELL_TOOL_NAMES = [
 - "run `sub`" → `hasIntent=true` → tool_call with command="sub" ✅
 - "the `sub` module" → `hasIntent=false` → no tool_call (document reference) ✅
 - "我来看 `config.yaml`" → `hasIntent=true` (Chinese intent verb) → tool_call ✅
+
+`COMMON_COMMANDS_RE` still used in `REMOTE_EXEC_CHECK` and `SANDBOX_EXEC_FAILURE_CHECK`.
 
 ## Loop Guard (Response-Side)
 
@@ -136,14 +183,13 @@ const SHELL_TOOL_NAMES = [
 - Different conversation → different first USER message → different conversationId (context isolation)
 - sessionId aligned with conversationId (same hash included)
 - Prevents cross-topic context pollution in M365 server-side conversation history
-
-- `M365_MAX_TOOL_RESULT_LEN = 8000` characters
-- `truncateToolResult()` truncates at line boundary, appends `... [N more characters omitted]`
-- Applied in: `extractLatestUserInput()` TOOL branch, `flattenMessages()` TOOL role, `buildToolResultPrompt()`
+- **Both translator and executor independently compute conversationId** — translator uses direct SHA-256, executor uses `resolveSessionId()` wrapper. Both must produce the same result for continuation to work.
 
 ## Destructive Guardrail
 
 **REMOVED in Fix42**. The gpt-5.6-specific destructive guardrail (`DESTRUCTIVE_COMMAND_PATTERNS` + `isDestructiveCommand()`) was removed due to high false-positive rate blocking legitimate code modification commands. Request-side `sanitizeForM365()` provides equivalent protection by removing dangerous words from the prompt before M365 sees them.
+
+**Dead code**: `isGpt56` variable in request translator (`openai-to-m365-copilot.js:292`) is declared but never used — remnant from Fix42. Safe to clean up.
 
 ## Request Routing Decision Tree (Fix57 Update)
 
@@ -181,17 +227,30 @@ M365 may embed raw search result JSON in bot `text` field of type=2 messages. `i
 
 ## M365 Model Registry
 
-| Model ID | Behavior |
-|----------|----------|
-| `copilot` | Default M365 Copilot (GPT-4o class) |
-| `gpt-5.5` | Deep thinking, reasoning on by default |
-| `gpt-5.5-fast` | Quick response, no reasoning |
-| `gpt-5.6` | Deep thinking, reasoning on by default |
-| `gpt-5.6-luna` | Quick response, no reasoning |
-| `gpt-5.6-terra` | Deep thinking, mid-tier reasoning |
-| `gpt-5.6-sol` | Deep thinking, high-tier reasoning |
+| Model ID | Name | Notes |
+|----------|------|-------|
+| `copilot` | M365 Copilot (Auto) | Default, tone=Magic or Gpt_5_6_Reasoning |
+| `gpt-5.6` | GPT-5.6 深度思考 | defaultReasoning=true, tone=Gpt_5_6_Reasoning |
+| `gpt-5.6-fast` | GPT-5.6 快速响应 | tone=Gpt_5_6_Chat |
 
-Always use provider prefix: `m365-copilot/gpt-5.6-sol`, not just `gpt-5.6`.
+Always use provider prefix: `m365-copilot/gpt-5.6`, not just `gpt-5.6`.
+
+`gpt-5.5`/`gpt-5.5-fast` still work via `model.toLowerCase().includes()` in executor but not in registry.
+
+## Tone Routing (Fix58)
+
+```javascript
+isFastModel = model.includes("gpt-5.6-fast") || model.includes("gpt-5.5-fast")
+isDeepModel = (model.includes("gpt-5.6") || model.includes("gpt-5.5")) && !isFastModel
+
+m365Tone = isFastModel
+  ? "Gpt_5_6_Chat"
+  : isDeepModel
+    ? (reasoning !== false ? "Gpt_5_6_Reasoning" : "Gpt_5_6_Chat")
+    : (reasoning === true ? "Gpt_5_6_Reasoning" : "Magic")
+```
+
+`enable_gg_gpt` only added for `"Gpt_5_6_Reasoning"` tone.
 
 ## Proxy Configuration
 
@@ -208,7 +267,7 @@ M365 WS protocol sends each T2 bot message **twice** (identical text, possibly d
 
 ## isContinuation Detection (Fix49 + Fix54)
 
-```
+```javascript
 isContinuationByStructure = hasAssistantHistory && earlierUserCount > 0 && !hasToolResults
 isContinuationByCache = seenConversationFingerprints.has(convId)
 isContinuation = isContinuationByStructure || (isContinuationByCache && hasAssistantHistory)
@@ -230,7 +289,7 @@ When prompt contains `<image` tag (Codex sends inline images with local file pat
 
 - **Next.js standalone** runs compiled `.next/server/chunks/` — `docker cp` of source files does NOT take effect
 - Must either: `docker build`, or directly modify compiled chunks (risky but faster for hotfixes)
-- Compiled chunk for M365 code: `.next/server/chunks/216.js`
+- Compiled chunk for M365 code: check `.next/server/chunks/` for current chunk number (changes with each build)
 - Crypto imports must use explicit Node.js: `import { createHash, randomUUID } from "crypto"` (not Web Crypto)
 
 ## Pure-Text Stall Guard (Fix57)
@@ -254,3 +313,20 @@ Detects and breaks the feedback loop where M365 replies with pure text (no tool_
 - **LOOP_GUARD (Fix43)**: Complementary — Fix43 handles tool_call signature loops, Fix57 handles pure-text stalls
 - **hasToolResults**: Always takes priority — stall guard never overrides tool_result processing
 - **isContinuation**: Stall guard checks after `isContinuation` computation but before strategy selection
+
+## Allowed Message Types (30 entries)
+
+When `disableCodeInterpreter=true`, 5 CI types are removed (GeneratedCode, RenderCardRequest, GenerateGraphicArt, GenerateContentQuery, ConfirmationCard) → 25 remain.
+
+Full list: Chat, Suggestion, InternalSearchQuery, Disengaged, InternalLoaderMessage, Progress, GeneratedCode, RenderCardRequest, AdsQuery, SemanticSerp, GenerateContentQuery, GenerateGraphicArt, SearchQuery, ConfirmationCard, AuthError, DeveloperLogs, TriggerPlugin, HintInvocation, MemoryUpdate, EndOfRequest, TriggerConfirmation, ResumeInvokeAction, ResumeUserInputRequest, TriggerUserInputRequest, EscapeHatch, TriggerPluginAuth, ResumePluginAuth, SideBySide, ReferencesListComplete, SwitchRespondingEndpoint.
+
+## WS Message Filtering
+
+| Message Type | Action | Notes |
+|---|---|---|
+| ChainOfThoughtSummary | **Emitted** with `[Thinking]` prefix | User can see model's reasoning |
+| non-DeepLeo Progress | Filtered | Progress indicators |
+| ReferencesListComplete | Filtered | Signal only |
+| Suggestion | Filtered | Suggestion chips |
+| EscapeHatch | Filtered | "Hide" button marker |
+| InternalLoaderMessage | Filtered | "正在生成响应。" loading indicator |

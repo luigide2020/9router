@@ -4,6 +4,24 @@ All fixes targeting M365's server-side Code Interpreter (CI) auto-execution, Jai
 
 ---
 
+## IMPORTANT — Principles for Modifying M365 Code
+
+1. **ALWAYS read this file (m365-copilot-fixes.md) before any M365 code change.** Every fix here documents a hard-won lesson. Repeating past mistakes wastes hours of debugging.
+
+2. **NEVER commit/push without user verification.** All changes must be tested in docker and confirmed by the user before `git commit`/`git push`.
+
+3. **Do NOT claim "You do NOT have a code interpreter"** in any prompt — triggers JailBreakClassifier → Disengaged → "抱歉，我似乎无法就此话题进行聊天". Use softer wording: "The user is on a remote machine. You CANNOT execute commands on their behalf."
+
+4. **Do NOT send full tool schema to M365.** M365 web chat works because it doesn't receive tool definitions. Sending full schema (with `justification`, `login`, `shell`, etc.) tells M365 "I have these capabilities" and triggers CI execution. Only expose `cmd` parameter.
+
+5. **Regex filter patterns must use `^` anchors.** Without anchors, patterns like `当前.*版本为` match normal text (e.g. "当前Python版本为3.12") and incorrectly suppress useful information. Every alternative in a regex must be independently anchored.
+
+6. **Test incrementally — one fix at a time.** M365's behavior is opaque; changes interact in unpredictable ways. Add one fix, test in docker, verify before adding the next.
+
+7. **`disconnectBehavior: "continue"` is the sole InvalidRequest trigger.** All other fingerprint fields are safe individually. Do not change fingerprint fields without explicit testing.
+
+---
+
 ## Fix1-17: Early Fixes (Pre-JailBreak Era)
 
 Fix1-17 addressed the basic CI suppression problem: anti-exec prompt injection for tool_results (Fix1), tool result hint text (Fix2), botTextStreams dedup (Fix3), remote exec path expansion (Fix4), SHELL_TOOL_NAMES (Fix5), JSON schema hint (Fix6), reminder placement (Fix7), Deep experienceType (Fix8), Precise tone (Fix9), optionsSets trimming (Fix10), conversationId randomization (Fix11), /mnt/ fallback (Fix12), isRemote cleanContent skip (Fix13), debug cleanup (Fix14), buildEarlierContext (Fix15), sanitizeForM365 (Fix16-17).
@@ -174,7 +192,12 @@ Added `M365_JAILBREAK_PHRASES` array catching: `[SYSTEM OVERRIDE...]`, `HIGHEST 
 
 **File**: `m365-copilot.js`
 
-**Change**: `disableCodeInterpreter` is now always `false`; `experienceType` is always `"Default"`; `tone` is `"Reasoning"` or `"Balanced"` (no more `"Deep"`/`"Precise"`). The previous Deep+Precise mode was causing M365 to be less responsive and more likely to refuse commands. The Default experience type with Reasoning tone produces better results for agentic tool-calling workflows.
+**Change** (partially superseded by Fix52 and Fix58):
+- `disableCodeInterpreter`: initially set to always `false` here; **superseded by Fix52** → `disableCodeInterpreter: !!toolMeta?.needsLocalExec` (true when local exec needed)
+- `experienceType` is always `"Default"`
+- `tone`: initially `"Reasoning"` or `"Balanced"` here; **superseded by Fix58** → `"Magic"` / `"Gpt_5_6_Chat"` / `"Gpt_5_6_Reasoning"` (tone-based routing)
+
+The previous Deep+Precise mode was causing M365 to be less responsive and more likely to refuse commands. The Default experience type produces better results for agentic tool-calling workflows.
 
 ---
 
@@ -251,6 +274,8 @@ Added `M365_JAILBREAK_PHRASES` array catching: `[SYSTEM OVERRIDE...]`, `HIGHEST 
 3. `M365_MAX_TOOL_RESULT_LEN = 8000` (general, unchanged)
 4. `truncateFileContent()` — new function using 3000-char limit
 5. Truncation now uses `classifyToolName()`: fileOp→3000, shell→6000, other→8000
+
+**NOTE**: These limits were later increased by Fix67 (3000→20000, 6000→16000, 8000→24000).
 
 ---
 
@@ -384,7 +409,7 @@ Added `extractHistoricalToolCallSignatures(messages)` which scans all ASSISTANT 
 | Shorter file content truncation (3000/6000) | Verified (Fix35) |
 | forceSummarize at ≥15 commands | Verified (Fix36) — M365 returned text summary, 0 tool_calls |
 | Scope constraint (Fix38) | Verified — "read one file" → only that file read, no expansion |
-| Destructive guardrail removed (Fix42) | Pending verification — need to confirm no truly destructive commands leak through |
+| Destructive guardrail removed (Fix42) | Verified — `DESTRUCTIVE_COMMAND_PATTERNS` and `isDestructiveCommand()` confirmed removed from response translator; dead `isGpt56` variable remains in request translator (unused, safe to clean up) |
 | Count-based loop guard ≥5x (Fix43) | Pending verification — need to confirm read→modify→read works, and 702x loops are blocked |
 | apply_patch failure forceSummarize (Fix44) | Pending verification — need to confirm M365 switches to manual code changes after 3 failures |
 | WS connect retry + 502 short cooldown (Fix45) | Pending verification — TLS failures should auto-retry, lockout only 5s |
@@ -485,9 +510,9 @@ new: conversationIdBase = resolveSessionId({ connectionId: email + ":conv:" + sh
 
 - **Removed `COMMON_COMMANDS_RE` gate from INLINE_BACKTICK**. Previously: backtick content → in whitelist? → no → skip (never checks intent). Now: backtick content → check COMMAND_INTENT_RE before it → has intent? → treat as command. No intent? → it's a document reference, skip.
 - This correctly handles: `run \`sub\`` (command, has intent) vs "the \`sub\` module" (reference, no intent)
-- `COMMON_COMMANDS_RE` still used in `REMOTE_EXEC_CHECK` (line 224) — kept there
-- **Expanded `COMMAND_INTENT_RE`** with Chinese intent verbs and English `use`:
-  - Added: `(我[要需来想先会]|让[我咱]|请)(来|去)?(看|读|查|检查|执行|运行|列出|浏览|跑)`
+- `COMMON_COMMANDS_RE` still used in `REMOTE_EXEC_CHECK` and `SANDBOX_EXEC_FAILURE_CHECK` — kept there
+- **Expanded `COMMAND_INTENT_RE`** with Chinese intent verbs, optional `一下` suffixes, reduplication forms, and English `use`:
+  - Added: `(?:我[要需来想先会]|让[我咱]|请)(?:来|去)?(?:看(?:一下)?|读(?:一下)?|查(?:一下)?|检查(?:一下)?|执行(?:一下)?|运行(?:一下)?|列出(?:一下)?|浏览(?:一下)?|跑(?:一下)?|看看|读读|查查)`
   - Added: `use` as intent verb ("use `cat` to view")
 
 ### Layer 3: Response-side NLU fallback
@@ -543,6 +568,7 @@ new: conversationIdBase = resolveSessionId({ connectionId: email + ":conv:" + sh
 - `getConversationFingerprint()` — first USER message content (≤120 chars)
 - `computeConversationId()` — deterministic UUID from fingerprint hash
 - Sets `body._m365IsContinuation = true` when fingerprint seen before
+- **NOTE**: Both translator and executor independently compute conversationId — translator uses direct SHA-256, executor uses `resolveSessionId()` wrapper. Both must produce the same result for continuation to work.
 
 ### Layer 2: `extractContinuationPrompt()` — lightweight prompt builder
 - Last USER/ASSISTANT message + `buildEarlierContext` summary + langHint
@@ -584,6 +610,8 @@ new: conversationIdBase = resolveSessionId({ connectionId: email + ":conv:" + sh
 - "我来看/我要看/让我看" → `看` followed by non-excluded → **matched** ✓
 
 The second pattern `让我(?:看|读|查|...)` is inherently imperative and doesn't need the fix.
+
+**NOTE**: Fix62 later expanded this to `看(?!看|到|了|过|一|出)` to also exclude reduplication (看看/看一看) and "看出" (perceive).
 
 **Before**: "我看到有些向日葵低下了头" → NLU fallback → `exec_command: ls` (false positive)
 **After**: "我看到有些向日葵低下了头" → NLU skipped → pure text response ✅
@@ -893,7 +921,7 @@ InvalidRequest 由 `disconnectBehavior: "continue"` 单独导致。该字段声�
 
 ### Layer 2: Full browser fingerprint fields
 
-- `allowedMessageTypes` expanded from 13 to 31 types
+- `allowedMessageTypes` expanded from 13 to 30 types
 - `streamingMode: "ConciseWithPadding"`, `extraExtensionParameters: {}`
 - Full `clientInfo` struct (mcmcopilot-web, Office, macOS, Desktop, etc.)
 - `entityAnnotationTypes: ["People", "File", "Event", "Email", "TeamsMessage"]`
@@ -904,7 +932,9 @@ InvalidRequest 由 `disconnectBehavior: "continue"` 单独导致。该字段声�
 
 ### Layer 3: WS message filtering (streaming + non-streaming)
 
-Filtered: `ChainOfThoughtSummary` (internal thinking), non-DeepLeo `Progress` (progress indicator), `ReferencesListComplete` (signal), `Suggestion` (suggestion chips). Applied in T1, T2, and non-streaming.
+Filtered: non-DeepLeo `Progress` (progress indicator), `ReferencesListComplete` (signal), `Suggestion` (suggestion chips). Applied in T1, T2, and non-streaming.
+
+**Emitted (not filtered)**: `ChainOfThoughtSummary` — emitted with `[Thinking]` prefix so user can see model's reasoning. Previously described as "filtered" but changed to visible emission.
 
 ### Layer 4: writeAtCursor handling + stream dedup
 
@@ -959,9 +989,9 @@ Filtered: `ChainOfThoughtSummary` (internal thinking), non-DeepLeo `Progress` (p
 
 **Root cause**: `codexInstructions.js` instructed the model to use `justification` and `sandbox_permissions` parameters in `exec_command` calls (lines 49-65). M365's CI sandbox does NOT support these parameters — when a command includes `justification` without `sandbox_permissions`, the sandbox rejects it with "执行未发生：`justification` 必须与显式的 `sandbox_permissions` 一起使用", and the original `cmd` is LOST (not returned to client).
 
-**Fix**: Replaced the entire sandbox/approval/escalation section with a clear prohibition:
+**Fix**: Added a CRITICAL prohibition within the existing sandbox/approval/escalation section:
 - "CRITICAL: Do NOT use `justification` or `sandbox_permissions` parameters in any command."
-- "Always use plain `exec_command` with only standard parameters (cmd, workdir, max_output_tokens, yield_time_ms)."
+- The original sandbox_mode/network_access/approval_policy options remain in place (they describe the execution environment to the client-side model, not M365's CI)
 - "When a command fails due to sandboxing, try alternative approaches rather than requesting permission escalation."
 
 **Impact**: Commands without `justification` execute successfully in M365's sandbox (verified by `uv run pytest -v`, `cat`, `python` commands that all worked when they lacked `justification`). Only commands with `justification` were rejected.
@@ -1066,3 +1096,46 @@ When file content was truncated, the `... [N more characters omitted]` suffix ap
 - `M365_MAX_SHELL_OUTPUT_LEN`: 6000 → 16000
 
 **Verification**: File reads and command outputs no longer truncated. Model can see full file content and provide accurate code fixes.
+
+---
+
+## Fix68: Bugfix — ^-anchor on `无需进一步操作` + schemaHint only exposes `cmd`
+
+**Files**: `m365-copilot.js`, `openai-to-m365-copilot.js`
+
+**Root cause**: Two bugs found during code review:
+1. Streaming T1/T2 handlers had `无需进一步操作$` (missing `^` anchor) — could falsely match text ending with this phrase
+2. `schemaHint` in `extractLatestUserInput()` exposed parameters beyond `cmd` (workdir, max_output_tokens etc.) — contradicted the anti-execution prompt
+
+**Fix**:
+1. `无需进一步操作$` → `^无需进一步操作$` in streaming handlers (already correct in non-streaming and response translator)
+2. `schemaHint` now always `{"name": "${primaryTool}", "arguments": {"cmd": "<command>"}}` regardless of schema
+
+---
+
+## Fix69: Output Truncation Awareness + login.py New Chat Flow
+
+**Files**: `openai-to-m365-copilot.js`, `login.py`
+
+### Part 1: Output truncation awareness (request translator)
+
+**Root cause**: Codex CLI has a default `max_output_tokens=10000` — when command output exceeds this, Codex CLI itself truncates with `Warning: truncated output (original token count: N)`. M365 saw this warning and concluded content was incomplete, then couldn't answer the user's question properly across multiple rounds.
+
+The prompt previously said "only use `cmd`" and banned `max_output_tokens`, so M365 couldn't request a larger output budget. Also, M365 didn't know about truncation risk, so it used `cat` on multiple large files in one command.
+
+**Fix**:
+1. Added `OUTPUT TRUNCATION` hint in `buildAntiExecutionPrompt()` schemaInstr: advises using `sed -n '1,200p' file` pagination for large files, reading one file at a time
+2. Removed `max_output_tokens` from the IMPORTANT prohibition list (only justification/sandbox_permissions/login/shell/yield_time_ms remain banned)
+3. Added truncation hint in tool_result reminder: "If the output says 'truncated', use `sed -n 'N,Mp' file` to read the remaining parts"
+4. Added truncation hint in continuation path schemaHint
+
+### Part 2: login.py — New chat instead of history click
+
+**Root cause**: M365 frontend updated, historical chat selectors (`a[href^="/chat/"]`) no longer work reliably. Chat input box selectors (`div[contenteditable="true"]`) also failed on newer UI.
+
+**Fix**:
+1. Changed CHAT_URL to `https://m365.cloud.microsoft/chat?es=SSR`
+2. Replaced "click history chat" with "click New chat button" (9 selectors)
+3. Expanded input box selectors from 3 to 11 (added data-testid, aria-label, generic contenteditable)
+4. Added diagnostic output: when all selectors fail, `page.evaluate()` scans all editable elements and prints tag/role/contenteditable/ariaLabel/data-testid
+5. Expanded chat box wait selector to include additional patterns

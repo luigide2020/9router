@@ -24,7 +24,7 @@ except ImportError:
     print("❌ 运行: uv add playwright && uv run playwright install chromium")
     sys.exit(1)
 
-CHAT_URL = "https://m365.cloud.microsoft/chat"
+CHAT_URL = "https://m365.cloud.microsoft/chat?es=SSR"
 
 ALLOWED_COUNTRY_CODES = {"TW"}
 
@@ -356,39 +356,55 @@ def main():
         ws.on("framereceived", scan)
 
     def click_history_and_type(page):
-        history_selectors = [
-            'nav a[href^="/chat/"]:not([href="/chat/all"]):not([href="/chat/"])',
-            'a[href^="/chat/"]:not([href="/chat/all"]):not([href="/chat/"])',
-            '[role="listbox"] [role="option"]',
-            'nav button[aria-label*="聊天"]',
-            'nav button[aria-label*="Chat"]',
-        ]
-        for sel in history_selectors:
-            try:
-                items = page.locator(sel).all()
-                if len(items) == 0:
-                    continue
-                idx = min(1, len(items) - 1)
-                items[idx].click(timeout=5000, force=True)
-                print(f"[INFO] ✅ 点击了第 {idx+1} 个历史聊天 (selector={sel}, total={len(items)})")
-                page.wait_for_timeout(3000)
-                try:
-                    page.wait_for_selector('[role="textbox"], div[contenteditable="true"]', state="visible", timeout=10000)
-                except Exception:
-                    pass
-                page.wait_for_timeout(2000)
-                break
-            except Exception as e:
-                print(f"[INFO] selector={sel} 失败: {e}")
-                continue
-        else:
-            print("[INFO] 没找到历史聊天，尝试直接输入")
-
         import random, string
         word = ''.join(random.choices(string.ascii_lowercase, k=5))
-        for sel in ['div[contenteditable="true"]', 'textarea', '[role="textbox"]']:
+
+        new_chat_selectors = [
+            'button[aria-label*="New chat"]',
+            'button[aria-label*="new chat"]',
+            'button[aria-label*="新建聊天"]',
+            'button[aria-label*="新建"]',
+            'a[href="/chat?es=SSR"]',
+            'a[href="/chat"]',
+            '[data-testid*="new-chat"]',
+            '[data-testid*="newChat"]',
+            'button[data-testid*="new"]',
+        ]
+        clicked_new = False
+        for sel in new_chat_selectors:
+            try:
+                btn = page.locator(sel).first
+                if btn.count() == 0:
+                    continue
+                btn.click(timeout=5000, force=True)
+                print(f"[INFO] ✅ 点击了新建聊天 (selector={sel})")
+                clicked_new = True
+                page.wait_for_timeout(3000)
+                break
+            except Exception:
+                continue
+
+        if not clicked_new:
+            print("[INFO] 没找到新建聊天按钮，直接尝试输入")
+
+        input_selectors = [
+            'div[contenteditable="true"]',
+            '[role="textbox"]',
+            'textarea',
+            '[data-testid*="chat"]',
+            '[data-testid*="input"]',
+            '[data-testid*="compose"]',
+            'div[aria-label*="message"]',
+            'div[aria-label*="Message"]',
+            'div[aria-label*="聊天"]',
+            'div[contenteditable]',
+            '[contenteditable="true"]',
+        ]
+        for sel in input_selectors:
             try:
                 box = page.locator(sel).last
+                if box.count() == 0:
+                    continue
                 box.click(timeout=3000)
                 try:
                     box.press("Control+A")
@@ -401,7 +417,21 @@ def main():
                 return True
             except Exception:
                 continue
-        print("[WARN] 没定位到输入框")
+        print("[WARN] 没定位到输入框，尝试诊断...")
+        try:
+            editable = page.evaluate("""() => {
+                const all = document.querySelectorAll('[contenteditable], [role="textbox"], textarea');
+                return Array.from(all).slice(0, 10).map(e => ({
+                    tag: e.tagName, role: e.getAttribute('role'),
+                    ce: e.getAttribute('contenteditable'),
+                    testid: e.getAttribute('data-testid'),
+                    ariaLabel: e.getAttribute('aria-label'),
+                    className: e.className?.slice(0, 80),
+                }));
+            }""")
+            print(f"[DIAG] 可编辑元素: {json.dumps(editable, ensure_ascii=False)}")
+        except Exception as e:
+            print(f"[DIAG] 诊断失败: {e}")
         return False
 
     launch_kwargs = dict(
@@ -473,7 +503,7 @@ def main():
                 continue
             try:
                 page.wait_for_selector(
-                    'div[contenteditable="true"], textarea, [role="textbox"]',
+                    'div[contenteditable="true"], textarea, [role="textbox"], [data-testid*="chat"], [data-testid*="input"], [data-testid*="compose"], div[contenteditable], [contenteditable="true"]',
                     timeout=30000,
                 )
                 print("[INFO] ✅ 聊天框已出现")

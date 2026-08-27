@@ -301,11 +301,15 @@ function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas, hasSearchToo
       ``,
       `Example for listing files:`,
       `{"name": "${primaryTool}", "arguments": {"cmd": "ls"}}`,
+      ``,
+      `OUTPUT TRUNCATION: Command output may be truncated if too large (~10K tokens). When reading large files, use pagination: "sed -n '1,200p' file" then "sed -n '201,400p' file", etc. Do NOT cat multiple large files in one command — read them one at a time.`,
     ].join("\n");
   } else {
     schemaInstr = [
       `When you need to execute a command, output JSON like:`,
       `{"name": "${primaryTool}", "arguments": {"cmd": "<the_command>"}}`,
+      ``,
+      `OUTPUT TRUNCATION: Command output may be truncated if too large. When reading large files, use pagination: "sed -n '1,200p' file" then "sed -n '201,400p' file".`,
     ].join("\n");
   }
 
@@ -321,7 +325,7 @@ function buildAntiExecutionPrompt(shellToolNames, shellToolSchemas, hasSearchToo
       remoteExecProhibition,
       scopeConstraint,
       langHint,
-      "IMPORTANT: You MUST output a JSON instruction for ANY action — including reading files, listing directories, checking status, or running commands. The ONLY time you should use plain text is when you are providing a final summary with NO further actions needed. Do NOT include `justification`, `sandbox_permissions`, `login`, `shell`, `yield_time_ms`, or `max_output_tokens` in your JSON — only use `cmd`.",
+      "IMPORTANT: You MUST output a JSON instruction for ANY action — including reading files, listing directories, checking status, or running commands. The ONLY time you should use plain text is when you are providing a final summary with NO further actions needed. Do NOT include `justification`, `sandbox_permissions`, `login`, `shell`, or `yield_time_ms` in your JSON — only use `cmd`.",
     ].filter(Boolean).join(" ");
   }
 
@@ -718,9 +722,9 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
     const schema = toolMeta?.shellToolSchemas?.[primaryTool];
     let schemaHint;
     if (schema && schema.properties && schema.properties.cmd) {
-      schemaHint = `{"name": "${primaryTool}", "arguments": {"cmd": "<command>"}}`;
+      schemaHint = `{"name": "${primaryTool}", "arguments": {"cmd": "<command>"}}. OUTPUT TRUNCATION: If output says "truncated", read remaining parts with "sed -n 'N,Mp' file". Do NOT cat multiple large files in one command.`;
     } else {
-      schemaHint = `{"name": "${primaryTool}", "arguments": {"cmd": "<command>"}}`;
+      schemaHint = `{"name": "${primaryTool}", "arguments": {"cmd": "<command>"}}. OUTPUT TRUNCATION: If output says "truncated", read remaining parts with "sed -n 'N,Mp' file".`;
     }
 
     const combinedResults = resultParts.join("\n");
@@ -750,7 +754,7 @@ function extractLatestUserInput(messages, toolCallMetaMap, toolMeta) {
           userIntentTag,
           `[User]: Here is the result of the previous step:`,
           combinedResults,
-          `Analyze the output above in light of the user's question. If the user asked to see file content, include the relevant content in your response. Do ONLY what the user explicitly asks — do NOT expand scope or read additional files unless asked. If another step is needed, output a JSON instruction using this schema:`,
+          `Analyze the output above in light of the user's question. If the output says "truncated", the full content was not returned — use "sed -n 'N,Mp' file" to read the remaining parts. If the user asked to see file content, include the relevant content in your response. Do ONLY what the user explicitly asks — do NOT expand scope or read additional files unless asked. If another step is needed, output a JSON instruction using this schema:`,
           schemaHint,
           ctx.filesReadCount >= 5
             ? `IMPORTANT: You have already read ${ctx.filesReadCount} files. Do NOT re-read any file already listed above. Use a different approach or summarize what you know.`
