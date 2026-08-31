@@ -327,8 +327,12 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
           const hasCiResult = /^命令已成功执行|^命令执行失败.*退出码|^无需进一步操作$/.test(fullText);
           const hasSandboxFail = /(?:当前执行环境|访问不到|无法访问|No such file or directory|\.codex\/attachments|执行未发生|`justification`.*`sandbox_permissions`)/.test(fullText);
           console.log(`[M365-CLOSE] Buffering tools: textLen=${fullText.length}, needsLocalExec=${!!toolMeta?.needsLocalExec}, hasJsonTool=${fullText.includes('```json-tool')}, hasCmd=${hasCmd}, hasRemoteExec=${hasRemoteExec}, hasSandboxFail=${hasSandboxFail}, hasCiResult=${hasCiResult}`);
-          console.log(`[M365-CLOSE-FULL] ${fullText.slice(0, 1000)}`);
-          emitContent(fullText);
+          if (hasCiResult) {
+            console.log(`[M365-CLOSE-CI-RESULT] suppressed CI result text in close handler: ${fullText.slice(0, 200)}`);
+          } else {
+            console.log(`[M365-CLOSE-FULL] ${fullText.slice(0, 1000)}`);
+            emitContent(fullText);
+          }
         }
         closed = true;
         try {
@@ -405,10 +409,20 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
               }
               if (msg.text && /执行未发生|`justification`.*`sandbox_permissions`/.test(msg.text)) {
                 console.log(`[M365-WS-SANDBOX-FAIL-T1] sandbox rejection filtered: text=${(msg.text||"").slice(0,200)}`);
+                const sfMsgId = msg.messageId || msg.responseIdentifier || "default";
+                if (botTextStreams && botTextStreams.has(sfMsgId)) {
+                  console.log(`[M365-WS-SANDBOX-FAIL-T1] cleared botTextStreams for msgId=${sfMsgId} (was len=${botTextStreams.get(sfMsgId).length})`);
+                  botTextStreams.delete(sfMsgId);
+                }
                 continue;
               }
               if (bufferForTools && msg.text && /^命令已成功执行|^命令执行失败.*退出码|^无需进一步操作$/.test(msg.text)) {
                 console.log(`[M365-WS-CI-RESULT-T1] CI execution result filtered: text=${(msg.text||"").slice(0,200)}`);
+                const ciMsgId = msg.messageId || msg.responseIdentifier || "default";
+                if (botTextStreams && botTextStreams.has(ciMsgId)) {
+                  console.log(`[M365-WS-CI-RESULT-T1] cleared botTextStreams for msgId=${ciMsgId} (was len=${botTextStreams.get(ciMsgId).length})`);
+                  botTextStreams.delete(ciMsgId);
+                }
                 continue;
               }
 
@@ -502,10 +516,20 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
               }
               if (msg.text && /执行未发生|`justification`.*`sandbox_permissions`/.test(msg.text)) {
                 console.log(`[M365-WS-SANDBOX-FAIL-T2] sandbox rejection filtered: text=${(msg.text||"").slice(0,200)}`);
+                const sfMsgId = msg.messageId || msg.responseIdentifier || "default";
+                if (botTextStreams && botTextStreams.has(sfMsgId)) {
+                  console.log(`[M365-WS-SANDBOX-FAIL-T2] cleared botTextStreams for msgId=${sfMsgId} (was len=${botTextStreams.get(sfMsgId).length})`);
+                  botTextStreams.delete(sfMsgId);
+                }
                 continue;
               }
               if (bufferForTools && msg.text && /^命令已成功执行|^命令执行失败.*退出码|^无需进一步操作$/.test(msg.text)) {
                 console.log(`[M365-WS-CI-RESULT-T2] CI execution result filtered: text=${(msg.text||"").slice(0,200)}`);
+                const ciMsgId = msg.messageId || msg.responseIdentifier || "default";
+                if (botTextStreams && botTextStreams.has(ciMsgId)) {
+                  console.log(`[M365-WS-CI-RESULT-T2] cleared botTextStreams for msgId=${ciMsgId} (was len=${botTextStreams.get(ciMsgId).length})`);
+                  botTextStreams.delete(ciMsgId);
+                }
                 continue;
               }
 

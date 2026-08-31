@@ -20,6 +20,8 @@ All fixes targeting M365's server-side Code Interpreter (CI) auto-execution, Jai
 
 7. **`disconnectBehavior: "continue"` is the sole InvalidRequest trigger.** All other fingerprint fields are safe individually. Do not change fingerprint fields without explicit testing.
 
+8. **When filtering a message via `continue`, also clear `botTextStreams` for that msgId.** M365 streams text progressively (T1 frames build botTextStreams incrementally). If a filter `continue`s past a message but doesn't remove the msgId from botTextStreams, earlier partial text (e.g., "命" from "命令已成功执行") becomes the final output.
+
 ---
 
 ## Fix1-17: Early Fixes (Pre-JailBreak Era)
@@ -1139,3 +1141,24 @@ The prompt previously said "only use `cmd`" and banned `max_output_tokens`, so M
 3. Expanded input box selectors from 3 to 11 (added data-testid, aria-label, generic contenteditable)
 4. Added diagnostic output: when all selectors fail, `page.evaluate()` scans all editable elements and prints tag/role/contenteditable/ariaLabel/data-testid
 5. Expanded chat box wait selector to include additional patterns
+
+---
+
+## Fix70: CI Result Residual Text in botTextStreams
+
+**Files**: `m365-copilot.js`
+
+**Root cause**: When M365 CI executes a command (e.g., `command -v spark-shell`), the response flows through two channels in the same WS conversation:
+1. T1/T2 streaming messages build `botTextStreams[msgId]` progressively — first "命" (start of "命令已成功执行"), then the full CI result text
+2. CI result filter (`^命令已成功执行|...`) correctly detects and `continue`s past the full text
+
+But the `continue` only skips adding the message to `botTextStreams` — it does NOT remove the partial text already stored from earlier T1 frames. At close, `rebuildFullText()` concatenates all `botTextStreams` values, so the residual "命" becomes the entire response.
+
+**Symptom**: Model's ChainOfThoughtSummary shows full command intent, but client receives a single Chinese character (e.g., "命") instead of the expected tool call or response.
+
+**Fix**: When CI result or sandbox fail is detected in streaming T1/T2 handlers, also `delete` the msgId from `botTextStreams`:
+- `[M365-WS-CI-RESULT-T1/T2]`: `botTextStreams.delete(ciMsgId)` after filtering
+- `[M365-WS-SANDBOX-FAIL-T1/T2]`: `botTextStreams.delete(sfMsgId)` after filtering
+- Close handler: if `fullText` matches CI result (`hasCiResult=true`), suppress `emitContent()` entirely instead of emitting the residual text
+
+**Verification**: When CI executes a command, the client now receives either a proper tool call (extracted before CI result) or nothing, instead of orphaned partial characters.
