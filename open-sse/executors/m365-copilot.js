@@ -5,6 +5,17 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { createHash, randomUUID } from "crypto";
 
+function stripCiResultPrefix(text) {
+  if (!text) return text;
+  let s = text;
+  s = s.replace(/^命令已成功执行[，,]无需进一步操作[。.]\s*/, '');
+  s = s.replace(/^命令已成功执行[。.]\s*结果.{0,5}[：:]\s*/, '');
+  s = s.replace(/^命令执行失败[，,]退出码[为：:]\s*\d+[。.]\s*/, '');
+  s = s.replace(/输出未被截断[，,]无需进一步操作[。.]\s*$/, '');
+  s = s.replace(/无需进一步操作$/, '');
+  return s.trim();
+}
+
 const M365_WS_BASE = "wss://substrate.office.com/m365Copilot/Chathub";
 const M365_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.3.1 Safari/605.1.15";
 const WS_CONNECT_TIMEOUT_MS = 15_000;
@@ -328,7 +339,7 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
           const hasSandboxFail = /(?:当前执行环境|访问不到|无法访问|No such file or directory|\.codex\/attachments|执行未发生|`justification`.*`sandbox_permissions`)/.test(fullText);
           console.log(`[M365-CLOSE] Buffering tools: textLen=${fullText.length}, needsLocalExec=${!!toolMeta?.needsLocalExec}, hasJsonTool=${fullText.includes('```json-tool')}, hasCmd=${hasCmd}, hasRemoteExec=${hasRemoteExec}, hasSandboxFail=${hasSandboxFail}, hasCiResult=${hasCiResult}`);
           if (hasCiResult) {
-            const strippedClose = fullText.replace(/^命令已成功执行[，,]无需进一步操作[。.]\s*/, '').replace(/^命令执行失败[，,]退出码[为：:]\s*\d+[。.]\s*/, '').replace(/^无需进一步操作$/, '');
+            const strippedClose = stripCiResultPrefix(fullText);
             if (strippedClose && strippedClose !== fullText) {
               console.log(`[M365-CLOSE-CI-STRIP] CI prefix stripped, emitting salvageable content: orig_len=${fullText.length} stripped_len=${strippedClose.length}`);
               emitContent(strippedClose);
@@ -424,7 +435,7 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
               }
               if (bufferForTools && msg.text && /^命令已成功执行|^命令执行失败.*退出码|^无需进一步操作$/.test(msg.text)) {
                 const ciMsgId = msg.messageId || msg.responseIdentifier || "default";
-                const stripped = msg.text.replace(/^命令已成功执行[，,]无需进一步操作[。.]\s*/, '').replace(/^命令执行失败[，,]退出码[为：:]\s*\d+[。.]\s*/, '').replace(/^无需进一步操作$/, '');
+                const stripped = stripCiResultPrefix(msg.text);
                 if (stripped && stripped !== msg.text) {
                   console.log(`[M365-WS-CI-RESULT-T1] CI prefix stripped: orig_len=${msg.text.length} stripped_len=${stripped.length} prefix=${(msg.text||"").slice(0,100)}`);
                   if (botTextStreams && botTextStreams.has(ciMsgId)) {
@@ -541,7 +552,7 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
               }
               if (bufferForTools && msg.text && /^命令已成功执行|^命令执行失败.*退出码|^无需进一步操作$/.test(msg.text)) {
                 const ciMsgId = msg.messageId || msg.responseIdentifier || "default";
-                const stripped = msg.text.replace(/^命令已成功执行[，,]无需进一步操作[。.]\s*/, '').replace(/^命令执行失败[，,]退出码[为：:]\s*\d+[。.]\s*/, '').replace(/^无需进一步操作$/, '');
+                const stripped = stripCiResultPrefix(msg.text);
                 if (stripped && stripped !== msg.text) {
                   console.log(`[M365-WS-CI-RESULT-T2] CI prefix stripped: orig_len=${msg.text.length} stripped_len=${stripped.length} prefix=${(msg.text||"").slice(0,100)}`);
                   if (botTextStreams && botTextStreams.has(ciMsgId)) {
@@ -699,7 +710,7 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, mes
             if (msgType === "EscapeHatch" || msgType === "InternalLoaderMessage") continue;
             if (msg.text && /执行未发生|`justification`.*`sandbox_permissions`/.test(msg.text)) continue;
             if (msg.text && /^命令已成功执行|^命令执行失败.*退出码|^无需进一步操作$/.test(msg.text)) {
-              const stripped = msg.text.replace(/^命令已成功执行[，,]无需进一步操作[。.]\s*/, '').replace(/^命令执行失败[，,]退出码[为：:]\s*\d+[。.]\s*/, '').replace(/^无需进一步操作$/, '');
+              const stripped = stripCiResultPrefix(msg.text);
               if (stripped && stripped !== msg.text && msg.author === "bot" && stripped.length > fullText.length) {
                 fullText = stripped;
               }
@@ -736,7 +747,7 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, mes
             if (msgType === "EscapeHatch" || msgType === "InternalLoaderMessage") continue;
             if (msg.text && /执行未发生|`justification`.*`sandbox_permissions`/.test(msg.text)) continue;
             if (msg.text && /^命令已成功执行|^命令执行失败.*退出码|^无需进一步操作$/.test(msg.text)) {
-              const stripped = msg.text.replace(/^命令已成功执行[，,]无需进一步操作[。.]\s*/, '').replace(/^命令执行失败[，,]退出码[为：:]\s*\d+[。.]\s*/, '').replace(/^无需进一步操作$/, '');
+              const stripped = stripCiResultPrefix(msg.text);
               if (stripped && stripped !== msg.text && msg.author === "bot" && stripped.length > fullText.length) {
                 fullText = stripped;
               }

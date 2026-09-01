@@ -401,7 +401,13 @@ const CI_RESULT_PATTERNS = [
 
 function stripCiResultPrefix(text) {
   if (!text) return text;
-  return text.replace(/^命令已成功执行[，,]无需进一步操作[。.]\s*/, '').replace(/^命令执行失败[，,]退出码[为：:]\s*\d+[。.]\s*/, '').replace(/^无需进一步操作$/, '');
+  let s = text;
+  s = s.replace(/^命令已成功执行[，,]无需进一步操作[。.]\s*/, '');
+  s = s.replace(/^命令已成功执行[。.]\s*结果.{0,5}[：:]\s*/, '');
+  s = s.replace(/^命令执行失败[，,]退出码[为：:]\s*\d+[。.]\s*/, '');
+  s = s.replace(/输出未被截断[，,]无需进一步操作[。.]\s*$/, '');
+  s = s.replace(/无需进一步操作$/, '');
+  return s.trim();
 }
 
 function isCiExecutionResult(text) {
