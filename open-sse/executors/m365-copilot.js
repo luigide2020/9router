@@ -328,7 +328,13 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
           const hasSandboxFail = /(?:当前执行环境|访问不到|无法访问|No such file or directory|\.codex\/attachments|执行未发生|`justification`.*`sandbox_permissions`)/.test(fullText);
           console.log(`[M365-CLOSE] Buffering tools: textLen=${fullText.length}, needsLocalExec=${!!toolMeta?.needsLocalExec}, hasJsonTool=${fullText.includes('```json-tool')}, hasCmd=${hasCmd}, hasRemoteExec=${hasRemoteExec}, hasSandboxFail=${hasSandboxFail}, hasCiResult=${hasCiResult}`);
           if (hasCiResult) {
-            console.log(`[M365-CLOSE-CI-RESULT] suppressed CI result text in close handler: ${fullText.slice(0, 200)}`);
+            const strippedClose = fullText.replace(/^命令已成功执行[，,]无需进一步操作[。.]\s*/, '').replace(/^命令执行失败[，,]退出码[为：:]\s*\d+[。.]\s*/, '').replace(/^无需进一步操作$/, '');
+            if (strippedClose && strippedClose !== fullText) {
+              console.log(`[M365-CLOSE-CI-STRIP] CI prefix stripped, emitting salvageable content: orig_len=${fullText.length} stripped_len=${strippedClose.length}`);
+              emitContent(strippedClose);
+            } else {
+              console.log(`[M365-CLOSE-CI-RESULT] suppressed CI result text (no salvageable content): ${fullText.slice(0, 200)}`);
+            }
           } else {
             console.log(`[M365-CLOSE-FULL] ${fullText.slice(0, 1000)}`);
             emitContent(fullText);
@@ -417,13 +423,23 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
                 continue;
               }
               if (bufferForTools && msg.text && /^命令已成功执行|^命令执行失败.*退出码|^无需进一步操作$/.test(msg.text)) {
-                console.log(`[M365-WS-CI-RESULT-T1] CI execution result filtered: text=${(msg.text||"").slice(0,200)}`);
                 const ciMsgId = msg.messageId || msg.responseIdentifier || "default";
-                if (botTextStreams && botTextStreams.has(ciMsgId)) {
-                  console.log(`[M365-WS-CI-RESULT-T1] cleared botTextStreams for msgId=${ciMsgId} (was len=${botTextStreams.get(ciMsgId).length})`);
-                  botTextStreams.delete(ciMsgId);
+                const stripped = msg.text.replace(/^命令已成功执行[，,]无需进一步操作[。.]\s*/, '').replace(/^命令执行失败[，,]退出码[为：:]\s*\d+[。.]\s*/, '').replace(/^无需进一步操作$/, '');
+                if (stripped && stripped !== msg.text) {
+                  console.log(`[M365-WS-CI-RESULT-T1] CI prefix stripped: orig_len=${msg.text.length} stripped_len=${stripped.length} prefix=${(msg.text||"").slice(0,100)}`);
+                  if (botTextStreams && botTextStreams.has(ciMsgId)) {
+                    botTextStreams.delete(ciMsgId);
+                  }
+                  const modMsg = { ...msg, text: stripped };
+                  payload.messages[payload.messages.indexOf(msg)] = modMsg;
+                } else {
+                  console.log(`[M365-WS-CI-RESULT-T1] CI execution result filtered (no salvageable content): text=${(msg.text||"").slice(0,200)}`);
+                  if (botTextStreams && botTextStreams.has(ciMsgId)) {
+                    console.log(`[M365-WS-CI-RESULT-T1] cleared botTextStreams for msgId=${ciMsgId} (was len=${botTextStreams.get(ciMsgId).length})`);
+                    botTextStreams.delete(ciMsgId);
+                  }
+                  continue;
                 }
-                continue;
               }
 
               if (msg.hiddenText && /Conversation disengaged|Sorry.*(?:chat|help|assist)|I can't (?:help|chat|assist)/i.test(msg.hiddenText)) {
@@ -524,13 +540,23 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
                 continue;
               }
               if (bufferForTools && msg.text && /^命令已成功执行|^命令执行失败.*退出码|^无需进一步操作$/.test(msg.text)) {
-                console.log(`[M365-WS-CI-RESULT-T2] CI execution result filtered: text=${(msg.text||"").slice(0,200)}`);
                 const ciMsgId = msg.messageId || msg.responseIdentifier || "default";
-                if (botTextStreams && botTextStreams.has(ciMsgId)) {
-                  console.log(`[M365-WS-CI-RESULT-T2] cleared botTextStreams for msgId=${ciMsgId} (was len=${botTextStreams.get(ciMsgId).length})`);
-                  botTextStreams.delete(ciMsgId);
+                const stripped = msg.text.replace(/^命令已成功执行[，,]无需进一步操作[。.]\s*/, '').replace(/^命令执行失败[，,]退出码[为：:]\s*\d+[。.]\s*/, '').replace(/^无需进一步操作$/, '');
+                if (stripped && stripped !== msg.text) {
+                  console.log(`[M365-WS-CI-RESULT-T2] CI prefix stripped: orig_len=${msg.text.length} stripped_len=${stripped.length} prefix=${(msg.text||"").slice(0,100)}`);
+                  if (botTextStreams && botTextStreams.has(ciMsgId)) {
+                    botTextStreams.delete(ciMsgId);
+                  }
+                  const modMsg = { ...msg, text: stripped };
+                  payload.messages[mi] = modMsg;
+                } else {
+                  console.log(`[M365-WS-CI-RESULT-T2] CI execution result filtered (no salvageable content): text=${(msg.text||"").slice(0,200)}`);
+                  if (botTextStreams && botTextStreams.has(ciMsgId)) {
+                    console.log(`[M365-WS-CI-RESULT-T2] cleared botTextStreams for msgId=${ciMsgId} (was len=${botTextStreams.get(ciMsgId).length})`);
+                    botTextStreams.delete(ciMsgId);
+                  }
+                  continue;
                 }
-                continue;
               }
 
               if (msg?.hiddenText && /Conversation disengaged|Sorry.*(?:chat|help|assist)|I can't (?:help|chat|assist)/i.test(msg.hiddenText)) {
@@ -672,7 +698,13 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, mes
             if (msgType === "ReferencesListComplete" || msgType === "Suggestion") continue;
             if (msgType === "EscapeHatch" || msgType === "InternalLoaderMessage") continue;
             if (msg.text && /执行未发生|`justification`.*`sandbox_permissions`/.test(msg.text)) continue;
-            if (msg.text && /^命令已成功执行|^命令执行失败.*退出码|^无需进一步操作$/.test(msg.text)) continue;
+            if (msg.text && /^命令已成功执行|^命令执行失败.*退出码|^无需进一步操作$/.test(msg.text)) {
+              const stripped = msg.text.replace(/^命令已成功执行[，,]无需进一步操作[。.]\s*/, '').replace(/^命令执行失败[，,]退出码[为：:]\s*\d+[。.]\s*/, '').replace(/^无需进一步操作$/, '');
+              if (stripped && stripped !== msg.text && msg.author === "bot" && stripped.length > fullText.length) {
+                fullText = stripped;
+              }
+              continue;
+            }
             if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
               fullText = msg.text;
             }
@@ -703,7 +735,13 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, mes
             if (msgType === "ReferencesListComplete" || msgType === "Suggestion") continue;
             if (msgType === "EscapeHatch" || msgType === "InternalLoaderMessage") continue;
             if (msg.text && /执行未发生|`justification`.*`sandbox_permissions`/.test(msg.text)) continue;
-            if (msg.text && /^命令已成功执行|^命令执行失败.*退出码|^无需进一步操作$/.test(msg.text)) continue;
+            if (msg.text && /^命令已成功执行|^命令执行失败.*退出码|^无需进一步操作$/.test(msg.text)) {
+              const stripped = msg.text.replace(/^命令已成功执行[，,]无需进一步操作[。.]\s*/, '').replace(/^命令执行失败[，,]退出码[为：:]\s*\d+[。.]\s*/, '').replace(/^无需进一步操作$/, '');
+              if (stripped && stripped !== msg.text && msg.author === "bot" && stripped.length > fullText.length) {
+                fullText = stripped;
+              }
+              continue;
+            }
             if (msg.text && msg.author === "bot" && msg.text.length > fullText.length) {
               fullText = msg.text;
             }

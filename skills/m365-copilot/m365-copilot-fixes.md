@@ -22,6 +22,8 @@ All fixes targeting M365's server-side Code Interpreter (CI) auto-execution, Jai
 
 8. **When filtering a message via `continue`, also clear `botTextStreams` for that msgId.** M365 streams text progressively (T1 frames build botTextStreams incrementally). If a filter `continue`s past a message but doesn't remove the msgId from botTextStreams, earlier partial text (e.g., "命" from "命令已成功执行") becomes the final output.
 
+9. **Strip CI result prefix, don't discard entire message.** M365 often combines CI result prefix ("命令已成功执行，无需进一步操作。") with actual response content in one message. Use `stripCiResultPrefix()` to remove only the prefix and preserve the rest, rather than filtering the entire message.
+
 ---
 
 ## Fix1-17: Early Fixes (Pre-JailBreak Era)
@@ -1144,9 +1146,11 @@ The prompt previously said "only use `cmd`" and banned `max_output_tokens`, so M
 
 ---
 
-## Fix70: CI Result Residual Text in botTextStreams
+## Fix70: CI Result Residual Text + CI Prefix Stripping
 
-**Files**: `m365-copilot.js`
+**Files**: `m365-copilot.js`, `m365-copilot-to-openai.js`
+
+### Part 1: botTextStreams residual text (original Fix70)
 
 **Root cause**: When M365 CI executes a command (e.g., `command -v spark-shell`), the response flows through two channels in the same WS conversation:
 1. T1/T2 streaming messages build `botTextStreams[msgId]` progressively — first "命" (start of "命令已成功执行"), then the full CI result text
@@ -1159,6 +1163,26 @@ But the `continue` only skips adding the message to `botTextStreams` — it does
 **Fix**: When CI result or sandbox fail is detected in streaming T1/T2 handlers, also `delete` the msgId from `botTextStreams`:
 - `[M365-WS-CI-RESULT-T1/T2]`: `botTextStreams.delete(ciMsgId)` after filtering
 - `[M365-WS-SANDBOX-FAIL-T1/T2]`: `botTextStreams.delete(sfMsgId)` after filtering
-- Close handler: if `fullText` matches CI result (`hasCiResult=true`), suppress `emitContent()` entirely instead of emitting the residual text
 
-**Verification**: When CI executes a command, the client now receives either a proper tool call (extracted before CI result) or nothing, instead of orphaned partial characters.
+### Part 2: CI result prefix stripping (Fix70b)
+
+**Root cause**: M365 CI execution produces responses like:
+```
+命令已成功执行，无需进一步操作。
+
+系统信息摘要：
+- **设备名称**：foo
+- **操作系统**：...
+```
+
+The old filter matched `^命令已成功执行` and `continue`d past the **entire message**, discarding the valuable content after the CI result prefix. When the CI result was the only bot message, the client received nothing.
+
+**Symptom**: User asks "centos如何安装wget", M365 CI executes `uname -a`, CI result prefix + actual response are in one message → entire response filtered → empty reply.
+
+**Fix**: Instead of filtering entire messages, strip only the CI result prefix and preserve the rest:
+- `stripCiResultPrefix()`: removes `命令已成功执行，无需进一步操作。` / `命令执行失败，退出码为 N。` / `无需进一步操作` prefixes
+- If stripped text is non-empty and differs from original → emit the stripped text
+- If stripped text is empty (pure CI result, no salvageable content) → fully filter as before
+- Applied to: streaming T1/T2 handlers, close handler, non-streaming T1/T2 handlers, response translator `buildToolCallResults()`
+
+**Verification**: When CI executes a command, the client now receives the salvageable content (e.g., system info summary) after the CI result prefix is stripped, instead of an empty response or orphaned partial characters.

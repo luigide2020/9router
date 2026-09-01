@@ -399,6 +399,11 @@ const CI_RESULT_PATTERNS = [
   /^无需进一步操作$/,
 ];
 
+function stripCiResultPrefix(text) {
+  if (!text) return text;
+  return text.replace(/^命令已成功执行[，,]无需进一步操作[。.]\s*/, '').replace(/^命令执行失败[，,]退出码[为：:]\s*\d+[。.]\s*/, '').replace(/^无需进一步操作$/, '');
+}
+
 function isCiExecutionResult(text) {
   if (!text) return false;
   for (const p of CI_RESULT_PATTERNS) {
@@ -413,18 +418,19 @@ function buildToolCallResults(toolCalls, textBuffer, chunk, hasToolMeta, choice,
   if (toolCalls.length > 0) {
     const cleanContent = stripToolPatternsFromText(textBuffer);
     const isCiResult = isCiExecutionResult(cleanContent);
-    if (cleanContent && !isRemote && !isCiResult) {
+    const effectiveContent = isCiResult ? stripCiResultPrefix(cleanContent) : cleanContent;
+    if (effectiveContent && !isRemote) {
       results.push({
         id: chunk.id,
         object: "chat.completion.chunk",
         created: chunk.created,
         model: chunk.model,
         system_fingerprint: null,
-        choices: [{ index: 0, delta: { content: cleanContent }, finish_reason: null, logprobs: null }],
+        choices: [{ index: 0, delta: { content: effectiveContent }, finish_reason: null, logprobs: null }],
       });
     }
     if (isCiResult) {
-      console.log(`[M365-RESP-CI-FILTER] suppressed CI execution result from tool_call response: "${cleanContent.slice(0, 100)}"`);
+      console.log(`[M365-RESP-CI-STRIP] CI prefix stripped from tool_call response: orig_len=${cleanContent.length} stripped_len=${(effectiveContent||"").length}`);
     }
 
     results.push({
