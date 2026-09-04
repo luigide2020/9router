@@ -8,7 +8,11 @@ All fixes targeting M365's server-side Code Interpreter (CI) auto-execution, Jai
 
 1. **ALWAYS read this file (m365-copilot-fixes.md) before any M365 code change.** Every fix here documents a hard-won lesson. Repeating past mistakes wastes hours of debugging.
 
-2. **NEVER commit/push without user verification.** All changes must be tested in docker and confirmed by the user before `git commit`/`git push`.
+2. **NEVER commit/push without user verification.** Strict rules:
+   - Code改完只说"修改完成，请重建docker测试"，**不主动commit/push**
+   - commit/push必须同时满足两个条件：a) 用户明确要求；b) docker端到端测试通过
+   - **语法检查 ≠ 验证**——只有docker运行确认才算验证
+   - 即使同一会话用户之前说过push，每个新fix是独立事件，必须重新获得授权
 
 3. **Do NOT claim "You do NOT have a code interpreter"** in any prompt — triggers JailBreakClassifier → Disengaged → "抱歉，我似乎无法就此话题进行聊天". Use softer wording: "The user is on a remote machine. You CANNOT execute commands on their behalf."
 
@@ -22,7 +26,9 @@ All fixes targeting M365's server-side Code Interpreter (CI) auto-execution, Jai
 
 8. **When filtering a message via `continue`, also clear `botTextStreams` for that msgId.** M365 streams text progressively (T1 frames build botTextStreams incrementally). If a filter `continue`s past a message but doesn't remove the msgId from botTextStreams, earlier partial text (e.g., "命" from "命令已成功执行") becomes the final output.
 
-9. **Strip CI result prefix, don't discard entire message.** M365 often combines CI result prefix ("命令已成功执行，无需进一步操作。") with actual response content in one message. Use `stripCiResultPrefix()` to remove only the prefix and preserve the rest, rather than filtering the entire message.
+9. **Strip CI result prefix, don't discard entire message (streaming/chat mode only).** M365 often combines CI result prefix with actual response content in one message. Use `stripCiResultPrefix()` to remove only the prefix and preserve the rest. BUT in `bufferForTools` mode (Codex CLI), CI result content comes from M365's sandbox (wrong machine), so always fully suppress it — the local tool_call execution gives the correct result.
+
+10. **CI result patterns are not stable.** M365 uses multiple CI result prefix variants: `命令已成功执行，无需进一步操作。`, `命令已成功执行。结果显示：`, `命令执行成功，但...当前步骤已完成，无需继续执行命令。`. Always use `isCiExecutionResult()` and `stripCiResultPrefix()` shared functions instead of inline regex. When a new variant appears, update both functions.
 
 ---
 
@@ -1146,7 +1152,7 @@ The prompt previously said "only use `cmd`" and banned `max_output_tokens`, so M
 
 ---
 
-## Fix70: CI Result Residual Text + CI Prefix Stripping
+## Fix70: CI Result Residual Text + CI Prefix Stripping + New Variants
 
 **Files**: `m365-copilot.js`, `m365-copilot-to-openai.js`
 
@@ -1180,9 +1186,36 @@ The old filter matched `^命令已成功执行` and `continue`d past the **entir
 **Symptom**: User asks "centos如何安装wget", M365 CI executes `uname -a`, CI result prefix + actual response are in one message → entire response filtered → empty reply.
 
 **Fix**: Instead of filtering entire messages, strip only the CI result prefix and preserve the rest:
-- `stripCiResultPrefix()`: removes `命令已成功执行，无需进一步操作。` / `命令执行失败，退出码为 N。` / `无需进一步操作` prefixes
+- `stripCiResultPrefix()`: removes CI result prefixes/suffixes
 - If stripped text is non-empty and differs from original → emit the stripped text
 - If stripped text is empty (pure CI result, no salvageable content) → fully filter as before
 - Applied to: streaming T1/T2 handlers, close handler, non-streaming T1/T2 handlers, response translator `buildToolCallResults()`
 
-**Verification**: When CI executes a command, the client now receives the salvageable content (e.g., system info summary) after the CI result prefix is stripped, instead of an empty response or orphaned partial characters.
+### Part 3: New CI result variants + bufferForTools full suppression (Fix70c/d)
+
+**Root cause**: M365 uses multiple CI result prefix formats that the old patterns didn't cover:
+
+| Variant | Example |
+|---------|---------|
+| `命令已成功执行，无需进一步操作。` | Pure CI result, no content |
+| `命令已成功执行。结果显示：...输出未被截断，无需进一步操作。` | CI result + content (Fix70b) |
+| `命令执行成功，但...当前步骤已完成，无需继续执行命令。` | **New variant** — different prefix wording |
+
+The `命令执行成功` variant was completely missed because `isCiExecutionResult()` only checked `^命令已成功执行`.
+
+Additionally, in `bufferForTools` mode (Codex CLI), the CI result's stripped content comes from M365's sandbox (wrong machine), not the user's local machine. Emitting it would give misleading results — the local `tool_call` execution already provides the correct answer.
+
+**Symptom**: User asks "du sh * 无法列出隐藏文件", M365 CI executes in sandbox, returns "命令执行成功，但 ./outputs 和 ./work 均为空目录..." — this is the sandbox's file system, not the user's. `hasCiResult=false` because `命令执行成功` didn't match `^命令已成功执行`.
+
+**Fix**:
+1. Expanded `CI_RESULT_PATTERNS` with tighter anchored patterns:
+   - `/^命令已成功执行[，,。.]\s*/` — requires punctuation after (prevents matching `命令已成功执行了...`)
+   - `/^命令执行成功[，,。.]\s*/` — new variant, same anchor discipline
+   - `/^命令执行失败[，,。.].*退出码/` — requires punctuation after `失败`
+   - `/当前步骤已完成[，,]\s*无需继续执行/` — new suffix pattern, requires `无需继续执行`
+2. `bufferForTools` mode: CI result is **fully suppressed** (not stripped) — content comes from M365 sandbox, not user's machine
+3. Non-bufferForTools (streaming chat) mode: CI result is stripped as before
+4. All inline CI result regex replaced with shared `isCiExecutionResult()` function
+5. `stripCiResultPrefix()` also tightened: `无需进一步操作` strip line uses `^` anchor
+
+**Key lesson**: `^` anchor discipline is critical — without `[，,。.]` after `命令已成功执行`, the pattern matches `命令已成功执行了，你可以继续下一步` (normal text). Every new variant must be anchored on both sides of the CI-specific punctuation boundary.

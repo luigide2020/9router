@@ -394,9 +394,11 @@ function stripToolPatternsFromText(text) {
 }
 
 const CI_RESULT_PATTERNS = [
-  /^命令已成功执行/,
-  /^命令执行失败.*退出码/,
+  /^命令已成功执行[，,。.]\s*/,
+  /^命令执行成功[，,。.]\s*/,
+  /^命令执行失败[，,。.].*退出码/,
   /^无需进一步操作$/,
+  /当前步骤已完成[，,]\s*无需继续执行/,
 ];
 
 function stripCiResultPrefix(text) {
@@ -405,8 +407,10 @@ function stripCiResultPrefix(text) {
   s = s.replace(/^命令已成功执行[，,]无需进一步操作[。.]\s*/, '');
   s = s.replace(/^命令已成功执行[。.]\s*结果.{0,5}[：:]\s*/, '');
   s = s.replace(/^命令执行失败[，,]退出码[为：:]\s*\d+[。.]\s*/, '');
+  s = s.replace(/^命令执行成功[，,]但\s*/, '');
+  s = s.replace(/当前步骤已完成[，,]无需继续执行命令?[。.]?\s*$/, '');
   s = s.replace(/输出未被截断[，,]无需进一步操作[。.]\s*$/, '');
-  s = s.replace(/无需进一步操作$/, '');
+  s = s.replace(/^无需进一步操作$/, '');
   return s.trim();
 }
 
