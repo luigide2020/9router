@@ -24,7 +24,8 @@ except ImportError:
     print("❌ 运行: uv add playwright && uv run playwright install chromium")
     sys.exit(1)
 
-CHAT_URL = "https://m365.cloud.microsoft/chat?es=SSR"
+# CHAT_URL = "https://m365.cloud.microsoft/chat?es=SSR"
+CHAT_URL = "https://outlook.office.com/host/b5abf2ae-c16b-4310-8f8a-d3bcdb52f162/entity1-d870f6cd-4aa5-4d42-9626-ab690c041429"
 
 ALLOWED_COUNTRY_CODES = {"TW"}
 
@@ -245,13 +246,17 @@ def do_login(page, email, password):
         pass
     # Wait for chat page to load (login success)
     for _ in range(6):
-        if 'm365.cloud.microsoft' in page.url:
+        if 'm365.cloud.microsoft' in page.url or 'outlook.office.com' in page.url:
             break
         try:
             page.wait_for_url("**m365.cloud.microsoft/**", timeout=10000)
             break
         except PwTimeout:
-            page.wait_for_timeout(2000)
+            try:
+                page.wait_for_url("**outlook.office.com/**", timeout=10000)
+                break
+            except PwTimeout:
+                page.wait_for_timeout(2000)
     else:
         print(f"[LOGIN] ⚠️ wait_for_url 超时，当前URL: {page.url}")
     print("[LOGIN] ✅ 登录成功")
@@ -355,38 +360,12 @@ def main():
         ws.on("framesent", scan)
         ws.on("framereceived", scan)
 
-    def click_history_and_type(page):
-        import random, string
-        word = ''.join(random.choices(string.ascii_lowercase, k=5))
+    def pick_greeting():
+        import random
+        greetings = ["hello", "hi", "hey", "good morning", "good afternoon", "howdy", "greetings"]
+        return random.choice(greetings)
 
-        new_chat_selectors = [
-            'button[aria-label*="New chat"]',
-            'button[aria-label*="new chat"]',
-            'button[aria-label*="新建聊天"]',
-            'button[aria-label*="新建"]',
-            'a[href="/chat?es=SSR"]',
-            'a[href="/chat"]',
-            '[data-testid*="new-chat"]',
-            '[data-testid*="newChat"]',
-            'button[data-testid*="new"]',
-        ]
-        clicked_new = False
-        for sel in new_chat_selectors:
-            try:
-                btn = page.locator(sel).first
-                if btn.count() == 0:
-                    continue
-                btn.click(timeout=5000, force=True)
-                print(f"[INFO] ✅ 点击了新建聊天 (selector={sel})")
-                clicked_new = True
-                page.wait_for_timeout(3000)
-                break
-            except Exception:
-                continue
-
-        if not clicked_new:
-            print("[INFO] 没找到新建聊天按钮，直接尝试输入")
-
+    def type_in_chat(page, word):
         input_selectors = [
             'div[contenteditable="true"]',
             '[role="textbox"]',
@@ -417,6 +396,29 @@ def main():
                 return True
             except Exception:
                 continue
+        frames = page.frames
+        print(f"[DIAG] 尝试 iframe 输入，frames 数量: {len(frames)}")
+        for fi, frame in enumerate(frames):
+            frame_url = frame.url
+            print(f"[DIAG] frame[{fi}]: {frame_url[:120]}")
+            for sel in input_selectors[:6]:
+                try:
+                    box = frame.locator(sel).last
+                    if box.count() == 0:
+                        continue
+                    box.click(timeout=3000)
+                    try:
+                        box.press("Control+A")
+                        box.press("Delete")
+                    except Exception:
+                        pass
+                    box.type(word, delay=120)
+                    frame.keyboard.press("Enter")
+                    print(f"[INFO] ✅ 在 iframe[{fi}] 的 {sel} 输入并发送: {word}")
+                    return True
+                except Exception:
+                    continue
+
         print("[WARN] 没定位到输入框，尝试诊断...")
         try:
             editable = page.evaluate("""() => {
@@ -432,6 +434,34 @@ def main():
             print(f"[DIAG] 可编辑元素: {json.dumps(editable, ensure_ascii=False)}")
         except Exception as e:
             print(f"[DIAG] 诊断失败: {e}")
+        return False
+
+    def try_new_chat_and_type(page):
+        new_chat_selectors = [
+            'button[aria-label*="New chat"]',
+            'button[aria-label*="new chat"]',
+            'button[aria-label*="新建聊天"]',
+            'button[aria-label*="新建"]',
+            'a[href="/chat?es=SSR"]',
+            'a[href="/chat"]',
+            '[data-testid*="new-chat"]',
+            '[data-testid*="newChat"]',
+            'button[data-testid*="new"]',
+        ]
+        for sel in new_chat_selectors:
+            try:
+                btn = page.locator(sel).first
+                if btn.count() == 0:
+                    continue
+                btn.click(timeout=5000, force=True)
+                print(f"[INFO] ✅ 点击了新建聊天 (selector={sel})")
+                page.wait_for_timeout(3000)
+                word = pick_greeting()
+                type_in_chat(page, word)
+                return True
+            except Exception:
+                continue
+        print("[INFO] 没找到新建聊天按钮，跳过（避免重复输入）")
         return False
 
     launch_kwargs = dict(
@@ -492,23 +522,43 @@ def main():
         for i in range(1, args.attempts + 1):
             if target["token"]:
                 break
-            print(f"\n========== 第 {i}/{args.attempts} 轮：reload → 等聊天框 → 点历史 → 敲字 → 等 WS ==========")
-            try:
-                page.reload(wait_until="commit", timeout=90000)
-            except Exception as e:
-                print(f"[WARN] reload 失败: {e}")
-                if "net::" in str(e).lower() or "err_" in str(e).lower():
-                    print(f"[ERROR] 网络不可达，终止重试")
-                    break
-                continue
+            if i == 1:
+                print(f"\n========== 第 {i}/{args.attempts} 轮：页面已加载 → 等聊天框 → 输入 → 等 WS ==========")
+            else:
+                print(f"\n========== 第 {i}/{args.attempts} 轮：reload → 等聊天框 → 输入 → 等 WS ==========")
+                try:
+                    page.reload(wait_until="commit", timeout=90000)
+                except Exception as e:
+                    print(f"[WARN] reload 失败: {e}")
+                    if "net::" in str(e).lower() or "err_" in str(e).lower():
+                        print(f"[ERROR] 网络不可达，终止重试")
+                        break
+                    continue
+            chat_found = False
             try:
                 page.wait_for_selector(
                     'div[contenteditable="true"], textarea, [role="textbox"], [data-testid*="chat"], [data-testid*="input"], [data-testid*="compose"], div[contenteditable], [contenteditable="true"]',
-                    timeout=30000,
+                    timeout=15000,
                 )
-                print("[INFO] ✅ 聊天框已出现")
+                chat_found = True
+                print("[INFO] ✅ 聊天框已出现（主页面）")
             except PwTimeout:
-                # Check if page is a network error
+                pass
+            if not chat_found:
+                print("[DIAG] 主页面未找到聊天框，检查 iframes...")
+                for fi, frame in enumerate(page.frames):
+                    print(f"[DIAG] frame[{fi}]: {frame.url[:120]}")
+                    try:
+                        frame.wait_for_selector(
+                            'div[contenteditable="true"], [role="textbox"], textarea, [contenteditable="true"]',
+                            timeout=5000,
+                        )
+                        chat_found = True
+                        print(f"[INFO] ✅ 聊天框已出现（iframe[{fi}]）")
+                        break
+                    except Exception:
+                        continue
+            if not chat_found:
                 try:
                     body_text = page.locator("body").inner_text(timeout=3000)
                     if any(kw in body_text.lower() for kw in ["err_internet", "net::", "can't reach", "refused", "timed out"]):
@@ -518,13 +568,22 @@ def main():
                     pass
                 print(f"[WARN] 聊天框30s未出现，当前URL: {page.url}")
                 continue
-            click_history_and_type(page)
+            word = pick_greeting()
+            type_in_chat(page, word)
             deadline = time.time() + args.wait
             while target["token"] is None and time.time() < deadline:
                 page.wait_for_timeout(1000)
             if target["token"]:
                 print(f"[INFO] 第 {i} 轮成功抓到 token")
                 break
+            print(f"[INFO] 直接输入没抓到 token，尝试新建聊天再输入...")
+            if try_new_chat_and_type(page):
+                deadline = time.time() + args.wait
+                while target["token"] is None and time.time() < deadline:
+                    page.wait_for_timeout(1000)
+                if target["token"]:
+                    print(f"[INFO] 第 {i} 轮（新建聊天后）成功抓到 token")
+                    break
             print(f"[INFO] 第 {i} 轮没抓到，准备重试...")
 
         if target["token"]:

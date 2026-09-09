@@ -1219,3 +1219,35 @@ Additionally, in `bufferForTools` mode (Codex CLI), the CI result's stripped con
 5. `stripCiResultPrefix()` also tightened: `无需进一步操作` strip line uses `^` anchor
 
 **Key lesson**: `^` anchor discipline is critical — without `[，,。.]` after `命令已成功执行`, the pattern matches `命令已成功执行了，你可以继续下一步` (normal text). Every new variant must be anchored on both sides of the CI-specific punctuation boundary.
+
+---
+
+## Fix71: login.py Flow Optimization - Skip First-Round Reload + Greeting Words + No Duplicate Input
+
+**Files**: `login.py`
+
+### Root cause
+
+Three issues in login.py token extraction flow:
+
+1. First round always did `page.reload()` before checking chat box - unnecessary since the page already loaded and WS connections were already established
+2. Input used random 5-letter gibberish (e.g. "abcde") - looks non-human
+3. After first input failed to capture token, `click_history_and_type` would type again even when no new chat button was found - causing duplicate messages like "good afternoon good afternoon"
+
+### Fix
+
+1. **Skip first-round reload**: Round 1 uses the already-loaded page directly; only round 2+ does reload
+2. **Greeting words instead of random letters**: `pick_greeting()` picks from ["hello", "hi", "hey", "good morning", "good afternoon", "howdy", "greetings"]
+3. **Extract `type_in_chat(page, word)` as shared function**: Both main loop and fallback use this function
+4. **`try_new_chat_and_type(page)` replaces `click_history_and_type`**: Only types if it successfully clicks a "New chat" button; if no button found, skips input entirely (avoids duplicate)
+5. **Main loop flow**: First input -> wait token -> if missed, try new chat + input -> if still missed, next round with reload
+
+### New flow per round
+
+1. (Round 1: no reload; Round 2+: reload first)
+2. Wait for chat box (main page -> iframes fallback)
+3. `type_in_chat(page, pick_greeting())` - first input attempt
+4. Wait for token
+5. If no token -> `try_new_chat_and_type(page)` - only types in NEW conversation
+6. Wait for token
+7. If still no token -> next round (reload + retry)

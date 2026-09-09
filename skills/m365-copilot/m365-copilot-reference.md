@@ -258,6 +258,15 @@ m365Tone = isFastModel
 - **Login browser** (`login.py`): Uses `M365_PROXY` (falls back to `HTTPS_PROXY`/`HTTP_PROXY`) — Playwright browser traffic routes through this proxy so exit IP is in Taiwan. Region check (`ALLOWED_COUNTRY_CODES = {"TW"}`) validates exit IP before login proceeds.
 - **sync_remote.sh**: Passes `M365_PROXY` env var and `--proxy` CLI arg to `login.py`.
 
+## login.py Token Extraction Flow (Fix71)
+
+1. Open CHAT_URL (outlook.office.com iframe), auto-set macOS system proxy
+2. Round 1: **no reload** — wait chat box (main page → iframes) → `type_in_chat(page, pick_greeting())` → wait WS token
+3. If no token: `try_new_chat_and_type(page)` — click "New chat" button first, only input if new conversation opened (avoids duplicate messages)
+4. If still no token: next round with `page.reload()` then retry
+5. `pick_greeting()` picks from: hello, hi, hey, good morning, good afternoon, howdy, greetings
+6. `type_in_chat(page, word)` is shared function for main page + iframe input
+
 ## Bot Text Dedup (Fix53)
 
 M365 WS protocol sends each T2 bot message **twice** (identical text, possibly different messageId). Dedup at two layers:
