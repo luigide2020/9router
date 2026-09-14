@@ -70,6 +70,7 @@ export const WEB_COOKIE_PROVIDERS = {
   "grok-web": { id: "grok-web", alias: "gw", name: "Grok Web (Subscription)", icon: "auto_awesome", color: "#1DA1F2", textIcon: "GW", website: "https://grok.com", authType: "cookie", authHint: "Paste your sso= cookie value from grok.com", passthroughModels: true, serviceKinds: ["llm"] },
   "perplexity-web": { id: "perplexity-web", alias: "pw", name: "Perplexity Web (Pro/Max)", icon: "search", color: "#20808D", textIcon: "PW", website: "https://www.perplexity.ai", authType: "cookie", authHint: "Paste your __Secure-next-auth.session-token cookie value from perplexity.ai", serviceKinds: ["llm"] },
   "m365-copilot": { id: "m365-copilot", alias: "m365", name: "M365 Copilot", icon: "smart_toy", color: "#0078D4", textIcon: "M3", website: "https://m365.cloud.microsoft", authType: "cookie", authHint: "Paste your substrate.office.com access token (from browser localStorage at outlook.office.com)", serviceKinds: ["llm"] },
+  "m365-foldcraft": { id: "m365-foldcraft", alias: "fc", name: "M365 Foldcraft (Thin Text)", icon: "text_snippet", color: "#107C10", textIcon: "FC", website: "https://m365.cloud.microsoft", authType: "cookie", authHint: "Shares token with M365 Copilot. Add M365 Copilot credentials first, or paste your substrate.office.com access token here.", sharedCredentials: "m365-copilot", serviceKinds: ["llm"] },
 };
 
 // Media provider kinds — each kind maps to a route and endpoint config

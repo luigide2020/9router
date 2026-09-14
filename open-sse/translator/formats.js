@@ -13,7 +13,8 @@ export const FORMATS = {
   CURSOR: "cursor",
   OLLAMA: "ollama",
   COMMANDCODE: "commandcode",
-  M365_COPILOT: "m365-copilot"
+  M365_COPILOT: "m365-copilot",
+  M365_FOLDCRAFT: "m365-foldcraft"
 };
 
 /**

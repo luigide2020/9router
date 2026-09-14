@@ -11,6 +11,10 @@ let selectionMutex = Promise.resolve();
 
 const GITHUB_MONTHLY_USAGE_LIMIT = "you've reached your additional usage limit for your plan";
 
+const CREDENTIAL_FALLBACK = {
+  "m365-foldcraft": "m365-copilot",
+};
+
 function githubMonthlyResetMs(status, errorText, provider) {
   if (resolveProviderId(provider) !== "github" || Number(status) !== 402) return null;
   if (!String(errorText || "").toLowerCase().includes(GITHUB_MONTHLY_USAGE_LIMIT)) return null;
@@ -73,6 +77,11 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     log.debug("AUTH", `${provider} | total connections: ${connections.length}, excludeIds: ${excludeSet.size > 0 ? [...excludeSet].join(",") : "none"}, model: ${model || "any"}`);
 
     if (connections.length === 0) {
+      const fallbackProvider = CREDENTIAL_FALLBACK[providerId];
+      if (fallbackProvider) {
+        log.info("AUTH", `${provider} | no own credentials, falling back to ${fallbackProvider}`);
+        return getProviderCredentials(fallbackProvider, excludeConnectionIds, model, options);
+      }
       log.warn("AUTH", `No credentials for ${provider}`);
       return null;
     }

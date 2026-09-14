@@ -12,7 +12,7 @@ export default function AddApiKeyModal({ isOpen, provider, providerName, isCompa
   const NONE_PROXY_POOL_VALUE = "__none__";
   const isOllamaLocal = provider === "ollama-local";
   const isCookie = authType === "cookie";
-  const isM365 = provider === "m365-copilot";
+  const isM365 = provider === "m365-copilot" || provider === "m365-foldcraft";
   const isXaiApiKey = provider === "xai" && !isCookie;
   const credentialLabel = isM365 ? "Access Token" : (isCookie ? "Cookie Value" : provider === "qoder" ? "Personal Access Token (PAT)" : "API Key");
   const credentialPlaceholder = isM365

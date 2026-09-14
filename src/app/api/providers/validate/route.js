@@ -544,7 +544,8 @@ export async function POST(request) {
           break;
         }
 
-        case "m365-copilot": {
+        case "m365-copilot":
+        case "m365-foldcraft": {
           // Validate by decoding the JWT access token (no external call needed)
           let token = apiKey.trim();
           try {

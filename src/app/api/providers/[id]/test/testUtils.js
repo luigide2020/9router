@@ -767,7 +767,8 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
         }, effectiveProxy);
         return { valid: res.ok, error: res.ok ? null : "Invalid API key" };
       }
-      case "m365-copilot": {
+      case "m365-copilot":
+      case "m365-foldcraft": {
         const token = connection.apiKey || connection.accessToken || "";
         if (!token || !token.startsWith("ey")) {
           return { valid: false, error: "Missing or invalid token. Paste a valid JWT from substrate.office.com." };

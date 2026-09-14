@@ -24,7 +24,7 @@ except ImportError:
     print("❌ 运行: uv add playwright && uv run playwright install chromium")
     sys.exit(1)
 
-# CHAT_URL = "https://m365.cloud.microsoft/chat?es=SSR"
+#CHAT_URL = "https://m365.cloud.microsoft/chat?es=SSR"
 CHAT_URL = "https://outlook.office.com/host/b5abf2ae-c16b-4310-8f8a-d3bcdb52f162/entity1-d870f6cd-4aa5-4d42-9626-ab690c041429"
 
 ALLOWED_COUNTRY_CODES = {"TW"}
@@ -34,15 +34,11 @@ NETWORK_SERVICES = ["Wi-Fi", "Ethernet"]
 
 _proxy_was_set = False
 _proxy_original_state = {}
-
-
 def _run_networksetup(*args):
     try:
         subprocess.run(["networksetup", *args], capture_output=True, timeout=5)
     except Exception:
         pass
-
-
 def _get_proxy_state(service, proxy_type):
     try:
         result = subprocess.run(
@@ -52,8 +48,6 @@ def _get_proxy_state(service, proxy_type):
         return result.stdout.strip()
     except Exception:
         return ""
-
-
 def setup_system_proxy():
     global _proxy_was_set, _proxy_original_state
     _proxy_original_state = {}
@@ -71,8 +65,6 @@ def setup_system_proxy():
     os.environ["HTTP_PROXY"] = f"http://127.0.0.1:{SYSTEM_PROXY_PORT}"
     os.environ["HTTPS_PROXY"] = f"http://127.0.0.1:{SYSTEM_PROXY_PORT}"
     print(f"[PROXY] ✅ 系统代理已设置 → 127.0.0.1:{SYSTEM_PROXY_PORT} ({', '.join(NETWORK_SERVICES)})")
-
-
 def restore_system_proxy():
     global _proxy_was_set
     if not _proxy_was_set:
@@ -85,8 +77,6 @@ def restore_system_proxy():
     os.environ.pop("HTTP_PROXY", None)
     os.environ.pop("HTTPS_PROXY", None)
     print("[PROXY] ✅ 系统代理已恢复")
-
-
 def detect_region_by_ip():
     """通过出口 IP 归属地检测网络区域（走系统代理 / HTTP_PROXY 环境变量）"""
     apis = [
@@ -113,8 +103,6 @@ def detect_region_by_ip():
             print(f"[REGION] {name} 查询失败: {e}")
             continue
     return None, None, None
-
-
 def check_region_or_exit():
     """区域预检：通过出口 IP 判断，仅允许 TW（依赖系统代理）"""
     code, country, ip = detect_region_by_ip()
@@ -131,8 +119,6 @@ USER_DATA_DIR = str(Path(__file__).parent / ".browser_profile")
 TOKEN_DIR = Path.home() / ".9router"
 TOKEN_FILE = TOKEN_DIR / "m365-token.json"
 CHATHUB_PATH = "m365copilot/chathub/"
-
-
 def atomic_write(path, text):
     tmp = str(path) + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -140,8 +126,6 @@ def atomic_write(path, text):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
-
-
 
 def decode_jwt_payload(token):
     try:
@@ -152,8 +136,6 @@ def decode_jwt_payload(token):
         return json.loads(base64.urlsafe_b64decode(seg))
     except Exception:
         return None
-
-
 def is_logged_in(page):
     # 如果页面上有邮箱输入框，说明未登录
     # 但 M365 登录页可能用不同的 selector，所以也检查 URL
@@ -164,13 +146,9 @@ def is_logged_in(page):
     if 'login' in page.url.lower() or 'login.microsoftonline' in page.url.lower():
         return False
     return True
-
-
 def is_on_chat_page(page):
     # 如果已经在 chat 页面，说明登录成功了
     return 'chat' in page.url
-
-
 def do_login(page, email, password):
     print("[LOGIN] 等待登录页面加载...")
     # Wait for login page - try multiple possible selectors
@@ -260,8 +238,6 @@ def do_login(page, email, password):
     else:
         print(f"[LOGIN] ⚠️ wait_for_url 超时，当前URL: {page.url}")
     print("[LOGIN] ✅ 登录成功")
-
-
 def main():
     import atexit
     atexit.register(restore_system_proxy)
@@ -516,7 +492,13 @@ def main():
                 print("[LOGIN] ✅ 已有登录态")
             else:
                 do_login(page, email, password)
-                page.wait_for_url("**/chat**", timeout=30000)
+                try:
+                    page.wait_for_url("**/chat**", timeout=30000)
+                except PwTimeout:
+                    if "outlook.office.com" in page.url or "m365.cloud.microsoft" in page.url:
+                        print("[LOGIN] URL 未跳转到 chat，但已在 M365 域内，继续")
+                    else:
+                        raise
                 page.wait_for_timeout(3000)
 
         for i in range(1, args.attempts + 1):
@@ -600,7 +582,5 @@ def main():
                     page.wait_for_timeout(1000)
             except KeyboardInterrupt:
                 ctx.close()
-
-
 if __name__ == "__main__":
     main()

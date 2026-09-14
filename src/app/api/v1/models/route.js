@@ -290,6 +290,19 @@ export async function buildModelsList(kindFilter, options = {}) {
     }
   }
 
+  const COMPANION_PROVIDERS = {
+    "m365-copilot": ["m365-foldcraft"],
+  };
+  for (const [sourceId, companions] of Object.entries(COMPANION_PROVIDERS)) {
+    if (!activeConnectionByProvider.has(sourceId)) continue;
+    const sourceConn = activeConnectionByProvider.get(sourceId);
+    for (const companionId of companions) {
+      if (!activeConnectionByProvider.has(companionId)) {
+        activeConnectionByProvider.set(companionId, sourceConn);
+      }
+    }
+  }
+
   const models = [];
 
   // Combos first (filtered by kind). Web combos expose `kind` so AI knows search vs fetch.

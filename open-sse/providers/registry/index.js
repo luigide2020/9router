@@ -57,6 +57,7 @@ import p54 from "./kiro.js";
 import p55 from "./linkup.js";
 import p56 from "./local-device.js";
 import p57 from "./m365-copilot.js";
+import p57b from "./m365-foldcraft.js";
 import p58 from "./mimo-free.js";
 import p59 from "./minimax-cn.js";
 import p60 from "./minimax.js";
@@ -184,6 +185,7 @@ export default [
   p55,
   p56,
   p57,
+  p57b,
   p58,
   p59,
   p60,
