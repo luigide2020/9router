@@ -1107,7 +1107,8 @@ export class M365CopilotExecutor extends BaseExecutor {
       effectivePrompt = effectivePrompt + "\n\nIMPORTANT: Images are already included inline above. Do NOT attempt to read, open, or process any image file paths (e.g. /var/folders/...). Just answer based on the images shown.";
     }
     const hasLocalPaths = /\/(Users|home|var|tmp|root|etc)\//.test(effectivePrompt) || /\.codex\/attachments\//.test(effectivePrompt);
-    if (hasLocalPaths && toolMeta?.needsLocalExec) {
+    const forceLocalExecHint = hasLocalPaths || (toolMeta?.needsLocalExec && (body?._m365HasToolResults || body?._m365HasEarlierToolResults));
+    if (forceLocalExecHint && toolMeta?.needsLocalExec) {
       effectivePrompt = effectivePrompt + "\n\nIMPORTANT: File paths in this conversation are on the user's machine — you do NOT have access to them. Do NOT attempt to execute any commands yourself. Instead, ALWAYS output a JSON instruction for the user to execute on their machine.";
     }
     console.log(`[M365-EXEC-FLAGS] disableCodeInterpreter=${m365Flags.disableCodeInterpreter} enableSearch=${m365Flags.enableSearch} experienceType=Default tone=${m365Tone} hasImage=${/<image\b/i.test(userPrompt)} hasLocalPaths=${hasLocalPaths}`);

@@ -476,10 +476,15 @@ def main():
         # Verify page content is M365 (not a browser error page)
         try:
             page_title = page.title()
-            if not page_title or "error" in page_title.lower() or "unreachable" in page_title.lower():
+            lower_title = (page_title or "").lower()
+            has_account = bool(page_title and " - " in page_title and len(page_title.split(" - ")) >= 3)
+            is_browser_error = (not page_title) or ("unreachable" in lower_title) or (lower_title == "error") or ("error" in lower_title and not has_account)
+            if is_browser_error:
                 print(f"[ERROR] 页面标题异常: {page_title}")
                 ctx.close()
                 sys.exit(1)
+            elif "error" in lower_title and has_account:
+                print(f"[WARN] 页面标题含 error 但有账户名，继续: {page_title}")
         except Exception:
             pass
 

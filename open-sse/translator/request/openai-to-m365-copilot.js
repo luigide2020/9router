@@ -510,11 +510,27 @@ function buildEarlierContext(messages, stopIndex, toolCallMetaMap, startScanIdx 
       if (!toolCallMetaMap.has(tcId)) toolCallMetaMap.set(tcId, "unknown");
     }
   }
+  const recentAssistantTexts = [];
+  for (let k = Math.max(startScanIdx, stopIndex - 10); k < stopIndex; k++) {
+    const msg = messages[k];
+    if ((msg.role || "") === ROLE.ASSISTANT && !msg.tool_calls?.length) {
+      const t = extractContent(msg.content) || "";
+      if (t.length > 20) recentAssistantTexts.push(t.slice(0, 500));
+    }
+    if (recentAssistantTexts.length >= 3) break;
+  }
+  const lastAssistantSummary = recentAssistantTexts.length > 0
+    ? recentAssistantTexts[recentAssistantTexts.length - 1]
+    : "";
+
   const parts = [];
   const lastCmd = prevCmds.length > 0 ? prevCmds[prevCmds.length - 1] : "";
   if (lastCmd) parts.push(`Previous command: ${lastCmd.slice(0, 200)}`);
   if (prevCmds.length > 1) {
     parts.push(`Commands executed so far: ${prevCmds.length}`);
+  }
+  if (lastAssistantSummary) {
+    parts.push(`Previous analysis: ${lastAssistantSummary}`);
   }
   if (filesInContext.size > 0) {
     const fileList = [...filesInContext].slice(0, 20).join(", ");
@@ -959,6 +975,8 @@ function openaiToM365CopilotRequest(model, body, stream, credentials) {
     messages: [],
     _m365Prompt: afterSanitize,
     _m365IsContinuation: isContinuation,
+    _m365HasToolResults: hasToolResults,
+    _m365HasEarlierToolResults: hasEarlierToolResults,
     _m365ToolMeta: {
       hasTools: !!(tools && tools.length > 0),
       needsLocalExec,
