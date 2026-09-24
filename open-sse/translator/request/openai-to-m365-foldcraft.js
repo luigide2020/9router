@@ -1,6 +1,6 @@
 import { createHash } from "crypto";
 import { FORMATS } from "../formats.js";
-import { register } from "../translator.js";
+import { register } from "../index.js";
 
 const ROLE = { SYSTEM: "system", DEVELOPER: "developer", USER: "user", ASSISTANT: "assistant", TOOL: "tool" };
 const SEEN_CONV_MAX = 500;

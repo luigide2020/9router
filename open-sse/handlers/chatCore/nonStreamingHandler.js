@@ -188,11 +188,6 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
   }
   if (targetFormat === FORMATS.OPENAI) return responseBody;
 
-  // M365 Foldcraft: pure text passthrough (no tool_call extraction)
-  if (targetFormat === FORMATS.M365_FOLDCRAFT) {
-    return responseBody;
-  }
-
   // M365 Copilot: detect ```json-tool blocks in content and convert to tool_calls
   if (targetFormat === FORMATS.M365_COPILOT) {
     const needsLocalExec = !!translatedBody?._m365ToolMeta?.needsLocalExec;

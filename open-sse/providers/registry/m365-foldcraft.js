@@ -17,7 +17,7 @@ export default {
   category: "cookie",
   transport: {
     baseUrl: "https://substrate.office.com/m365Copilot/Chathub",
-    format: "m365-foldcraft",
+    format: "openai",
   },
   models: [
     { id: "foldcraft", name: "Foldcraft (Reasoning)", defaultReasoning: true },

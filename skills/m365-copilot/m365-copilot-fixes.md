@@ -1251,3 +1251,35 @@ Three issues in login.py token extraction flow:
 5. If no token -> `try_new_chat_and_type(page)` - only types in NEW conversation
 6. Wait for token
 7. If still no token -> next round (reload + retry)
+
+---
+
+## Fix72: M365 Foldcraft — Thin Passthrough Provider (Translator Removal + WS Double-Emit Fix)
+
+**Files**: `open-sse/executors/m365-foldcraft.js`, `open-sse/providers/registry/m365-foldcraft.js`, `open-sse/translator/index.js`, `open-sse/translator/request/openai-to-m365-foldcraft.js`, `open-sse/translator/response/m365-foldcraft-to-openai.js`, `open-sse/handlers/chatCore/nonStreamingHandler.js`
+
+### Root cause
+
+Three issues preventing m365-foldcraft from working:
+
+1. **Translator never registered**: `openai-to-m365-foldcraft.js` and `m365-foldcraft-to-openai.js` imported `../translator.js` (nonexistent) instead of `../index.js`. The `register()` call never executed, so `body._m365Prompt` was never set → `prompt_len=0` → 400 "Empty query after processing".
+
+2. **Format mismatch**: Provider declared `format: "m365-foldcraft"` requiring a custom translator. But foldcraft's purpose is thin passthrough — no translation needed. Changed to `format: "openai"` so messages pass through directly. Executor now extracts the last user message from `body.messages` itself.
+
+3. **WS double-emit**: The `ws` library triggers BOTH `ws.on("message", listener)` AND `ws.onmessage` for every WS frame. The `messageListener` callback also manually called `ws.onmessage()`, causing every frame to be processed twice — producing duplicated output (every line appeared twice).
+
+### Fix
+
+1. **Removed foldcraft translators from `translator/index.js`**: Deleted `import "./request/openai-to-m365-foldcraft.js"` and `import "./response/m365-foldcraft-to-openai.js"`. Translator files still exist but are unused; their `register()` import path was also fixed (`../translator.js` → `../index.js`) in case they're needed later.
+
+2. **Changed provider format to `"openai"`**: `m365-foldcraft.js` registry now uses `format: "openai"` — no translation step, messages arrive at executor as-is.
+
+3. **Executor reads `body.messages` directly**: Replaced `body._m365Prompt` with inline extraction of last user message from `body.messages`. Also uses `messages.length > 1` for `isContinuation` instead of `body._m365IsContinuation`.
+
+4. **Simplified `buildStreamingFromWs`** (~280 lines → ~40 lines): Only emits `writeAtCursor` as SSE content. `messages` array is logged only (metadata). No more `botTextStreams`, `writeAtCursorEmittedLen`, `rebuildFullText`, `isSearchBotMessage`, CoT conversion, or dedup logic — all processing deferred to downstream foldcraft project.
+
+5. **Fixed WS double-emit**: `messageListener` no longer calls `ws.onmessage()` directly. It only buffers messages. After `buildStreamingFromWs` sets `ws.onmessage`, buffer is replayed once, then `messageBuffer` is set to `null` to prevent further buffering. The ws library's own `ws.onmessage` dispatch handles all post-setup delivery.
+
+### Key design decision
+
+m365-foldcraft is a **thin passthrough**: 9router only does WS→SSE conversion, emitting raw `writeAtCursor` increments. All content processing (dedup, CoT extraction, tool_call parsing) is the downstream foldcraft project's responsibility.

@@ -208,22 +208,6 @@ function buildCopilotMessage(text, invocationId, conversationId, sessionId, tone
   };
 }
 
-const SEARCH_MESSAGE_TYPES = new Set([
-  "InternalSearchQuery", "InternalSearchResult", "SemanticSerp",
-  "SearchQuery", "AdsQuery", "GenerateContentQuery",
-]);
-
-function isSearchBotMessage(msg) {
-  if (msg.author !== "bot") return false;
-  const mt = msg.messageType || msg.type || "";
-  if (SEARCH_MESSAGE_TYPES.has(mt)) return true;
-  if (msg.hiddenText && typeof msg.hiddenText === "string" && msg.hiddenText.includes("WebPages")) return true;
-  const text = msg.text || "";
-  if (text.startsWith('{"query"') && text.includes('"WebPages"')) return true;
-  if (text.startsWith('[{"query"') && text.includes('"WebPages"')) return true;
-  return false;
-}
-
 function sseChunk(data) {
   return `data: ${JSON.stringify(data)}\n\n`;
 }
@@ -256,21 +240,7 @@ function buildStreamingFromWs(ws, model, cid, created, signal) {
         choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null, logprobs: null }],
       })));
 
-      let botTextStreams = new Map();
-      let writeAtCursorEmittedLen = 0;
       let closed = false;
-
-      const rebuildFullText = () => {
-        const seen = new Set();
-        const parts = [];
-        for (const text of botTextStreams.values()) {
-          if (text && !seen.has(text)) {
-            seen.add(text);
-            parts.push(text);
-          }
-        }
-        return parts.join("\n");
-      };
 
       const emitContent = (text) => {
         if (!text || closed) return;
@@ -282,8 +252,7 @@ function buildStreamingFromWs(ws, model, cid, created, signal) {
 
       const close = () => {
         if (closed) return;
-        const finalText = rebuildFullText();
-        console.log(`[M365-FC-CLOSE] textLen=${finalText.length} preview=${finalText.slice(0, 200)}`);
+        console.log(`[M365-FC-CLOSE] stream closing`);
         closed = true;
         try {
           controller.enqueue(encoder.encode(sseChunk({
@@ -309,202 +278,55 @@ function buildStreamingFromWs(ws, model, cid, created, signal) {
         if (!closed) sendError("M365 Foldcraft response timed out");
       }, WS_RESPONSE_TIMEOUT_MS);
 
-      const processData = (data) => {
-        if (data.type === 1) {
-          const payload = data.item || data.arguments?.[0];
+       const processData = (data) => {
+         if (data.type === 1) {
+           const payload = data.item || data.arguments?.[0];
 
-          if (payload?.writeAtCursor && !payload?.messages) {
-            const cursorText = payload.writeAtCursor;
-            if (cursorText) {
-              emitContent(cursorText);
-              writeAtCursorEmittedLen += cursorText.length;
-            }
-          } else if (payload?.patches) {
-            console.log(`[M365-FC-WS-PATCHES] ${JSON.stringify(payload.patches).slice(0, 200)}`);
-          }
+           if (payload?.writeAtCursor) {
+             const cursorText = payload.writeAtCursor;
+             if (cursorText) {
+               emitContent(cursorText);
+             }
+           } else if (payload?.patches) {
+             console.log(`[M365-FC-WS-PATCHES] ${JSON.stringify(payload.patches).slice(0, 200)}`);
+           }
 
-          if (payload?.messages) {
-            for (const msg of payload.messages) {
-              const msgAuthor = msg.author || "NONE";
-              const msgType = msg.messageType || msg.type || "unknown";
-              const msgText = (msg.text || "").slice(0, 200).replace(/\n/g, "\\n");
-              const msgHidden = msg.hiddenText ? msg.hiddenText.slice(0, 200).replace(/\n/g, "\\n") : "";
-              const msgOffense = msg.offense || "none";
-              const msgTurnState = msg.turnState || "none";
-              const msgContentOrigin = msg.contentOrigin || "none";
-              console.log(`[M365-FC-WS-T1] author=${msgAuthor} type=${msgType} textLen=${(msg.text||"").length} hiddenLen=${(msg.hiddenText||"").length} offense=${JSON.stringify(msgOffense)} turnState=${JSON.stringify(msgTurnState)} contentOrigin=${msgContentOrigin} text=${msgText}`);
-
-              if (msgContentOrigin === "ChainOfThoughtSummary") {
-                console.log(`[M365-FC-WS-COT] ChainOfThoughtSummary (textLen=${(msg.text||"").length})`);
-                if (msg.text) {
-                  emitContent(`[Thinking] ${msg.text}\n`);
-                }
-                continue;
-              }
-              if (msgType === "Progress" && msgContentOrigin !== "DeepLeo") {
-                console.log(`[M365-FC-WS-PROGRESS] skipped Progress message (contentOrigin=${msgContentOrigin})`);
-                continue;
-              }
-              if (msgType === "ReferencesListComplete") {
-                console.log(`[M365-FC-WS-REFS] ReferencesListComplete signal, turnCount=${msg.turnCount || "n/a"}`);
-                continue;
-              }
-              if (msgType === "Suggestion") {
-                continue;
-              }
-              if (msgType === "EscapeHatch" || msgType === "InternalLoaderMessage") {
-                continue;
-              }
-
-              if (msg.hiddenText && /Conversation disengaged|Sorry.*(?:chat|help|assist)|I can't (?:help|chat|assist)/i.test(msg.hiddenText)) {
-                console.log(`[M365-FC-WS-DISENGAGE-T1] DETECTED in hiddenText! hiddenText=${msgHidden} author=${msgAuthor} type=${msgType}`);
-                const disengageMsg = { ...msg };
-                if (disengageMsg.text && disengageMsg.text.length > 500) disengageMsg.text = disengageMsg.text.slice(0, 500) + "...(truncated)";
-                if (disengageMsg.hiddenText && disengageMsg.hiddenText.length > 500) disengageMsg.hiddenText = disengageMsg.hiddenText.slice(0, 500) + "...(truncated)";
-                console.log(`[M365-FC-WS-DISENGAGE-T1-FULL] ${JSON.stringify(disengageMsg)}`);
-              }
-
-              if (msg.text && /Conversation disengaged|Sorry.*(?:chat|help|assist)|I can't (?:help|chat|assist)/i.test(msg.text)) {
-                console.log(`[M365-FC-WS-DISENGAGE-T1] DETECTED in text! text=${msgText} author=${msgAuthor} type=${msgType}`);
-                const disengageMsg = { ...msg };
-                if (disengageMsg.text && disengageMsg.text.length > 500) disengageMsg.text = disengageMsg.text.slice(0, 500) + "...(truncated)";
-                if (disengageMsg.hiddenText && disengageMsg.hiddenText.length > 500) disengageMsg.hiddenText = disengageMsg.hiddenText.slice(0, 500) + "...(truncated)";
-                console.log(`[M365-FC-WS-DISENGAGE-T1-FULL] ${JSON.stringify(disengageMsg)}`);
-              }
-
-              if (msg.author !== "bot") {
-                if (msgType === "InternalSearchQuery" || msgType === "InternalSearchResult" ||
-                    msgType === "SemanticSerp" || msgType === "SearchQuery" ||
-                    msgType === "AdsQuery" || msgType === "GenerateContentQuery") {
-                  console.log(`[M365-FC-SEARCH] type=${msgType} text=${(msg.text||"").slice(0,300)}`);
-                }
-              }
-              if (isSearchBotMessage(msg)) {
-                console.log(`[M365-FC-SEARCH-BOT] skipped search payload in bot message (len=${(msg.text||"").length})`);
-                continue;
-              }
-              if (msg.text && msg.author === "bot") {
-                const msgId = msg.messageId || msg.responseIdentifier || "default";
-                const prev = botTextStreams.get(msgId) || "";
-                if (msg.text.length > prev.length) {
-                  let isCrossDup = false;
-                  if (msgId !== "default") {
-                    for (const [k, v] of botTextStreams) {
-                      if (k !== msgId && v === msg.text) { isCrossDup = true; break; }
-                    }
-                  }
-                  if (isCrossDup) {
-                    console.log(`[M365-FC-WS-T6] skipped cross-msgId duplicate bot text (msgId=${msgId}, textLen=${msg.text.length})`);
-                  } else {
-                    const emitStart = Math.max(prev.length, writeAtCursorEmittedLen);
-                    const delta = msg.text.slice(emitStart);
-                    botTextStreams.set(msgId, msg.text);
-                    if (delta) emitContent(delta);
-                  }
-                }
-              }
-            }
-          }
-        }
-        if (data.type === 2) {
-          const payload = data.item || data.arguments?.[0];
-          if (payload?.messages) {
-            const firstNew = payload.firstNewMessageIndex ?? 0;
-            for (let mi = 0; mi < payload.messages.length; mi++) {
-              const msg = payload.messages[mi];
-              if (mi < firstNew) {
-                console.log(`[M365-FC-WS-T2-HIST] skipped history msg idx=${mi} author=${msg?.author}`);
-                continue;
-              }
-              const msgAuthor = msg?.author || "NONE";
-              const msgType = msg?.messageType || msg?.type || "unknown";
-              const msgText = (msg?.text || "").slice(0, 200).replace(/\n/g, "\\n");
-              const msgHidden = msg?.hiddenText ? msg.hiddenText.slice(0, 200).replace(/\n/g, "\\n") : "";
-              const msgOffense = msg?.offense || "none";
-              const msgTurnState = msg?.turnState || "none";
-              const msgContentOrigin = msg?.contentOrigin || "none";
-              console.log(`[M365-FC-WS-T2] author=${msgAuthor} type=${msgType} textLen=${(msg?.text||"").length} hiddenLen=${(msg?.hiddenText||"").length} offense=${JSON.stringify(msgOffense)} turnState=${JSON.stringify(msgTurnState)} contentOrigin=${msgContentOrigin} text=${msgText}`);
-
-              if (msgContentOrigin === "ChainOfThoughtSummary") {
-                console.log(`[M365-FC-WS-COT-T2] ChainOfThoughtSummary (textLen=${(msg?.text||"").length})`);
-                if (msg?.text) {
-                  emitContent(`[Thinking] ${msg.text}\n`);
-                }
-                continue;
-              }
-              if (msgType === "Progress" && msgContentOrigin !== "DeepLeo") {
-                console.log(`[M365-FC-WS-PROGRESS-T2] skipped Progress message (contentOrigin=${msgContentOrigin})`);
-                continue;
-              }
-              if (msgType === "ReferencesListComplete" || msgType === "Suggestion") {
-                continue;
-              }
-              if (msgType === "EscapeHatch" || msgType === "InternalLoaderMessage") {
-                continue;
-              }
-
-              if (msg?.hiddenText && /Conversation disengaged|Sorry.*(?:chat|help|assist)|I can't (?:help|chat|assist)/i.test(msg.hiddenText)) {
-                console.log(`[M365-FC-WS-DISENGAGE-T2] DETECTED in hiddenText! hiddenText=${msgHidden} author=${msgAuthor} type=${msgType}`);
-                const disengageMsg = { ...msg };
-                if (disengageMsg.text && disengageMsg.text.length > 500) disengageMsg.text = disengageMsg.text.slice(0, 500) + "...(truncated)";
-                if (disengageMsg.hiddenText && disengageMsg.hiddenText.length > 500) disengageMsg.hiddenText = disengageMsg.hiddenText.slice(0, 500) + "...(truncated)";
-                console.log(`[M365-FC-WS-DISENGAGE-T2-FULL] ${JSON.stringify(disengageMsg)}`);
-              }
-
-              if (msg?.text && /Conversation disengaged|Sorry.*(?:chat|help|assist)|I can't (?:help|chat|assist)/i.test(msg.text)) {
-                console.log(`[M365-FC-WS-DISENGAGE-T2] DETECTED in text! text=${msgText} author=${msgAuthor} type=${msgType}`);
-                const disengageMsg = { ...msg };
-                if (disengageMsg.text && disengageMsg.text.length > 500) disengageMsg.text = disengageMsg.text.slice(0, 500) + "...(truncated)";
-                if (disengageMsg.hiddenText && disengageMsg.hiddenText.length > 500) disengageMsg.hiddenText = disengageMsg.hiddenText.slice(0, 500) + "...(truncated)";
-                console.log(`[M365-FC-WS-DISENGAGE-T2-FULL] ${JSON.stringify(disengageMsg)}`);
-              }
-
-              if (isSearchBotMessage(msg)) {
-                console.log(`[M365-FC-SEARCH-BOT] skipped search payload in T2 bot message (len=${(msg.text||"").length})`);
-                continue;
-              }
-              if (msg.text && msg.author === "bot") {
-                const msgId = msg.messageId || msg.responseIdentifier || "default";
-                const prev = botTextStreams.get(msgId) || "";
-                if (msg.text.length > prev.length) {
-                  let isCrossDup = false;
-                  if (msgId !== "default") {
-                    for (const [k, v] of botTextStreams) {
-                      if (k !== msgId && v === msg.text) { isCrossDup = true; break; }
-                    }
-                  }
-                  if (isCrossDup) {
-                    console.log(`[M365-FC-WS-T2] skipped cross-msgId duplicate bot text (msgId=${msgId}, textLen=${msg.text.length})`);
-                  } else {
-                    const delta = msg.text.slice(prev.length);
-                    botTextStreams.set(msgId, msg.text);
-                    if (delta) emitContent(delta);
-                  }
-                }
-              }
-            }
-          }
-          if (payload?.result?.value && payload.result.value !== "Success") {
-            console.log(`[M365-FC-WS-T2] result=NOT_SUCCESS value=${payload.result.value} message=${payload.result.message || "none"}`);
-            sendError(payload.result.message || payload.result.value);
-            return;
-          }
-          clearTimeout(responseTimer);
-          close();
-          return;
-        }
-        if (data.type === 3) {
-          console.log(`[M365-FC-WS-T3] end of conversation turn`);
-          clearTimeout(responseTimer);
-          close();
-        }
-        if (data.type === 6) {
-          console.log(`[M365-FC-WS-T6] keep-alive ping received`);
-        }
-        if (data.type !== 1 && data.type !== 2 && data.type !== 3 && data.type !== 6) {
-          console.log(`[M365-FC-WS-OTHER] type=${data.type} keys=${Object.keys(data).join(",")}`);
-        }
-      };
+           if (payload?.messages) {
+             for (const msg of payload.messages) {
+               console.log(`[M365-FC-WS-T1] author=${msg.author || "NONE"} type=${msg.messageType || msg.type || "unknown"} textLen=${(msg.text||"").length} contentOrigin=${msg.contentOrigin || "none"}`);
+             }
+           }
+         }
+         if (data.type === 2) {
+           const payload = data.item || data.arguments?.[0];
+           if (payload?.messages) {
+             const firstNew = payload.firstNewMessageIndex ?? 0;
+             for (let mi = firstNew; mi < payload.messages.length; mi++) {
+               const msg = payload.messages[mi];
+               console.log(`[M365-FC-WS-T2] author=${msg?.author || "NONE"} type=${msg?.messageType || msg?.type || "unknown"} textLen=${(msg?.text||"").length} contentOrigin=${msg?.contentOrigin || "none"}`);
+             }
+           }
+           if (payload?.result?.value && payload.result.value !== "Success") {
+             console.log(`[M365-FC-WS-T2] result=NOT_SUCCESS value=${payload.result.value} message=${payload.result.message || "none"}`);
+             sendError(payload.result.message || payload.result.value);
+             return;
+           }
+           clearTimeout(responseTimer);
+           close();
+           return;
+         }
+         if (data.type === 3) {
+           console.log(`[M365-FC-WS-T3] end of conversation turn`);
+           clearTimeout(responseTimer);
+           close();
+         }
+         if (data.type === 6) {
+           console.log(`[M365-FC-WS-T6] keep-alive ping received`);
+         }
+         if (data.type !== 1 && data.type !== 2 && data.type !== 3 && data.type !== 6) {
+           console.log(`[M365-FC-WS-OTHER] type=${data.type} keys=${Object.keys(data).join(",")}`);
+         }
+       };
 
       ws.onmessage = (event) => {
         const records = parseSignalRRecords(event.data);
@@ -549,11 +371,19 @@ export class M365FoldcraftExecutor extends BaseExecutor {
       );
     }
 
-    const userPrompt = body._m365Prompt || "";
+    const messages = body?.messages || [];
+    let userPrompt = "";
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "user") {
+        const c = messages[i].content;
+        userPrompt = typeof c === "string" ? c : Array.isArray(c) ? c.filter(p => p.type === "text").map(p => p.text).join("\n") : "";
+        break;
+      }
+    }
     console.log(`[M365-FC-EXEC] ========== NEW REQUEST ==========`);
-    console.log(`[M365-FC-EXEC] model=${model} stream=${stream} prompt_len=${userPrompt.length}`);
+    console.log(`[M365-FC-EXEC] model=${model} stream=${stream} msg_count=${messages.length} prompt_len=${userPrompt.length}`);
     if (!userPrompt.trim()) {
-      return this._errorResponse("Empty query after processing", 400, "invalid_request");
+      return this._errorResponse("No user message found in request", 400, "invalid_request");
     }
 
     const { oid, tid } = extractTokenClaims(accessToken);
@@ -568,7 +398,6 @@ export class M365FoldcraftExecutor extends BaseExecutor {
 
     const connectionId = credentials?.connectionId || credentials?.email || `${oid}@${tid}`;
 
-    const messages = body?.messages || [];
     let firstUserFingerprint = "";
     for (const m of messages) {
       if (m.role === "user") {
@@ -599,7 +428,7 @@ export class M365FoldcraftExecutor extends BaseExecutor {
     const conversationIdHash = createHash("sha256").update(conversationIdBase).digest("hex");
     let conversationId = `${conversationIdHash.slice(0,8)}-${conversationIdHash.slice(8,12)}-${conversationIdHash.slice(12,16)}-${conversationIdHash.slice(16,20)}-${conversationIdHash.slice(20,32)}`;
 
-    const isContinuation = !!body._m365IsContinuation;
+    const isContinuation = messages.length > 1;
     console.log(`[M365-FC-EXEC-CID] strategy=STABLE conversationId=${conversationId} isContinuation=${isContinuation}`);
 
     const sessionIdHash = createHash("sha256").update(sessionIdBase).digest("hex");
@@ -742,7 +571,7 @@ export class M365FoldcraftExecutor extends BaseExecutor {
 
     log?.info?.("M365-FC", `WS handshake OK, sending message`);
 
-    const messageBuffer = [];
+    let messageBuffer = [];
     const messageListener = (data) => {
       let rawStr;
       if (Buffer.isBuffer(data)) rawStr = data.toString("utf8");
@@ -750,8 +579,8 @@ export class M365FoldcraftExecutor extends BaseExecutor {
       else if (data instanceof ArrayBuffer || data instanceof Uint8Array) rawStr = Buffer.from(data).toString("utf8");
       else rawStr = String(data);
       log?.info?.("M365-FC", `WS recv: ${rawStr.replace(/\u001e/g, "|").slice(0, 200)}`);
-      if (ws.onmessage) {
-        ws.onmessage({ data: rawStr });
+      if (!messageBuffer) {
+        // onmessage already set, messageListener only logs
       } else {
         messageBuffer.push(rawStr);
       }
@@ -787,6 +616,7 @@ export class M365FoldcraftExecutor extends BaseExecutor {
       if (ws.onmessage) ws.onmessage({ data: buf });
     }
     messageBuffer.length = 0;
+    messageBuffer = null;
     const finalResponse = new Response(sseStream, {
       status: 200,
       headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no" },
