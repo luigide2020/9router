@@ -324,6 +324,7 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
       let botTextStreams = new Map();
       let writeAtCursorEmittedLen = 0;
       let closed = false;
+      let finalContentEmitted = false;
 
       const rebuildFullText = () => {
         const seen = new Set();
@@ -350,7 +351,7 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
         rebuildFullText();
         // When buffering for tools, emit all accumulated text as one chunk
         // BEFORE setting closed=true (emitContent checks the closed flag)
-        if (bufferForTools && fullText) {
+        if (bufferForTools && fullText && !finalContentEmitted) {
           const hasCmd = /^CMD:/m.test(fullText);
           const hasRemoteExec = /\/mnt\/(file_upload|data|home|tmp|usr|var|workspace|sandbox)/.test(fullText);
           const hasCiResult = isCiExecutionResult(fullText);
@@ -371,6 +372,7 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
           } else {
             console.log(`[M365-CLOSE-FULL] ${fullText.slice(0, 1000)}`);
             emitContent(fullText);
+            finalContentEmitted = true;
           }
         }
         closed = true;
@@ -388,7 +390,10 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
       const sendError = (msg) => {
         if (closed) return;
         rebuildFullText();
-        if (bufferForTools && fullText) emitContent(fullText);
+        if (bufferForTools && fullText && !finalContentEmitted) {
+          emitContent(fullText);
+          finalContentEmitted = true;
+        }
         controller.enqueue(encoder.encode(sseChunk({
           id: cid, object: "chat.completion.chunk", created, model, system_fingerprint: null,
           choices: [{ index: 0, delta: { content: `[Error: ${msg}]` }, finish_reason: null, logprobs: null }],
@@ -614,9 +619,25 @@ function buildStreamingFromWs(ws, model, cid, created, signal, toolMeta) {
             }
           }
           if (payload?.result?.value && payload.result.value !== "Success") {
-            console.log(`[M365-WS-T2] result=NOT_SUCCESS value=${payload.result.value} message=${payload.result.message || "none"}`);
-            sendError(payload.result.message || payload.result.value);
-            return;
+            const resultValue = payload.result.value;
+            const resultMessage = payload.result.message || "";
+            if (resultValue === "ProcessingMessage") {
+              // Intermediate status: M365 is still processing this turn. The real
+              // turn end arrives via a later type-3 frame; content received so far
+              // stays valid. Non-fatal — do NOT inject an error into the stream.
+              console.log(`[M365-WS-T2] result=ProcessingMessage (intermediate, non-fatal) message=${resultMessage} textLen=${fullText.length} — waiting for type-3`);
+            } else if (fullText) {
+              // Non-Success result but usable content was already received —
+              // prefer the content over the error message (Fix73).
+              console.log(`[M365-WS-T2] result=NOT_SUCCESS value=${resultValue} message=${resultMessage} — content present (len=${fullText.length}), suppressing error injection`);
+              clearTimeout(responseTimer);
+              close();
+              return;
+            } else {
+              console.log(`[M365-WS-T2] result=NOT_SUCCESS value=${resultValue} message=${resultMessage}`);
+              sendError(resultMessage || resultValue);
+              return;
+            }
           }
           clearTimeout(responseTimer);
           close();
@@ -761,10 +782,22 @@ async function buildNonStreamingFromWs(ws, model, cid, created, signal, log, mes
           }
         }
         if (payload?.result?.value && payload.result.value !== "Success") {
-          doResolve(new Response(JSON.stringify({
-            error: { message: payload.result.message || payload.result.value, type: "upstream_error", code: "COPILOT_ERROR" },
-          }), { status: 502, headers: { "Content-Type": "application/json" } }));
-          return;
+          const resultValue = payload.result.value;
+          const resultMessage = payload.result.message || "";
+          if (resultValue === "ProcessingMessage") {
+            // Intermediate status (Fix73): real turn end arrives via a later
+            // type-3 frame; keep waiting instead of failing the request.
+            console.log(`[M365-WS-T2-NS] result=ProcessingMessage (intermediate, non-fatal) message=${resultMessage} textLen=${fullText.length} — waiting for type-3`);
+          } else if (fullText) {
+            console.log(`[M365-WS-T2-NS] result=NOT_SUCCESS value=${resultValue} message=${resultMessage} — content present (len=${fullText.length}), returning content`);
+            doResolve(makeCompletionResponse());
+            return;
+          } else {
+            doResolve(new Response(JSON.stringify({
+              error: { message: resultMessage || resultValue, type: "upstream_error", code: "COPILOT_ERROR" },
+            }), { status: 502, headers: { "Content-Type": "application/json" } }));
+            return;
+          }
         }
         doResolve(makeCompletionResponse());
         return;

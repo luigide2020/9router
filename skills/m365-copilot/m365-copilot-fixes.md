@@ -446,6 +446,7 @@ Added `extractHistoricalToolCallSignatures(messages)` which scans all ASSISTANT 
 | Enhanced anti-execution prompt (Fix66) | Verified — model outputs JSON and waits for result; JailBreak avoided by NOT denying CI existence |
 | Remove CI allowedMessageTypes (Fix66) | Defense-in-depth only — did NOT prevent CI execution; CI is backend-driven |
 | Increase truncation limits (Fix67) | Verified — file reads and command outputs no longer truncated; model sees full content |
+| ProcessingMessage non-fatal + content-preferred errors + no double-emit (Fix73) | Verified — 14 occurrences in 2h, zero `[Error: 很抱歉` in bufferPreview; tool_call extraction unchanged; no regression vs Fix1-72 |
 
 ## Fix45: WS Connect Retry + 502 Short Cooldown
 
@@ -1283,3 +1284,60 @@ Three issues preventing m365-foldcraft from working:
 ### Key design decision
 
 m365-foldcraft is a **thin passthrough**: 9router only does WS→SSE conversion, emitting raw `writeAtCursor` increments. All content processing (dedup, CoT extraction, tool_call parsing) is the downstream foldcraft project's responsibility.
+
+---
+
+## Fix73: ProcessingMessage Result — Stop Injecting Refusal Text into Valid Responses
+
+**Files**: `open-sse/executors/m365-copilot.js` (streaming + non-streaming paths)
+
+### Symptom
+
+Codex downstream receives `[Error: 很抱歉，我无法响应。我可以提供其他方面的帮助吗?]` on every M365 turn, interleaved with the actual (valid) tool_call JSON. Conversation continues normally — the error text is pure noise injected by 9router itself.
+
+### Root cause
+
+M365 ends a turn with a type-2 frame carrying `result.value` ≠ `"Success"`. The executor treated **any** non-Success result as fatal:
+
+```js
+if (payload?.result?.value && payload.result.value !== "Success") {
+  sendError(payload.result.message || payload.result.value);  // ← injected refusal text
+}
+```
+
+Observed value: `result.value = "ProcessingMessage"` with `result.message = "很抱歉，我无法响应。我可以提供其他方面的帮助吗?`. WS log timeline proves this is an **intermediate status, not a refusal**:
+
+```
+T1 bot DeepLeo  {"name":"exec_command",...}      ← actual content already received
+T2 result=ProcessingMessage message=很抱歉...     ← intermediate status
+sendError → emit fullText (1st) + [Error:] chunk  ← 9router injects error
+close()   → emit fullText AGAIN (2nd)             ← duplicate emission bug
+T3 end of conversation turn                       ← real turn end arrives AFTER
+```
+
+Two bugs:
+1. `ProcessingMessage` means "turn still processing" — the real turn end arrives via a later type-3 frame. Killing the stream on it injects the refusal text even though valid content was already received.
+2. `sendError()` emitted `fullText` in bufferForTools mode, then `close()` emitted it again → downstream buffer contained `toolJSON[Error: ...]toolJSON` (269 = 118 + 33 + 118).
+
+### Fix
+
+Streaming path (type-2 result handling):
+- `result.value === "ProcessingMessage"` → log `[M365-WS-T2] result=ProcessingMessage (intermediate, non-fatal)` and **keep waiting** for type-3 (responseTimer still guards genuine hangs).
+- Other non-Success values with content already received (`fullText` non-empty) → prefer content: log and `close()` normally, suppress error injection.
+- Other non-Success values with **no** content → `sendError()` as before (genuine failure).
+
+Non-streaming path: identical three-way branch (`ProcessingMessage` → wait for type-3; content present → `doResolve(makeCompletionResponse())`; no content → 502 as before).
+
+Duplicate emission: added `finalContentEmitted` flag — set by both `sendError()` and `close()` after emitting buffered `fullText`; the other path skips re-emission.
+
+### Verification
+
+**Verified (docker, 2026-09-28)**. Evidence from container logs after rebuild:
+- `[M365-WS-T2] result=ProcessingMessage (intermediate, non-fatal) message=很抱歉，我无法响应。我可以提供其他方面的帮助吗? textLen=0 — waiting for type-3` — intermediate status arrives even BEFORE content (textLen=0); stream stays open, content flows afterwards (second dispatch shows textLen=2004), type-3 closes normally.
+- 14 occurrences in 2h of real traffic, zero `[Error: 很抱歉` in any `[M365-RESP-TRANSLATE] bufferPreview`.
+- tool_call extraction unchanged (`[M365-RESP-EXTRACT] total_calls=1 names=[exec_command]` as before); pure-text responses end cleanly.
+- Regression review against Fix1-72: no prior fix re-ignites. Key checks: Fix3/53 dedup preserved (rebuildFullText runs before the new flag check), Fix57 stall guard unaffected (`[Error:` text never consumed as a signal), Fix61/64/66 filters untouched (Fix73 only edits the post-messages-loop result block), Fix70 CI suppression strictly improved (was double-emit, now single).
+
+### Related observation (NOT fixed in Fix73)
+
+`m365-copilot.js` has the same WS double-emit pattern Fix72 removed from foldcraft: `messageListener` manually calls `ws.onmessage()` while the ws library also dispatches → every frame processed twice (visible as doubled `[M365-WS-*]` log lines). Masked by T1 text dedup and closed/resolved idempotency guards. Candidate Fix74.

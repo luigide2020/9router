@@ -217,6 +217,22 @@ M365 可能在看到命令输出后被"触发" CI 执行。将 reminder 从 tool
 
 增加 `console.log` 调试输出 `[M365-SESSION-CHECK]` 和 `[M365-SESSION-RANDOM]`，确认随机化逻辑是否执行。
 
+### 修复15 / Fix73 (2026-09-28): ProcessingMessage 中间状态误判为致命错误
+
+**文件**: `open-sse/executors/m365-copilot.js`（流式 + 非流式两路径）
+
+**根因**: M365 回合结束时 type-2 帧返回 `result.value="ProcessingMessage"`（中间状态，真正的回合结束信号 type-3 在其后到达），并携带 `result.message="很抱歉，我无法响应。我可以提供其他方面的帮助吗?"`。执行器把**任何**非 `"Success"` 的 result 都当致命错误 → `sendError(message)` 把拒答话术作为 `[Error: ...]` 注入下游。且 `sendError` 先发 fullText、`close()` 又发一遍 → Codex 收到 `toolJSON[Error: ...]toolJSON`（内容重复 + 错误噪音），但 tool_call 仍可提取所以对话能继续。
+
+**修复**:
+1. `ProcessingMessage` → 仅记日志，继续等 type-3 正常收尾（120s responseTimer 兜底）
+2. 其他非 Success 但已有内容 → 返回内容，抑制错误注入
+3. 无内容的非 Success → 照旧 `sendError` / 502
+4. 新增 `finalContentEmitted` 标志消除 sendError/close 重复发送
+
+**验证** (docker, 2026-09-28): 2 小时真实流量 14 次 ProcessingMessage 全部走新分支（含 textLen=0 内容未到的场景），`bufferPreview` 零 `[Error: 很抱歉`，tool_call 提取不变。对照 Fix1-72 逐项回归审查无复燃。详见 `skills/m365-copilot/m365-copilot-fixes.md` Fix73。
+
+**遗留观察（候选 Fix74）**: `m365-copilot.js` 存在 Fix72 已在 foldcraft 修过的 WS 双重派发（`messageListener` 手动调 `ws.onmessage()` + ws 库自身派发 → 每帧处理两次，日志行成对出现），被 T1 文本去重与 closed/resolved 幂等守卫掩盖。
+
 ---
 
 ## 当前验证状态

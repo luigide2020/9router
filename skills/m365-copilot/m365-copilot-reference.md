@@ -339,3 +339,16 @@ Full list: Chat, Suggestion, InternalSearchQuery, Disengaged, InternalLoaderMess
 | Suggestion | Filtered | Suggestion chips |
 | EscapeHatch | Filtered | "Hide" button marker |
 | InternalLoaderMessage | Filtered | "正在生成响应。" loading indicator |
+
+## WS Turn Result Values (Fix73)
+
+The type-2 frame carries `payload.result`. Handling in `m365-copilot.js`:
+
+| result.value | Meaning | Action |
+|---|---|---|
+| `Success` | Turn completed normally | `close()` / resolve |
+| `ProcessingMessage` | **Intermediate status** — turn still processing; content received so far is valid; real turn end arrives via a later type-3 frame (observed same-second). Carries a scary-looking Chinese message ("很抱歉，我无法响应。我可以提供其他方面的帮助吗?") that is NOT a refusal | Log `[M365-WS-T2] result=ProcessingMessage (intermediate, non-fatal)` and keep waiting for type-3; 120s responseTimer guards genuine hangs |
+| other non-Success, content already received | Turn ended abnormally but usable content exists | Prefer content: log + `close()` normally, suppress error injection |
+| other non-Success, no content | Genuine failure (e.g. InvalidSessionId) | `sendError(result.message)` / 502 |
+
+**Key lesson**: `result.message` text must never be blindly injected as `[Error: ...]` into the downstream stream — ProcessingMessage carries refusal-looking text while the actual content is valid. Before Fix73 this polluted every Codex turn with `[Error: 很抱歉，我无法响应...]` noise.
