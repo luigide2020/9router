@@ -86,9 +86,26 @@ def detect_region_by_ip():
     proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
     if proxy_url:
         print(f"[REGION] 使用代理检测出口 IP: {proxy_url}")
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
-    else:
-        opener = urllib.request.build_opener()
+        try:
+            result = subprocess.run(
+                ["curl", "-s", "--max-time", "10", "-x", proxy_url,
+                 "http://ip-api.com/json/?fields=status,countryCode,country,query"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                print(f"[REGION] curl ip-api 失败: rc={result.returncode} stderr={result.stderr[:200]} stdout={result.stdout[:200]}")
+            else:
+                data = json.loads(result.stdout)
+                print(f"[REGION] curl ip-api 返回: {json.dumps(data, ensure_ascii=False)[:200]}")
+                if data.get("status") == "success":
+                    return data.get("countryCode", ""), data.get("country", ""), data.get("query", "")
+        except json.JSONDecodeError as e:
+            print(f"[REGION] curl ip-api 返回非JSON: {result.stdout[:200]}")
+        except Exception as e:
+            print(f"[REGION] curl ip-api 失败: {e}")
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}) if proxy_url else urllib.request.ProxyHandler({})
+    )
     for url, name in apis:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
@@ -111,9 +128,9 @@ def check_region_or_exit():
         return
     if code:
         print(f"[REGION] ❌ 出口 IP: {ip}，区域: {country}({code})，不在允许列表 ({'/'.join(sorted(ALLOWED_COUNTRY_CODES))})，退出")
+        sys.exit(0)
     else:
-        print("[REGION] ❌ 无法检测出口 IP 归属地，退出")
-    sys.exit(0)
+        print("[REGION] ⚠️ 无法检测出口 IP 归属地（网络超时），继续执行")
 
 USER_DATA_DIR = str(Path(__file__).parent / ".browser_profile")
 TOKEN_DIR = Path.home() / ".9router"
@@ -377,7 +394,7 @@ def main():
         for fi, frame in enumerate(frames):
             frame_url = frame.url
             print(f"[DIAG] frame[{fi}]: {frame_url[:120]}")
-            for sel in input_selectors[:6]:
+            for sel in input_selectors:
                 try:
                     box = frame.locator(sel).last
                     if box.count() == 0:
@@ -407,9 +424,36 @@ def main():
                     className: e.className?.slice(0, 80),
                 }));
             }""")
-            print(f"[DIAG] 可编辑元素: {json.dumps(editable, ensure_ascii=False)}")
+            print(f"[DIAG] 主页面可编辑元素: {json.dumps(editable, ensure_ascii=False)}")
         except Exception as e:
             print(f"[DIAG] 诊断失败: {e}")
+        for fi, frame in enumerate(page.frames[1:], 1):
+            try:
+                editable = frame.evaluate("""() => {
+                    const all = document.querySelectorAll('[contenteditable], [role="textbox"], textarea');
+                    return Array.from(all).slice(0, 10).map(e => ({
+                        tag: e.tagName, role: e.getAttribute('role'),
+                        ce: e.getAttribute('contenteditable'),
+                        testid: e.getAttribute('data-testid'),
+                        ariaLabel: e.getAttribute('aria-label'),
+                        className: e.className?.slice(0, 80),
+                    }));
+                }""")
+                if editable:
+                    print(f"[DIAG] iframe[{fi}] 可编辑元素: {json.dumps(editable, ensure_ascii=False)}")
+                else:
+                    shadow_roots = frame.evaluate("""() => {
+                        const all = document.querySelectorAll('*');
+                        const shadows = [];
+                        for (const el of all) {
+                            if (el.shadowRoot) shadows.push({tag: el.tagName, id: el.id, cls: el.className?.slice(0,80)});
+                        }
+                        return shadows.slice(0, 5);
+                    }""")
+                    if shadow_roots:
+                        print(f"[DIAG] iframe[{fi}] 无可编辑元素但有 shadow DOM: {json.dumps(shadow_roots, ensure_ascii=False)}")
+            except Exception:
+                pass
         return False
 
     def try_new_chat_and_type(page):
@@ -518,8 +562,8 @@ def main():
                 except Exception as e:
                     print(f"[WARN] reload 失败: {e}")
                     if "net::" in str(e).lower() or "err_" in str(e).lower():
-                        print(f"[ERROR] 网络不可达，终止重试")
-                        break
+                        print(f"[WARN] 网络暂时不可达，等待后重试...")
+                        page.wait_for_timeout(10000)
                     continue
             chat_found = False
             try:

@@ -38,8 +38,14 @@ echo "========== [STEP 2] 更新本地 DB =========="
 
 echo "========== [STEP 3] scp → $HOST =========="
 scp "$TOKEN_FILE" "$HOST:$REMOTE_TOKEN_DIR/m365-token.json"
+scp "$SCRIPT_DIR/update_db.py" "$HOST:$REMOTE_SCRIPT"
 
 echo "========== [STEP 4] ssh $HOST → update_db =========="
-ssh "$HOST" "python3 $REMOTE_SCRIPT"
+# 远端 dashboard 密码：REMOTE_DASHBOARD_PASSWORD 优先，否则沿用本地 DASHBOARD_PASSWORD
+REMOTE_PWD="${REMOTE_DASHBOARD_PASSWORD:-$DASHBOARD_PASSWORD}"
+REMOTE_ENV=""
+[ -n "$REMOTE_PWD" ] && REMOTE_ENV="DASHBOARD_PASSWORD=$(printf '%q' "$REMOTE_PWD") "
+[ -n "$REMOTE_BASE_URL" ] && REMOTE_ENV="${REMOTE_ENV}BASE_URL=$(printf '%q' "$REMOTE_BASE_URL") "
+ssh "$HOST" "${REMOTE_ENV}python3 $REMOTE_SCRIPT"
 
 echo "✅ 全流程完成"
